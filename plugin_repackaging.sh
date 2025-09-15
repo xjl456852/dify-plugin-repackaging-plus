@@ -5,6 +5,9 @@ GITHUB_API_URL=https://github.com
 ARKETPLACE_API_URL=https://marketplace.dify.ai
 PIP_MIRROR_URL=https://mirrors.aliyun.com/pypi/simple
 
+ARCH=`if [ "$(uname -m)" = "x86_64" ]; then echo "dify-plugin-linux-amd64-5g"; else echo "dify-plugin-linux-arm64-5g"; fi`
+
+
 CURR_DIR=`dirname $0`
 cd $CURR_DIR
 CURR_DIR=`pwd`
@@ -101,8 +104,8 @@ repackage(){
 	  sed -i '/^wheels\//d' .difyignore
 	fi
 	cd ${CURR_DIR}
-	chmod 755 ${CURR_DIR}/dify-plugin-linux-arm64-5g
-	${CURR_DIR}/dify-plugin-linux-arm64-5g plugin package ${CURR_DIR}/${PACKAGE_NAME} -o ${CURR_DIR}/${PACKAGE_NAME}-offline.difypkg
+	chmod 755 ${CURR_DIR}/${ARCH}
+	${CURR_DIR}/${ARCH} plugin package ${CURR_DIR}/${PACKAGE_NAME} -o ${CURR_DIR}/${PACKAGE_NAME}-offline.difypkg
 	echo "Repackage success."
 }
 
