@@ -39,8 +39,22 @@ packager_name_for_host() {
   esac
 }
 
+normalize_python_version() {
+  local version=$1
+
+  if [[ "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
+    printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf 'unsupported Python version: %s (expected MAJOR.MINOR or MAJOR.MINOR.PATCH)\n' "$version" >&2
+    return 1
+  fi
+}
+
 python_abi() {
-  local version=${1//./}
+  local version
+
+  version="$(normalize_python_version "$1")"
+  version=${version//./}
   printf 'cp%s\n' "$version"
 }
 
@@ -69,7 +83,7 @@ detect_python_version() {
   local detected=
 
   if [[ -n "$requested" ]]; then
-    printf '%s\n' "$requested"
+    normalize_python_version "$requested"
     return
   fi
 
@@ -83,7 +97,7 @@ detect_python_version() {
     )"
   fi
 
-  printf '%s\n' "${detected:-3.12}"
+  normalize_python_version "${detected:-3.12}"
 }
 
 export_requirements_from_uv() {

@@ -67,6 +67,7 @@ assert_eq aarch64 "$(normalize_arch arm64)" 'arm64 normalizes to aarch64'
 assert_eq dify-plugin-linux-amd64-5g "$(packager_name_for_host x86_64)" 'x86 host packager'
 assert_eq dify-plugin-linux-arm64-5g "$(packager_name_for_host aarch64)" 'arm host packager'
 assert_eq cp312 "$(python_abi 3.12)" 'Python 3.12 ABI'
+assert_eq cp312 "$(python_abi 3.12.7)" 'Python patch version normalizes to CPython 3.12 ABI'
 assert_eq $'manylinux_2_28_aarch64\nmanylinux2014_aarch64' "$(default_platforms aarch64)" 'ARM64 platform set'
 assert_eq custom_aarch64 "$(DIFY_MANYLINUX_PLATFORMS=custom_aarch64 default_platforms aarch64)" 'platform override'
 
@@ -84,7 +85,7 @@ trap cleanup_test_files EXIT
 
 metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
-printf '3.12\n' >"$metadata_dir/.python-version"
+printf '3.12.7\n' >"$metadata_dir/.python-version"
 printf '%s\n' '--no-index --find-links=./old-wheels' 'requests==2.34.2' >"$metadata_dir/requirements.txt"
 printf '%s\n' \
   '[project]' \

@@ -105,6 +105,8 @@ Python 版本按以下顺序确定：
 3. `pyproject.toml` 的 `requires-python` 下限。
 4. 默认 Python 3.12。
 
+`.python-version` 或覆盖变量可以写 `3.12` 或 `3.12.7`；脚本会统一按 CPython 主次版本 `3.12` 选择 ABI 和平台依赖。
+
 默认 wheel 平台为：
 
 - ARM64：`manylinux_2_28_aarch64`、`manylinux2014_aarch64`
