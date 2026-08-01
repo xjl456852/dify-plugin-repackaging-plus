@@ -2,6 +2,8 @@
 # author: xiejianglei
 set -Eeuo pipefail
 
+PIP_MIRROR_URL="${PIP_MIRROR_URL:-https://mirrors.aliyun.com/pypi/simple}"
+
 normalize_arch() {
   case "$1" in
     x86_64 | amd64)
@@ -142,6 +144,68 @@ EOF
 
   rm -f -- "$plugin_dir/uv.lock"
   sanitize_difyignore "$plugin_dir/.difyignore"
+}
+
+resolve_pip_command() {
+  local -n result=$1
+
+  if [[ -n "${DIFY_PIP_COMMAND:-}" ]]; then
+    read -r -a result <<<"$DIFY_PIP_COMMAND"
+  elif python3 -m pip --version >/dev/null 2>&1; then
+    result=(python3 -m pip)
+  elif command -v pip >/dev/null 2>&1; then
+    result=(pip)
+  elif command -v pip3 >/dev/null 2>&1; then
+    result=(pip3)
+  else
+    printf 'pip not found; install python3-pip or set DIFY_PIP_COMMAND\n' >&2
+    return 1
+  fi
+}
+
+reset_wheels_dir() {
+  local wheels_dir=$1
+  local parent
+
+  parent="$(dirname "$wheels_dir")"
+  if [[ "$(basename "$wheels_dir")" != wheels || "$parent" == / || "$parent" == . ]]; then
+    printf 'refusing to reset unsafe wheels path: %s\n' "$wheels_dir" >&2
+    return 1
+  fi
+
+  rm -rf -- "$wheels_dir"
+  mkdir -p "$wheels_dir"
+}
+
+download_wheels() {
+  local requirements=$1
+  local wheels_dir=$2
+  local target_arch=$3
+  local python_version=$4
+  local abi platform
+  local -a pip_command=()
+  local -a platform_args=()
+
+  reset_wheels_dir "$wheels_dir"
+  if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
+    return 0
+  fi
+
+  resolve_pip_command pip_command
+  abi="$(python_abi "$python_version")"
+  while IFS= read -r platform; do
+    [[ -n "$platform" ]] && platform_args+=(--platform "$platform")
+  done < <(default_platforms "$target_arch")
+
+  "${pip_command[@]}" download \
+    --index-url "$PIP_MIRROR_URL" \
+    --python-version "$python_version" \
+    --implementation cp \
+    --abi "$abi" \
+    "${platform_args[@]}" \
+    --only-binary=:all: \
+    --requirement "$requirements" \
+    --dest "$wheels_dir"
 }
 
 usage() {

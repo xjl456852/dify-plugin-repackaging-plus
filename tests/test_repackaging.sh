@@ -126,6 +126,55 @@ printf '%s\n' '[project]' 'dependencies = ["httpx==0.28.1"]' >"$export_dir_no_lo
 DIFY_UV_COMMAND="$fake_bin/uv-export" prepare_download_requirements "$export_dir_no_lock" "$export_dir_no_lock/download.txt"
 assert_file_not_contains "$UV_EXPORT_LOG" '--frozen' 'uv export resolves pyproject without stale lock'
 
+cat >"$fake_bin/pip-download" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$PIP_ARGS_LOG"
+while (($#)); do
+  if [[ "$1" == '-d' || "$1" == '--dest' ]]; then
+    shift
+    mkdir -p "$1"
+    touch "$1/example-1.0-py3-none-any.whl"
+  fi
+  shift
+done
+EOF
+chmod +x "$fake_bin/pip-download"
+
+wheel_dir="$FIXTURE_DIR/wheels"
+mkdir -p "$wheel_dir"
+touch "$wheel_dir/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+export PIP_ARGS_LOG="$FIXTURE_DIR/pip-download.args"
+DIFY_PIP_COMMAND="$fake_bin/pip-download" download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12
+assert_file_contains "$PIP_ARGS_LOG" '--python-version' 'pip receives target Python option'
+assert_file_contains "$PIP_ARGS_LOG" '3.12' 'pip targets Python 3.12'
+assert_file_contains "$PIP_ARGS_LOG" 'cp312' 'pip receives CPython ABI'
+assert_file_contains "$PIP_ARGS_LOG" 'manylinux_2_28_aarch64' 'pip accepts modern ARM64 wheels'
+assert_file_contains "$PIP_ARGS_LOG" 'manylinux2014_aarch64' 'pip accepts legacy ARM64 wheels'
+assert_file_contains "$PIP_ARGS_LOG" '--only-binary=:all:' 'pip rejects source distributions'
+assert_file_missing "$wheel_dir/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl" 'wheelhouse is rebuilt without stale x86 wheel'
+
+platform_count="$(grep -c -- '--platform' "$PIP_ARGS_LOG")"
+assert_eq 2 "$platform_count" 'pip receives exactly two target platform options'
+
+cat >"$fake_bin/pip-fail" <<'EOF'
+#!/usr/bin/env bash
+exit 23
+EOF
+chmod +x "$fake_bin/pip-fail"
+if DIFY_PIP_COMMAND="$fake_bin/pip-fail" download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12; then
+  fail 'pip failure stops wheel download'
+else
+  pass 'pip failure stops wheel download'
+fi
+
+empty_requirements="$FIXTURE_DIR/empty-requirements.txt"
+: >"$empty_requirements"
+if DIFY_PIP_COMMAND="$fake_bin/pip-fail" download_wheels "$empty_requirements" "$wheel_dir" aarch64 3.12; then
+  pass 'empty requirements do not invoke pip'
+else
+  fail 'empty requirements do not invoke pip'
+fi
+
 if grep -q 'DIFY_TARGET_ARCH=aarch64' "$ROOT_DIR/plugin_repackaging_amd64_to_arm64.sh" &&
   grep -q 'exec .*plugin_repackaging.sh' "$ROOT_DIR/plugin_repackaging_amd64_to_arm64.sh"; then
   pass 'cross-architecture wrapper delegates to unified script'
