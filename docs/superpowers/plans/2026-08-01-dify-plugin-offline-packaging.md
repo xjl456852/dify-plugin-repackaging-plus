@@ -8,6 +8,8 @@
 
 **Tech Stack:** Bash 4+, pip download, uv 0.6.11+, unzip/zip-compatible `.difypkg` archives, Dify plugin CLI, Docker for the optional ARM64 daemon verification.
 
+**End-to-end implementation note:** Real `uv 0.11.24` validation found that universal locking also resolves default development groups and non-target platforms. The final implementation therefore removes modern `[dependency-groups]` and legacy `[tool.uv].dev-dependencies` / `default-groups` from the staged runtime copy, and writes a Linux/architecture/Python-specific `[tool.uv].environments` marker into `pyproject.toml`. `uv.toml` remains responsible only for offline mode and the local flat index because `environments` is not valid in that configuration file.
+
 ---
 
 ## File Structure

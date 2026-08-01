@@ -35,7 +35,7 @@
 
    `uv pip install -r requirements.txt` 和兼容 requirements 格式的 pip 安装器只能读取包内 wheelhouse。
 
-2. `pyproject.toml` 路径：保留插件原始项目元数据，并在包根目录生成 `uv.toml`：
+2. `pyproject.toml` 路径：保留插件的 `[project]` 运行时元数据；从 staging 副本中删除 `[dependency-groups]` 以及旧式 `[tool.uv].dev-dependencies` / `default-groups`，并在 `[tool.uv]` 中写入只匹配目标 Linux、CPU 架构和 Python 版本的 `environments`。包根目录同时生成 `uv.toml`：
 
    ```toml
    offline = true
@@ -49,14 +49,16 @@
 
    该配置将本地 wheelhouse 设为 uv 项目的唯一默认索引，并明确禁止网络访问。它不要求修改插件自己的 `[project]` 依赖声明。
 
-原始 `uv.lock` 不进入输出包。锁文件通常记录公网 registry URL，而且 daemon 检测到它后会增加 `--frozen`。删除锁文件后，`uv sync` 会依据未改动的 `pyproject.toml` 从本地唯一索引重新解析。
+原始 `uv.lock` 不进入输出包。锁文件通常记录公网 registry URL，而且 daemon 检测到它后会增加 `--frozen`。删除锁文件后，`uv sync` 会依据运行时规范化后的 `pyproject.toml` 从本地唯一索引重新解析。
+
+`environments` 必须写入 `pyproject.toml`，不能写入 `uv.toml`：真实 uv 验证表明该字段属于项目配置。若不限制解析环境，uv 的通用锁定会继续解析开发组、Windows 和其他 CPU 平台，导致本来完整的 ARM64 运行时 wheelhouse 因无关依赖而失败。
 
 这套策略不读取或判断 Dify 版本。只要安装器继续支持标准 requirements 文件或 uv 项目，两条路径至少有一条可用；当前 daemon 两条路径都能离线解析。如果未来 Dify 引入第三种完全不同的依赖格式，需要为该格式增加适配，但现有打包命令和架构模型无需改变。
 
 ### 输入依赖格式
 
 - 存在 `requirements.txt` 时，以它作为下载依赖闭包的权威输入。
-- 不存在 `requirements.txt`、但同时存在 `pyproject.toml` 和 `uv.lock` 时，使用 `uv export --frozen` 生成 requirements；导出时排除项目本身、开发组、注释和 hashes。
+- 不存在 `requirements.txt`、但同时存在 `pyproject.toml` 和 `uv.lock` 时，使用 `uv export --frozen` 生成 requirements；导出时排除项目本身、全部默认依赖组、开发组、注释和 hashes。
 - 只有 `pyproject.toml` 时，使用非 frozen 的 `uv export` 在线解析并生成 requirements。
 - 两种依赖文件都不存在时，将插件视为无第三方 Python 依赖；仍生成空的离线 `requirements.txt` 和 `uv.toml`，以避免安装器尝试猜测远程来源。
 - 需要从 pyproject 导出但系统找不到 `uv` 时，立即失败并给出安装提示。
@@ -78,7 +80,7 @@
 2. 在项目目录下创建唯一临时 staging 目录，解压源包；不复用以前的解压目录。
 3. 规范化依赖输入：必要时从 uv 项目导出 requirements，并生成一份不包含旧离线索引指令的下载输入文件。
 4. 创建全新的 `wheels/`，用一次完整的目标平台 `pip download` 解析并下载全部固定依赖闭包。禁止逐包回退和主机平台回退。
-5. 写入双路径离线配置，移除 staging 中的 `uv.lock`，并确保 `.difyignore` 不排除 `wheels/` 或 `uv.toml`。
+5. 写入双路径离线配置；规范化 staging 中的运行时 `pyproject.toml`，移除开发组并限制 uv 目标环境；移除 `uv.lock`，并确保 `.difyignore` 不排除 `wheels/` 或 `uv.toml`。
 6. 在目标 Python/平台条件下执行不联网的 requirements dry-run；输入包含 `pyproject.toml` 时再执行 `uv sync` dry-run。任何适用路径尝试联网、缺少版本或没有兼容 wheel都会停止构建。
 7. 调用与主机架构匹配的 Dify CLI 生成 `*-offline.difypkg`。
 8. 检查最终 ZIP：必须包含 wheel、`requirements.txt` 和 `uv.toml`，不能包含 `uv.lock`；随后报告输出路径。
@@ -110,6 +112,7 @@
 - 原始问题中的 requirements 不会因其他版本的同名 wheel 被误判为完整。
 - 输出 requirements 的离线指令独立、幂等，`wheels/` 和 `uv.toml` 不会被 `.difyignore` 排除。
 - 输入含 `pyproject.toml` 时输出包继续保留它；所有输出包包含 `uv.toml` 且不含 `uv.lock`。
+- 新旧 uv 开发依赖配置均不会进入运行时解析，已有 `[tool.uv]` 的其他设置保持不变，目标环境不会重复写入。
 - pip 下载失败、requirements dry-run 失败、uv dry-run 失败及 Dify CLI 失败都会令整个命令失败。
 - 只有 pyproject/lock 的插件可以导出 requirements；缺少 uv 时得到明确错误。
 - 含空格的本地源路径可正确处理。

@@ -86,7 +86,13 @@ metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
 printf '3.12\n' >"$metadata_dir/.python-version"
 printf '%s\n' '--no-index --find-links=./old-wheels' 'requests==2.34.2' >"$metadata_dir/requirements.txt"
-printf '%s\n' '[project]' 'requires-python = ">=3.12"' >"$metadata_dir/pyproject.toml"
+printf '%s\n' \
+  '[project]' \
+  'requires-python = ">=3.12"' \
+  '[dependency-groups]' \
+  'dev = ["black>=26.5.1", "pytest>=9.0.3"]' \
+  '[tool.example]' \
+  'enabled = true' >"$metadata_dir/pyproject.toml"
 printf 'version = 1\n' >"$metadata_dir/uv.lock"
 printf '%s\n' 'wheels/' '/wheels/**' 'uv.toml' '.venv/' >"$metadata_dir/.difyignore"
 
@@ -97,16 +103,47 @@ prepare_download_requirements "$metadata_dir" "$metadata_dir/download.txt"
 assert_file_not_contains "$metadata_dir/download.txt" '--no-index' 'download input strips old no-index directive'
 assert_file_contains "$metadata_dir/download.txt" 'requests==2.34.2' 'download input keeps pinned requirement'
 
-write_offline_metadata "$metadata_dir" "$metadata_dir/download.txt"
+write_offline_metadata "$metadata_dir" "$metadata_dir/download.txt" aarch64 3.12
 assert_file_starts_with "$metadata_dir/requirements.txt" $'--no-index\n--find-links=./wheels' 'requirements uses local wheelhouse only'
 assert_file_contains "$metadata_dir/uv.toml" 'offline = true' 'uv config disables network'
+assert_file_not_contains "$metadata_dir/uv.toml" 'environments' 'uv.toml contains only global settings'
+assert_file_contains "$metadata_dir/pyproject.toml" '[tool.uv]' 'runtime pyproject contains uv project settings'
+assert_file_contains "$metadata_dir/pyproject.toml" "sys_platform == 'linux'" 'uv resolution is limited to Linux'
+assert_file_contains "$metadata_dir/pyproject.toml" "platform_machine == 'aarch64'" 'uv resolution is limited to ARM64'
+assert_file_contains "$metadata_dir/pyproject.toml" "python_version == '3.12'" 'uv resolution is limited to target Python'
 assert_file_contains "$metadata_dir/uv.toml" 'url = "./wheels"' 'uv config uses local wheelhouse'
 assert_file_contains "$metadata_dir/uv.toml" 'format = "flat"' 'uv config declares flat index'
 assert_file_contains "$metadata_dir/uv.toml" 'default = true' 'uv config replaces default registry'
 assert_file_missing "$metadata_dir/uv.lock" 'remote uv lock is removed'
+assert_file_not_contains "$metadata_dir/pyproject.toml" '[dependency-groups]' 'runtime pyproject excludes dependency groups'
+assert_file_not_contains "$metadata_dir/pyproject.toml" 'black' 'runtime pyproject excludes development tools'
+assert_file_contains "$metadata_dir/pyproject.toml" '[tool.example]' 'runtime pyproject preserves unrelated sections'
 assert_file_not_contains "$metadata_dir/.difyignore" 'wheels/' 'difyignore includes wheels'
 assert_file_not_contains "$metadata_dir/.difyignore" 'uv.toml' 'difyignore includes uv config'
 assert_file_contains "$metadata_dir/.difyignore" '.venv/' 'difyignore preserves unrelated patterns'
+
+legacy_uv_dir="$FIXTURE_DIR/legacy-uv-metadata"
+mkdir -p "$legacy_uv_dir"
+printf '%s\n' \
+  '[project]' \
+  'dependencies = ["httpx==0.28.1"]' \
+  '[tool.uv]' \
+  'dev-dependencies = [' \
+  '  "pytest>=9.0.3",' \
+  ']' \
+  'environments = [' \
+  '  "sys_platform == '\''win32'\''",' \
+  ']' \
+  'index-strategy = "first-index"' >"$legacy_uv_dir/pyproject.toml"
+
+sanitize_pyproject_for_runtime "$legacy_uv_dir/pyproject.toml"
+configure_pyproject_environment "$legacy_uv_dir/pyproject.toml" aarch64 3.12
+assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'dev-dependencies' 'legacy uv development dependency key is removed'
+assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'pytest' 'legacy uv development packages are removed'
+assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'win32' 'existing uv environment marker is replaced'
+assert_file_contains "$legacy_uv_dir/pyproject.toml" "platform_machine == 'aarch64'" 'existing tool.uv receives target environment'
+assert_file_contains "$legacy_uv_dir/pyproject.toml" 'index-strategy = "first-index"' 'existing tool.uv settings are preserved'
+assert_eq 1 "$(grep -c '^\[tool\.uv\]$' "$legacy_uv_dir/pyproject.toml")" 'existing tool.uv section is not duplicated'
 
 fake_bin="$FIXTURE_DIR/fake-bin"
 mkdir -p "$fake_bin"
@@ -127,6 +164,7 @@ assert_file_contains "$export_dir/download.txt" 'httpx==0.28.1' 'pyproject-only 
 assert_file_contains "$UV_EXPORT_LOG" '--frozen' 'uv export honors existing lock'
 assert_file_contains "$UV_EXPORT_LOG" '--no-emit-project' 'uv export excludes the plugin project'
 assert_file_contains "$UV_EXPORT_LOG" 'dev' 'uv export excludes development dependencies'
+assert_file_contains "$UV_EXPORT_LOG" '--no-default-groups' 'uv export excludes every default dependency group'
 
 export_dir_no_lock="$FIXTURE_DIR/export-without-lock"
 mkdir -p "$export_dir_no_lock"
@@ -218,6 +256,7 @@ if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
   pass 'local command packages a path containing spaces'
 else
   fail 'local command packages a path containing spaces'
+  sed 's/^/# repackage: /' "$run_log"
 fi
 
 if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then

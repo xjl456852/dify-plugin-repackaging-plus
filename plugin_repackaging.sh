@@ -93,6 +93,7 @@ export_requirements_from_uv() {
   local -a args=(
     export
     --format requirements.txt
+    --no-default-groups
     --no-group dev
     --no-emit-project
     --no-hashes
@@ -132,9 +133,113 @@ sanitize_difyignore() {
     "$ignore_file"
 }
 
+sanitize_pyproject_for_runtime() {
+  local pyproject_file=$1
+  local temporary_file
+
+  [[ -f "$pyproject_file" ]] || return 0
+  temporary_file="$(mktemp "$(dirname "$pyproject_file")/.pyproject.runtime.XXXXXX")"
+  awk '
+    {
+      if (skipping_dependency_groups) {
+        if ($0 ~ /^[[:space:]]*\[/) {
+          skipping_dependency_groups = 0
+        } else {
+          next
+        }
+      }
+      if ($0 ~ /^[[:space:]]*\[dependency-groups\][[:space:]]*$/) {
+        skipping_dependency_groups = 1
+        next
+      }
+      if (skipping_legacy_group) {
+        if ($0 ~ /]/) {
+          skipping_legacy_group = 0
+        }
+        next
+      }
+      if ($0 ~ /^[[:space:]]*\[/) {
+        in_tool_uv = ($0 ~ /^[[:space:]]*\[tool\.uv\][[:space:]]*$/)
+        print
+        next
+      }
+      if (in_tool_uv && $0 ~ /^[[:space:]]*(dev-dependencies|default-groups)[[:space:]]*=/) {
+        if ($0 ~ /\[/ && $0 !~ /]/) {
+          skipping_legacy_group = 1
+        }
+        next
+      }
+      print
+    }
+  ' "$pyproject_file" >"$temporary_file"
+  mv -- "$temporary_file" "$pyproject_file"
+}
+
+configure_pyproject_environment() {
+  local pyproject_file=$1
+  local target_arch=$2
+  local python_version=$3
+  local platform_machine marker temporary_file
+
+  [[ -f "$pyproject_file" ]] || return 0
+  case "$(normalize_arch "$target_arch")" in
+    x86_64)
+      platform_machine=x86_64
+      ;;
+    aarch64)
+      platform_machine=aarch64
+      ;;
+  esac
+  marker="sys_platform == 'linux' and platform_machine == '$platform_machine' and python_version == '$python_version'"
+  temporary_file="$(mktemp "$(dirname "$pyproject_file")/.pyproject.environment.XXXXXX")"
+
+  awk -v marker="$marker" '
+    function print_environment() {
+      print "environments = ["
+      print "  \"" marker "\","
+      print "]"
+    }
+    {
+      if (skipping_environment) {
+        if ($0 ~ /]/) {
+          skipping_environment = 0
+        }
+        next
+      }
+      if ($0 ~ /^[[:space:]]*\[tool\.uv\][[:space:]]*$/) {
+        print
+        print_environment()
+        inserted_environment = 1
+        in_tool_uv = 1
+        next
+      }
+      if (in_tool_uv && $0 ~ /^[[:space:]]*\[/) {
+        in_tool_uv = 0
+      }
+      if (in_tool_uv && $0 ~ /^[[:space:]]*environments[[:space:]]*=/) {
+        if ($0 !~ /]/) {
+          skipping_environment = 1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (!inserted_environment) {
+        print ""
+        print "[tool.uv]"
+        print_environment()
+      }
+    }
+  ' "$pyproject_file" >"$temporary_file"
+  mv -- "$temporary_file" "$pyproject_file"
+}
+
 write_offline_metadata() {
   local plugin_dir=$1
   local clean_requirements=$2
+  local target_arch=${3:-${TARGET_ARCH:-$(normalize_arch "$(uname -m)")}}
+  local python_version=${4:-$(detect_python_version "$plugin_dir")}
 
   {
     printf '%s\n' '--no-index' '--find-links=./wheels'
@@ -151,6 +256,8 @@ format = "flat"
 default = true
 EOF
 
+  sanitize_pyproject_for_runtime "$plugin_dir/pyproject.toml"
+  configure_pyproject_environment "$plugin_dir/pyproject.toml" "$target_arch" "$python_version"
   rm -f -- "$plugin_dir/uv.lock"
   sanitize_difyignore "$plugin_dir/.difyignore"
 }
@@ -323,7 +430,7 @@ initialize_runtime() {
 
   HOST_ARCH="$(normalize_arch "$(uname -m)")"
   TARGET_ARCH="$(normalize_arch "${DIFY_TARGET_ARCH:-$HOST_ARCH}")"
-  PACKAGER_BINARY="${DIFY_PACKAGER_BINARY:-$SCRIPT_DIR/$(packager_name_for_host "$HOST_ARCH")}" 
+  PACKAGER_BINARY="${DIFY_PACKAGER_BINARY:-$SCRIPT_DIR/$(packager_name_for_host "$HOST_ARCH")}"
 
   command -v unzip >/dev/null 2>&1 || {
     printf 'unzip not found\n' >&2
@@ -378,7 +485,11 @@ repackage() {
     "$plugin_dir/wheels" \
     "$TARGET_ARCH" \
     "$python_version"
-  write_offline_metadata "$plugin_dir" "$staging/download-requirements.txt"
+  write_offline_metadata \
+    "$plugin_dir" \
+    "$staging/download-requirements.txt" \
+    "$TARGET_ARCH" \
+    "$python_version"
 
   printf 'Verifying requirements.txt offline path ...\n'
   verify_requirements_offline "$plugin_dir" "$TARGET_ARCH" "$python_version"
