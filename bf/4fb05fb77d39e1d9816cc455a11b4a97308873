@@ -1,0 +1,33 @@
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_0d19812e78bc70 283-287
+  s_c1a60985b94e3d::t_50857d2f997ab5 74-83,187-281
+  s_c1a60985b94e3d::t_d4b3034c7f4cd5 288-303
+  s_e581ca7c18baf5::t_391d3c33e7b7a6 282
+plugin_repackaging.sh
+  s_c1a60985b94e3d::t_9928590bd18f99 5-6,8-14,220-397,402-434,439-456,458-460
+  s_c1a60985b94e3d::t_ea22bc4b08543d 435-438
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "bf4fb05fb77d39e1d9816cc455a11b4a97308873",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    },
+    "s_e581ca7c18baf5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa78f-fe09-7232-9ca0-5e3e0873a19c",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
