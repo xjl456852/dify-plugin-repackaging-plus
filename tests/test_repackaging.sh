@@ -71,7 +71,16 @@ assert_eq $'manylinux_2_28_aarch64\nmanylinux2014_aarch64' "$(default_platforms 
 assert_eq custom_aarch64 "$(DIFY_MANYLINUX_PLATFORMS=custom_aarch64 default_platforms aarch64)" 'platform override'
 
 FIXTURE_DIR="$(mktemp -d /tmp/dify-repackaging-tests.XXXXXX)"
-trap 'rm -rf -- "$FIXTURE_DIR"' EXIT
+GENERATED_TEST_OUTPUT=
+
+cleanup_test_files() {
+  rm -rf -- "$FIXTURE_DIR"
+  if [[ "$GENERATED_TEST_OUTPUT" == "$ROOT_DIR/source plugin-offline.difypkg" ]]; then
+    rm -f -- "$GENERATED_TEST_OUTPUT"
+  fi
+}
+
+trap cleanup_test_files EXIT
 
 metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
@@ -173,6 +182,123 @@ if DIFY_PIP_COMMAND="$fake_bin/pip-fail" download_wheels "$empty_requirements" "
   pass 'empty requirements do not invoke pip'
 else
   fail 'empty requirements do not invoke pip'
+fi
+
+cat >"$fake_bin/uv-runtime" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$UV_ARGS_LOG"
+exit "${FAKE_UV_EXIT:-0}"
+EOF
+cat >"$fake_bin/dify-packager" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$PACKAGER_ARGS_LOG"
+exec "$REAL_PACKAGER" "$@"
+EOF
+cat >"$fake_bin/packager-fail" <<'EOF'
+#!/usr/bin/env bash
+exit 29
+EOF
+chmod +x "$fake_bin/uv-runtime" "$fake_bin/dify-packager" "$fake_bin/packager-fail"
+
+input_package="$FIXTURE_DIR/source plugin.difypkg"
+cp "$ROOT_DIR/langgenius-openai_api_compatible_0.0.57.difypkg" "$input_package"
+GENERATED_TEST_OUTPUT="$ROOT_DIR/source plugin-offline.difypkg"
+rm -f -- "$GENERATED_TEST_OUTPUT"
+export UV_ARGS_LOG="$FIXTURE_DIR/uv-runtime.args"
+export PACKAGER_ARGS_LOG="$FIXTURE_DIR/packager.args"
+export REAL_PACKAGER="$ROOT_DIR/dify-plugin-linux-amd64-5g"
+chmod +x "$REAL_PACKAGER"
+
+run_log="$FIXTURE_DIR/repackage.log"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$run_log" 2>&1; then
+  pass 'local command packages a path containing spaces'
+else
+  fail 'local command packages a path containing spaces'
+fi
+
+if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
+  pass 'offline package is created'
+  archive_entries="$(unzip -Z1 "$GENERATED_TEST_OUTPUT")"
+  assert_eq 1 "$(grep -c '^requirements.txt$' <<<"$archive_entries")" 'archive contains requirements'
+  assert_eq 1 "$(grep -c '^uv.toml$' <<<"$archive_entries")" 'archive contains uv config'
+  assert_eq 1 "$(grep -c '^pyproject.toml$' <<<"$archive_entries")" 'archive preserves pyproject'
+  assert_eq 1 "$(grep -c '^wheels/example-1.0-py3-none-any.whl$' <<<"$archive_entries")" 'archive contains wheelhouse'
+  assert_eq 0 "$(grep -c '^uv.lock$' <<<"$archive_entries")" 'archive excludes remote lock'
+else
+  fail 'offline package is created'
+fi
+
+if [[ -f "$UV_ARGS_LOG" ]]; then
+  assert_file_contains "$UV_ARGS_LOG" 'pip install' 'requirements path is dry-run validated'
+  assert_file_contains "$UV_ARGS_LOG" 'sync' 'pyproject path is dry-run validated'
+  assert_file_contains "$UV_ARGS_LOG" '--offline' 'validation explicitly disables network'
+else
+  fail 'uv validation commands are recorded'
+fi
+
+staging_count="$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*' | wc -l)"
+assert_eq 0 "$staging_count" 'successful build cleans its staging directory'
+
+rm -f -- "$GENERATED_TEST_OUTPUT"
+if DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/pip-failure.log" 2>&1; then
+  fail 'pip failure stops repackaging'
+else
+  pass 'pip failure stops repackaging'
+fi
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'pip failure leaves no stale output'
+
+rm -f -- "$GENERATED_TEST_OUTPUT"
+if FAKE_UV_EXIT=31 \
+  DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/uv-failure.log" 2>&1; then
+  fail 'uv validation failure stops repackaging'
+else
+  pass 'uv validation failure stops repackaging'
+fi
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'uv failure leaves no stale output'
+
+rm -f -- "$GENERATED_TEST_OUTPUT"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/packager-fail" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/packager-failure.log" 2>&1; then
+  fail 'packager failure stops repackaging'
+else
+  pass 'packager failure stops repackaging'
+fi
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'packager failure leaves no stale output'
+
+if github_usage_error="$(github_source github 2>&1)"; then
+  github_usage_status=0
+else
+  github_usage_status=$?
+fi
+if ((github_usage_status != 0)); then
+  pass 'github mode rejects missing arguments'
+else
+  fail 'github mode rejects missing arguments'
+fi
+if grep -Fq 'Usage:' <<<"$github_usage_error"; then
+  pass 'github mode reports usage for missing arguments'
+else
+  fail 'github mode reports usage for missing arguments'
+fi
+if grep -Fq 'unbound variable' <<<"$github_usage_error"; then
+  fail 'github mode validates before reading arguments'
+else
+  pass 'github mode validates before reading arguments'
 fi
 
 if grep -q 'DIFY_TARGET_ARCH=aarch64' "$ROOT_DIR/plugin_repackaging_amd64_to_arm64.sh" &&
