@@ -1,0 +1,20 @@
+docs/superpowers/specs/2026-08-01-dify-plugin-offline-packaging-design.md
+  s_c1a60985b94e3d::t_70e50ce3a867cd 1-81,83-111,113-133
+  s_c1a60985b94e3d::t_62c935b46aa4c5 82,112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "3296307841af178bda1b629359dbf4ae42adc2ee",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
