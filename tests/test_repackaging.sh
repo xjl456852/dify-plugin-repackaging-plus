@@ -70,6 +70,62 @@ assert_eq cp312 "$(python_abi 3.12)" 'Python 3.12 ABI'
 assert_eq $'manylinux_2_28_aarch64\nmanylinux2014_aarch64' "$(default_platforms aarch64)" 'ARM64 platform set'
 assert_eq custom_aarch64 "$(DIFY_MANYLINUX_PLATFORMS=custom_aarch64 default_platforms aarch64)" 'platform override'
 
+FIXTURE_DIR="$(mktemp -d /tmp/dify-repackaging-tests.XXXXXX)"
+trap 'rm -rf -- "$FIXTURE_DIR"' EXIT
+
+metadata_dir="$FIXTURE_DIR/metadata"
+mkdir -p "$metadata_dir"
+printf '3.12\n' >"$metadata_dir/.python-version"
+printf '%s\n' '--no-index --find-links=./old-wheels' 'requests==2.34.2' >"$metadata_dir/requirements.txt"
+printf '%s\n' '[project]' 'requires-python = ">=3.12"' >"$metadata_dir/pyproject.toml"
+printf 'version = 1\n' >"$metadata_dir/uv.lock"
+printf '%s\n' 'wheels/' '/wheels/**' 'uv.toml' '.venv/' >"$metadata_dir/.difyignore"
+
+assert_eq 3.12 "$(detect_python_version "$metadata_dir")" 'reads .python-version'
+assert_eq 3.13 "$(DIFY_PYTHON_VERSION=3.13 detect_python_version "$metadata_dir")" 'Python version override'
+
+prepare_download_requirements "$metadata_dir" "$metadata_dir/download.txt"
+assert_file_not_contains "$metadata_dir/download.txt" '--no-index' 'download input strips old no-index directive'
+assert_file_contains "$metadata_dir/download.txt" 'requests==2.34.2' 'download input keeps pinned requirement'
+
+write_offline_metadata "$metadata_dir" "$metadata_dir/download.txt"
+assert_file_starts_with "$metadata_dir/requirements.txt" $'--no-index\n--find-links=./wheels' 'requirements uses local wheelhouse only'
+assert_file_contains "$metadata_dir/uv.toml" 'offline = true' 'uv config disables network'
+assert_file_contains "$metadata_dir/uv.toml" 'url = "./wheels"' 'uv config uses local wheelhouse'
+assert_file_contains "$metadata_dir/uv.toml" 'format = "flat"' 'uv config declares flat index'
+assert_file_contains "$metadata_dir/uv.toml" 'default = true' 'uv config replaces default registry'
+assert_file_missing "$metadata_dir/uv.lock" 'remote uv lock is removed'
+assert_file_not_contains "$metadata_dir/.difyignore" 'wheels/' 'difyignore includes wheels'
+assert_file_not_contains "$metadata_dir/.difyignore" 'uv.toml' 'difyignore includes uv config'
+assert_file_contains "$metadata_dir/.difyignore" '.venv/' 'difyignore preserves unrelated patterns'
+
+fake_bin="$FIXTURE_DIR/fake-bin"
+mkdir -p "$fake_bin"
+cat >"$fake_bin/uv-export" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$UV_EXPORT_LOG"
+printf 'httpx==0.28.1\n'
+EOF
+chmod +x "$fake_bin/uv-export"
+
+export_dir="$FIXTURE_DIR/export-with-lock"
+mkdir -p "$export_dir"
+printf '%s\n' '[project]' 'dependencies = ["httpx==0.28.1"]' >"$export_dir/pyproject.toml"
+printf 'version = 1\n' >"$export_dir/uv.lock"
+export UV_EXPORT_LOG="$FIXTURE_DIR/uv-export.args"
+DIFY_UV_COMMAND="$fake_bin/uv-export" prepare_download_requirements "$export_dir" "$export_dir/download.txt"
+assert_file_contains "$export_dir/download.txt" 'httpx==0.28.1' 'pyproject-only input exports requirements'
+assert_file_contains "$UV_EXPORT_LOG" '--frozen' 'uv export honors existing lock'
+assert_file_contains "$UV_EXPORT_LOG" '--no-emit-project' 'uv export excludes the plugin project'
+assert_file_contains "$UV_EXPORT_LOG" 'dev' 'uv export excludes development dependencies'
+
+export_dir_no_lock="$FIXTURE_DIR/export-without-lock"
+mkdir -p "$export_dir_no_lock"
+printf '%s\n' '[project]' 'dependencies = ["httpx==0.28.1"]' >"$export_dir_no_lock/pyproject.toml"
+: >"$UV_EXPORT_LOG"
+DIFY_UV_COMMAND="$fake_bin/uv-export" prepare_download_requirements "$export_dir_no_lock" "$export_dir_no_lock/download.txt"
+assert_file_not_contains "$UV_EXPORT_LOG" '--frozen' 'uv export resolves pyproject without stale lock'
+
 if grep -q 'DIFY_TARGET_ARCH=aarch64' "$ROOT_DIR/plugin_repackaging_amd64_to_arm64.sh" &&
   grep -q 'exec .*plugin_repackaging.sh' "$ROOT_DIR/plugin_repackaging_amd64_to_arm64.sh"; then
   pass 'cross-architecture wrapper delegates to unified script'

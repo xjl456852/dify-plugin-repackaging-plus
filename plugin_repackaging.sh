@@ -52,6 +52,98 @@ default_platforms() {
   printf 'manylinux_2_28_%s\nmanylinux2014_%s\n' "$suffix" "$suffix"
 }
 
+detect_python_version() {
+  local plugin_dir=$1
+  local requested=${DIFY_PYTHON_VERSION:-}
+  local detected=
+
+  if [[ -n "$requested" ]]; then
+    printf '%s\n' "$requested"
+    return
+  fi
+
+  if [[ -f "$plugin_dir/.python-version" ]]; then
+    detected="$(tr -d '[:space:]' <"$plugin_dir/.python-version")"
+  elif [[ -f "$plugin_dir/pyproject.toml" ]]; then
+    detected="$(
+      sed -nE \
+        's/^[[:space:]]*requires-python[[:space:]]*=[[:space:]]*"[^0-9]*([0-9]+\.[0-9]+).*"/\1/p' \
+        "$plugin_dir/pyproject.toml" | head -n1
+    )"
+  fi
+
+  printf '%s\n' "${detected:-3.12}"
+}
+
+export_requirements_from_uv() {
+  local plugin_dir=$1
+  local output=$2
+  local uv_command=${DIFY_UV_COMMAND:-uv}
+  local -a args=(
+    export
+    --format requirements.txt
+    --no-group dev
+    --no-emit-project
+    --no-hashes
+    --no-header
+    --no-annotate
+  )
+
+  if [[ -f "$plugin_dir/uv.lock" ]]; then
+    args+=(--frozen)
+  fi
+
+  (cd "$plugin_dir" && "$uv_command" "${args[@]}") >"$output"
+}
+
+prepare_download_requirements() {
+  local plugin_dir=$1
+  local output=$2
+
+  if [[ -f "$plugin_dir/requirements.txt" ]]; then
+    sed -E \
+      '/^[[:space:]]*--(no-index|find-links)([=[:space:]].*)?$/d' \
+      "$plugin_dir/requirements.txt" >"$output"
+  elif [[ -f "$plugin_dir/pyproject.toml" ]]; then
+    export_requirements_from_uv "$plugin_dir" "$output"
+  else
+    : >"$output"
+  fi
+}
+
+sanitize_difyignore() {
+  local ignore_file=$1
+
+  [[ -f "$ignore_file" ]] || return 0
+  sed -i -E \
+    -e '\#^[[:space:]]*/?wheels(/(\*\*)?)?/?[[:space:]]*$#d' \
+    -e '\#^[[:space:]]*/?uv\.toml[[:space:]]*$#d' \
+    "$ignore_file"
+}
+
+write_offline_metadata() {
+  local plugin_dir=$1
+  local clean_requirements=$2
+
+  {
+    printf '%s\n' '--no-index' '--find-links=./wheels'
+    cat "$clean_requirements"
+  } >"$plugin_dir/requirements.txt"
+
+  cat >"$plugin_dir/uv.toml" <<'EOF'
+offline = true
+
+[[index]]
+name = "dify-offline-wheels"
+url = "./wheels"
+format = "flat"
+default = true
+EOF
+
+  rm -f -- "$plugin_dir/uv.lock"
+  sanitize_difyignore "$plugin_dir/.difyignore"
+}
+
 usage() {
   printf 'Usage: %s {local <difypkg>|market <author> <name> <version>|github <repo> <release> <asset>}\n' "$0"
 }
