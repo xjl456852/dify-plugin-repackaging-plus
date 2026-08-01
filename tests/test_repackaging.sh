@@ -60,6 +60,15 @@ assert_file_starts_with() {
   fi
 }
 
+assert_toml_valid() {
+  local file=$1 name=${2:-"$file is valid TOML"}
+  if python3 -c 'import pathlib, sys, tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text())' "$file"; then
+    pass "$name"
+  else
+    fail "$name"
+  fi
+}
+
 source "$ROOT_DIR/plugin_repackaging.sh"
 
 assert_eq x86_64 "$(normalize_arch amd64)" 'amd64 normalizes to x86_64'
@@ -70,15 +79,34 @@ assert_eq cp312 "$(python_abi 3.12)" 'Python 3.12 ABI'
 assert_eq cp312 "$(python_abi 3.12.7)" 'Python patch version normalizes to CPython 3.12 ABI'
 assert_eq $'manylinux_2_28_aarch64\nmanylinux2014_aarch64' "$(default_platforms aarch64)" 'ARM64 platform set'
 assert_eq custom_aarch64 "$(DIFY_MANYLINUX_PLATFORMS=custom_aarch64 default_platforms aarch64)" 'platform override'
+if uv_version_at_least 0.7.21 0.7.21 && uv_version_at_least 0.11.24 0.7.21; then
+  pass 'supported uv versions satisfy the minimum'
+else
+  fail 'supported uv versions satisfy the minimum'
+fi
+if uv_version_at_least 0.7.20 0.7.21; then
+  fail 'uv version before sync target-platform support is rejected'
+else
+  pass 'uv version before sync target-platform support is rejected'
+fi
 
 FIXTURE_DIR="$(mktemp -d /tmp/dify-repackaging-tests.XXXXXX)"
 GENERATED_TEST_OUTPUT=
+GENERATED_REMOTE_FILES=()
 
 cleanup_test_files() {
   rm -rf -- "$FIXTURE_DIR"
   if [[ "$GENERATED_TEST_OUTPUT" == "$ROOT_DIR/source plugin-offline.difypkg" ]]; then
     rm -f -- "$GENERATED_TEST_OUTPUT"
   fi
+  local generated_remote_file
+  for generated_remote_file in "${GENERATED_REMOTE_FILES[@]}"; do
+    case "$generated_remote_file" in
+      "$ROOT_DIR"/repackaging-test-*)
+        rm -f -- "$generated_remote_file"
+        ;;
+    esac
+  done
 }
 
 trap cleanup_test_files EXIT
@@ -130,21 +158,24 @@ printf '%s\n' \
   'dependencies = ["httpx==0.28.1"]' \
   '[tool.uv]' \
   'dev-dependencies = [' \
-  '  "pytest>=9.0.3",' \
+  '  "pytest-cov[all]>=7.0.0",' \
   ']' \
-  'environments = [' \
-  '  "sys_platform == '\''win32'\''",' \
-  ']' \
-  'index-strategy = "first-index"' >"$legacy_uv_dir/pyproject.toml"
+  'environments = "sys_platform == '\''win32'\''"' \
+  'index-strategy = "first-index"' \
+  '[tool.example]' \
+  'enabled = true' >"$legacy_uv_dir/pyproject.toml"
 
 sanitize_pyproject_for_runtime "$legacy_uv_dir/pyproject.toml"
 configure_pyproject_environment "$legacy_uv_dir/pyproject.toml" aarch64 3.12
 assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'dev-dependencies' 'legacy uv development dependency key is removed'
-assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'pytest' 'legacy uv development packages are removed'
+assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'pytest-cov' 'legacy uv development package extras are removed safely'
 assert_file_not_contains "$legacy_uv_dir/pyproject.toml" 'win32' 'existing uv environment marker is replaced'
 assert_file_contains "$legacy_uv_dir/pyproject.toml" "platform_machine == 'aarch64'" 'existing tool.uv receives target environment'
 assert_file_contains "$legacy_uv_dir/pyproject.toml" 'index-strategy = "first-index"' 'existing tool.uv settings are preserved'
+assert_file_contains "$legacy_uv_dir/pyproject.toml" '[tool.example]' 'section after scalar uv environment is preserved'
+assert_file_contains "$legacy_uv_dir/pyproject.toml" 'enabled = true' 'settings after scalar uv environment are preserved'
 assert_eq 1 "$(grep -c '^\[tool\.uv\]$' "$legacy_uv_dir/pyproject.toml")" 'existing tool.uv section is not duplicated'
+assert_toml_valid "$legacy_uv_dir/pyproject.toml" 'normalized legacy uv metadata remains valid TOML'
 
 fake_bin="$FIXTURE_DIR/fake-bin"
 mkdir -p "$fake_bin"
@@ -225,8 +256,16 @@ fi
 
 cat >"$fake_bin/uv-runtime" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then
+  printf 'uv 0.11.24\n'
+  exit 0
+fi
 printf '%s\n' "$*" >>"$UV_ARGS_LOG"
 exit "${FAKE_UV_EXIT:-0}"
+EOF
+cat >"$fake_bin/uv-old" <<'EOF'
+#!/usr/bin/env bash
+printf 'uv 0.7.20\n'
 EOF
 cat >"$fake_bin/dify-packager" <<'EOF'
 #!/usr/bin/env bash
@@ -237,7 +276,18 @@ cat >"$fake_bin/packager-fail" <<'EOF'
 #!/usr/bin/env bash
 exit 29
 EOF
-chmod +x "$fake_bin/uv-runtime" "$fake_bin/dify-packager" "$fake_bin/packager-fail"
+cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 37
+EOF
+chmod +x "$fake_bin/uv-runtime" "$fake_bin/uv-old" "$fake_bin/dify-packager" "$fake_bin/packager-fail" "$fake_bin/curl"
+
+if check_uv_version "$fake_bin/uv-old" >"$FIXTURE_DIR/uv-old.log" 2>&1; then
+  fail 'uv without sync target-platform support is rejected by runtime check'
+else
+  pass 'uv without sync target-platform support is rejected by runtime check'
+fi
+assert_file_contains "$FIXTURE_DIR/uv-old.log" '0.7.21 or newer' 'old uv error reports the required version'
 
 input_package="$FIXTURE_DIR/source plugin.difypkg"
 cp "$ROOT_DIR/langgenius-openai_api_compatible_0.0.57.difypkg" "$input_package"
@@ -319,6 +369,37 @@ else
   pass 'packager failure stops repackaging'
 fi
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'packager failure leaves no stale output'
+
+remote_test_id="repackaging-test-${BASHPID}"
+github_asset="${remote_test_id}.difypkg"
+github_download="$ROOT_DIR/${remote_test_id}-v-test.difypkg"
+github_offline="$ROOT_DIR/${remote_test_id}-v-test-offline.difypkg"
+GENERATED_REMOTE_FILES+=("$github_download" "$github_offline")
+touch "$github_offline"
+if PATH="$fake_bin:$PATH" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  bash "$ROOT_DIR/plugin_repackaging.sh" github owner/repository v-test "$github_asset" >"$FIXTURE_DIR/github-download-failure.log" 2>&1; then
+  fail 'GitHub download failure stops repackaging'
+else
+  pass 'GitHub download failure stops repackaging'
+fi
+assert_file_missing "$github_offline" 'GitHub download failure removes stale offline output'
+
+market_author="${remote_test_id}-author"
+market_download="$ROOT_DIR/${market_author}-plugin_0.0.1.difypkg"
+market_offline="$ROOT_DIR/${market_author}-plugin_0.0.1-offline.difypkg"
+GENERATED_REMOTE_FILES+=("$market_download" "$market_offline")
+touch "$market_offline"
+if PATH="$fake_bin:$PATH" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  bash "$ROOT_DIR/plugin_repackaging.sh" market "$market_author" plugin 0.0.1 >"$FIXTURE_DIR/market-download-failure.log" 2>&1; then
+  fail 'Marketplace download failure stops repackaging'
+else
+  pass 'Marketplace download failure stops repackaging'
+fi
+assert_file_missing "$market_offline" 'Marketplace download failure removes stale offline output'
 
 if github_usage_error="$(github_source github 2>&1)"; then
   github_usage_status=0

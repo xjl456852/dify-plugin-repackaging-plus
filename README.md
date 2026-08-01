@@ -32,7 +32,7 @@ Dify 安装 Python 插件时通常需要从 PyPI 下载依赖。在纯内网环�
 
 - Bash 4+
 - Python 和 pip
-- [uv](https://docs.astral.sh/uv/) 0.6.11 或更高版本
+- [uv](https://docs.astral.sh/uv/) 0.7.21 或更高版本（需要 `uv sync --python-platform`）
 - `curl`、`unzip`、`realpath`
 - 本项目附带的对应主机架构 Dify Plugin CLI
 
@@ -44,6 +44,7 @@ sudo apt install -y python3-pip curl unzip coreutils
 ```
 
 uv 可按其官方文档安装。脚本不会在运行过程中使用 `sudo` 修改系统。
+启动时会检查 uv 版本；版本过旧会直接给出最低版本提示，不会进行不可靠的降级验证。
 
 ## 使用方法
 

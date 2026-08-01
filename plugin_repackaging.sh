@@ -5,6 +5,7 @@ set -Eeuo pipefail
 GITHUB_API_URL="${GITHUB_API_URL:-https://github.com}"
 MARKETPLACE_API_URL="${MARKETPLACE_API_URL:-https://marketplace.dify.ai}"
 PIP_MIRROR_URL="${PIP_MIRROR_URL:-https://mirrors.aliyun.com/pypi/simple}"
+UV_MIN_VERSION=0.7.21
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_ARCH=
 TARGET_ARCH=
@@ -37,6 +38,45 @@ packager_name_for_host() {
       printf 'dify-plugin-linux-arm64-5g\n'
       ;;
   esac
+}
+
+uv_version_at_least() {
+  local installed=$1 required=$2
+  local installed_major installed_minor installed_patch
+  local required_major required_minor required_patch
+
+  IFS=. read -r installed_major installed_minor installed_patch <<<"$installed"
+  IFS=. read -r required_major required_minor required_patch <<<"$required"
+  [[ "$installed_major" =~ ^[0-9]+$ && "$installed_minor" =~ ^[0-9]+$ && "$installed_patch" =~ ^[0-9]+$ ]] || return 1
+  [[ "$required_major" =~ ^[0-9]+$ && "$required_minor" =~ ^[0-9]+$ && "$required_patch" =~ ^[0-9]+$ ]] || return 1
+
+  if ((10#$installed_major != 10#$required_major)); then
+    ((10#$installed_major > 10#$required_major))
+  elif ((10#$installed_minor != 10#$required_minor)); then
+    ((10#$installed_minor > 10#$required_minor))
+  else
+    ((10#$installed_patch >= 10#$required_patch))
+  fi
+}
+
+check_uv_version() {
+  local uv_command=$1
+  local version_output installed_version
+
+  version_output="$("$uv_command" --version)" || {
+    printf 'failed to read uv version: %s\n' "$uv_command" >&2
+    return 1
+  }
+  if [[ "$version_output" =~ (^|[[:space:]])([0-9]+\.[0-9]+\.[0-9]+)($|[[:space:]]) ]]; then
+    installed_version=${BASH_REMATCH[2]}
+  else
+    printf 'unable to parse uv version: %s\n' "$version_output" >&2
+    return 1
+  fi
+  if ! uv_version_at_least "$installed_version" "$UV_MIN_VERSION"; then
+    printf 'uv %s or newer is required (found %s)\n' "$UV_MIN_VERSION" "$installed_version" >&2
+    return 1
+  fi
 }
 
 normalize_python_version() {
@@ -154,6 +194,38 @@ sanitize_pyproject_for_runtime() {
   [[ -f "$pyproject_file" ]] || return 0
   temporary_file="$(mktemp "$(dirname "$pyproject_file")/.pyproject.runtime.XXXXXX")"
   awk '
+    function array_delta(line,    i, character, quote, escaped, delta) {
+      quote = ""
+      escaped = 0
+      delta = 0
+      for (i = 1; i <= length(line); i++) {
+        character = substr(line, i, 1)
+        if (quote == "double") {
+          if (escaped) {
+            escaped = 0
+          } else if (character == "\\") {
+            escaped = 1
+          } else if (character == "\"") {
+            quote = ""
+          }
+        } else if (quote == "single") {
+          if (character == sprintf("%c", 39)) {
+            quote = ""
+          }
+        } else if (character == "#") {
+          break
+        } else if (character == "\"") {
+          quote = "double"
+        } else if (character == sprintf("%c", 39)) {
+          quote = "single"
+        } else if (character == "[") {
+          delta++
+        } else if (character == "]") {
+          delta--
+        }
+      }
+      return delta
+    }
     {
       if (skipping_dependency_groups) {
         if ($0 ~ /^[[:space:]]*\[/) {
@@ -167,7 +239,8 @@ sanitize_pyproject_for_runtime() {
         next
       }
       if (skipping_legacy_group) {
-        if ($0 ~ /]/) {
+        legacy_group_depth += array_delta($0)
+        if (legacy_group_depth <= 0) {
           skipping_legacy_group = 0
         }
         next
@@ -178,7 +251,8 @@ sanitize_pyproject_for_runtime() {
         next
       }
       if (in_tool_uv && $0 ~ /^[[:space:]]*(dev-dependencies|default-groups)[[:space:]]*=/) {
-        if ($0 ~ /\[/ && $0 !~ /]/) {
+        legacy_group_depth = array_delta($0)
+        if (legacy_group_depth > 0) {
           skipping_legacy_group = 1
         }
         next
@@ -208,6 +282,38 @@ configure_pyproject_environment() {
   temporary_file="$(mktemp "$(dirname "$pyproject_file")/.pyproject.environment.XXXXXX")"
 
   awk -v marker="$marker" '
+    function array_delta(line,    i, character, quote, escaped, delta) {
+      quote = ""
+      escaped = 0
+      delta = 0
+      for (i = 1; i <= length(line); i++) {
+        character = substr(line, i, 1)
+        if (quote == "double") {
+          if (escaped) {
+            escaped = 0
+          } else if (character == "\\") {
+            escaped = 1
+          } else if (character == "\"") {
+            quote = ""
+          }
+        } else if (quote == "single") {
+          if (character == sprintf("%c", 39)) {
+            quote = ""
+          }
+        } else if (character == "#") {
+          break
+        } else if (character == "\"") {
+          quote = "double"
+        } else if (character == sprintf("%c", 39)) {
+          quote = "single"
+        } else if (character == "[") {
+          delta++
+        } else if (character == "]") {
+          delta--
+        }
+      }
+      return delta
+    }
     function print_environment() {
       print "environments = ["
       print "  \"" marker "\","
@@ -215,7 +321,8 @@ configure_pyproject_environment() {
     }
     {
       if (skipping_environment) {
-        if ($0 ~ /]/) {
+        environment_depth += array_delta($0)
+        if (environment_depth <= 0) {
           skipping_environment = 0
         }
         next
@@ -231,7 +338,8 @@ configure_pyproject_environment() {
         in_tool_uv = 0
       }
       if (in_tool_uv && $0 ~ /^[[:space:]]*environments[[:space:]]*=/) {
-        if ($0 !~ /]/) {
+        environment_depth = array_delta($0)
+        if (environment_depth > 0) {
           skipping_environment = 1
         }
         next
@@ -439,6 +547,17 @@ cleanup_runtime() {
   return "$status"
 }
 
+register_output_for_package() {
+  local package_path=$1
+  local package_filename package_name
+
+  package_filename="$(basename "$package_path")"
+  package_name="${package_filename%.*}"
+  ACTIVE_OUTPUT="$SCRIPT_DIR/${package_name}-offline.difypkg"
+  BUILD_SUCCEEDED=false
+  rm -f -- "$ACTIVE_OUTPUT"
+}
+
 initialize_runtime() {
   local uv_command=${DIFY_UV_COMMAND:-uv}
 
@@ -458,6 +577,7 @@ initialize_runtime() {
     printf 'uv not found: %s\n' "$uv_command" >&2
     return 1
   fi
+  check_uv_version "$uv_command"
   if [[ ! -f "$PACKAGER_BINARY" ]]; then
     printf 'Dify packager not found: %s\n' "$PACKAGER_BINARY" >&2
     return 1
@@ -467,16 +587,13 @@ initialize_runtime() {
 
 repackage() {
   local package_path=$1
-  local package_filename package_name staging plugin_dir output python_version
+  local package_filename staging plugin_dir output python_version
   local requires_wheel=false
   local requires_pyproject=false
 
   package_filename="$(basename "$package_path")"
-  package_name="${package_filename%.*}"
-  output="$SCRIPT_DIR/${package_name}-offline.difypkg"
-  ACTIVE_OUTPUT=$output
-  BUILD_SUCCEEDED=false
-  rm -f -- "$output"
+  register_output_for_package "$package_path"
+  output=$ACTIVE_OUTPUT
 
   staging="$(mktemp -d "$SCRIPT_DIR/.dify-repackaging.XXXXXX")"
   ACTIVE_STAGING=$staging
@@ -551,6 +668,7 @@ market_source() {
     return 1
   }
   output="$SCRIPT_DIR/$2-$3_$4.difypkg"
+  register_output_for_package "$output"
   curl --fail --location --show-error --output "$output" \
     "$MARKETPLACE_API_URL/api/v1/plugins/$2/$3/$4/download"
   repackage "$output"
@@ -574,6 +692,7 @@ github_source() {
     repo="$GITHUB_API_URL/$repo"
   fi
   output="$SCRIPT_DIR/${asset%.difypkg}-$release.difypkg"
+  register_output_for_package "$output"
   curl --fail --location --show-error --output "$output" \
     "$repo/releases/download/$release/$asset"
   repackage "$output"
