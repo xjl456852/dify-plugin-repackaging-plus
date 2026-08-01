@@ -1,0 +1,24 @@
+docs/superpowers/plans/2026-08-01-dify-plugin-offline-packaging.md
+  s_c1a60985b94e3d::t_6a40524d0a0e58 1-43,60-72,74-128,133-198,200-238,255-325,342-401,403-404,422-455,477-479,481-487,489,491,493-496,546-548,550-633
+  s_c1a60985b94e3d::t_64de0d3b318cf2 402,405-421,456-462,480,488,490,492,497-510,525-545,549
+  s_c1a60985b94e3d::t_850f21da7af910 199
+  s_c1a60985b94e3d::t_48dfffdc837057 44-59,73,129-132
+  s_c1a60985b94e3d::t_bd59adc2933319 239-254
+  s_c1a60985b94e3d::t_19ada3badf34e7 326-341,463-476,511-524
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "5ff4d45de29917ad21a85cfbc88f4b365b9d6b90",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
