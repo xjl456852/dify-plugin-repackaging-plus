@@ -147,6 +147,6 @@ export DIFY_PIP_COMMAND=/path/to/venv/bin/pip
 
 每次运行使用独立临时目录，不会复用上一次构建留下的 wheel。
 
-## 原作者文章
+## 作者文章
 
 [Dify 纯内网插件离线安装支持多平台多架构跨架构](https://www.cnblogs.com/xjl456852/p/18865586)
