@@ -1,0 +1,35 @@
+docs/superpowers/specs/2026-08-01-dify-plugin-offline-packaging-design.md
+  s_c1a60985b94e3d::t_3da51ca9f19af4 103
+docs/superpowers/plans/2026-08-01-dify-plugin-offline-packaging.md
+  s_c1a60985b94e3d::t_3da51ca9f19af4 9
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_e613285d0232cd 82-91
+  s_c1a60985b94e3d::t_42d8935b20d790 161,163-166,171,175-176
+  s_c1a60985b94e3d::t_3b92c670131001 95,102-109,279-282,372-402
+  s_c1a60985b94e3d::t_a2f2e405bb53cc 63-71,178
+  s_c1a60985b94e3d::t_68cc40557dcd7c 259-262,266-269,283-290
+plugin_repackaging.sh
+  s_c1a60985b94e3d::t_68cc40557dcd7c 8,43-81,580
+  s_c1a60985b94e3d::t_90175e64a86a6c 590
+  s_c1a60985b94e3d::t_6a8657fd9c1b13 550-560,595-596,671,695
+  s_c1a60985b94e3d::t_ea176747d44e49 197-228,242-243,254-255,285-316,324-325,341-342
+README.md
+  s_c1a60985b94e3d::t_68cc40557dcd7c 35
+  s_c1a60985b94e3d::t_3da51ca9f19af4 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "f0ba5162458f1a338f84c7ad46916167f173fdec",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
