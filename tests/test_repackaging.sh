@@ -892,6 +892,14 @@ if [[ "${REPAIR_UV_MODE:-success}" == timeout ]]; then
   sleep 5
   exit 53
 fi
+if [[ "${REPAIR_UV_MODE:-success}" == steal-secrets ]]; then
+  {
+    printf 'HOME=%s\n' "${HOME:-}"
+    [[ -f "${HOME:-}/.netrc" ]] && sed 's/^/NETRC:/' "${HOME:-}/.netrc"
+    env | grep -E 'SECRET|TOKEN|PASSWORD|PIP_MIRROR_URL' || true
+  } >"$REPAIR_SECRET_STEAL_MARKER"
+  exit 54
+fi
 out_dir=
 while (($#)); do
   if [[ "$1" == --out-dir ]]; then
@@ -1004,6 +1012,39 @@ PY
       sleep 0.001
     done
     ;;
+  cancel-block)
+    printf '%s\n' "$BASHPID" >"$REPAIR_CANCEL_UV_PID_FILE"
+    (
+      printf '%s\n' "$BASHPID" >"$REPAIR_CANCEL_CHILD_PID_FILE"
+      while :; do sleep 1; done
+    ) </dev/null >/dev/null 2>&1 &
+    python3 - "$REPAIR_CANCEL_DOUBLEFORK_PID_FILE" <<'PY'
+import os
+from pathlib import Path
+import sys
+import time
+
+
+if os.fork():
+    raise SystemExit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+null_fd = os.open(os.devnull, os.O_RDWR)
+for descriptor in (0, 1, 2):
+    os.dup2(null_fd, descriptor)
+if null_fd > 2:
+    os.close(null_fd)
+Path(sys.argv[1]).write_text(f"{os.getpid()}\n", encoding="utf-8")
+while True:
+    time.sleep(1)
+PY
+    for _ in $(seq 1 1000); do
+      [[ -s "$REPAIR_CANCEL_CHILD_PID_FILE" && -s "$REPAIR_CANCEL_DOUBLEFORK_PID_FILE" ]] && break
+      sleep 0.001
+    done
+    while :; do sleep 1; done
+    ;;
   native)
     cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
     ;;
@@ -1041,6 +1082,10 @@ export REPAIR_MUTATION_PID_FILE="$FIXTURE_DIR/sdist-repair-mutation.pid"
 export REPAIR_REPLACER_SEEN="$FIXTURE_DIR/sdist-repair-replacer.seen"
 export REPAIR_BACKGROUND_STARTED="$FIXTURE_DIR/sdist-repair-background.started"
 export REPAIR_BACKGROUND_REPLACED="$FIXTURE_DIR/sdist-repair-background.replaced"
+export REPAIR_SECRET_STEAL_MARKER="$FIXTURE_DIR/sdist-repair-secret-steal.marker"
+export REPAIR_CANCEL_UV_PID_FILE="$FIXTURE_DIR/sdist-repair-cancel-uv.pid"
+export REPAIR_CANCEL_CHILD_PID_FILE="$FIXTURE_DIR/sdist-repair-cancel-child.pid"
+export REPAIR_CANCEL_DOUBLEFORK_PID_FILE="$FIXTURE_DIR/sdist-repair-cancel-doublefork.pid"
 : >"$REPAIR_PIP_ARGS_LOG"
 : >"$REPAIR_UV_ARGS_LOG"
 : >"$REPAIR_PIP_ENV_LOG"
@@ -1056,7 +1101,7 @@ printf 'unchanged\n' >"$fake_conda_prefix/marker"
 repair_requirement='docopt>=0.6,<1'
 repair_pip_command=("$fake_bin/pip-sdist-repair")
 repair_success_log="$FIXTURE_DIR/sdist-repair-success.log"
-if PIP_MIRROR_URL='https://argv-user-secret:argv-password-secret@target-index.example/simple' \
+if PIP_MIRROR_URL='https://target-index.example/simple' \
   UV_NO_BUILD_ISOLATION='uv-isolation-sentinel' \
   UV_EXTRA_INDEX_URL='https://uv-extra-sentinel.example/simple' \
   PIP_EXTRA_INDEX_URL='https://pip-extra-sentinel.example/simple' \
@@ -1137,113 +1182,73 @@ else
 fi
 assert_eq unchanged "$(<"$fake_conda_prefix/marker")" 'repair leaves caller Conda prefix contents unchanged'
 for environment_log in "$REPAIR_PIP_ENV_LOG" "$REPAIR_UV_ENV_LOG"; do
-  assert_file_contains "$environment_log" "HOME=$repair_dir/candidate-1/auth-home" 'tool child receives only the controlled private HOME'
-  assert_file_contains "$environment_log" 'NETRC_FILE=present' 'tool child can discover private index authentication through netrc'
-  assert_file_contains "$environment_log" 'NETRC_MODE=600' 'private index credentials use mode 0600'
-  assert_file_contains "$environment_log" 'NETRC_PARSE=valid' 'private index credentials remain standards-parseable'
+  assert_file_contains "$environment_log" "HOME=$repair_dir/candidate-1" 'tool child receives only the controlled private HOME'
+  assert_file_contains "$environment_log" 'NETRC_FILE=absent' 'tool child receives no package-index credential file'
+  assert_file_contains "$environment_log" 'NETRC_MODE=absent' 'tool child cannot read private index credentials'
+  assert_file_contains "$environment_log" 'NETRC_PARSE=absent-or-invalid' 'tool child receives no parseable netrc authentication'
   assert_file_contains "$environment_log" 'HTTPS_PROXY=http://required-proxy.example:8080' 'required HTTP proxy survives environment isolation'
   assert_file_contains "$environment_log" "SSL_CERT_FILE=$FIXTURE_DIR/ca-sentinel.pem" 'required CA environment survives isolation'
   for poisoned_value in uv-isolation-sentinel uv-extra-sentinel pip-extra-sentinel pip-config-sentinel \
     pythonpath-sentinel /usr venv-sentinel home-sentinel fake-conda netrc-sentinel \
-    argv-user-secret argv-password-secret; do
+    caller-secret-sentinel; do
     assert_file_not_contains "$environment_log" "$poisoned_value" "tool child environment excludes caller poison $poisoned_value"
   done
 done
 for tool_args_log in "$REPAIR_PIP_ARGS_LOG" "$REPAIR_UV_ARGS_LOG"; do
-  assert_file_not_contains "$tool_args_log" 'argv-user-secret' 'tool argv excludes private-index username'
-  assert_file_not_contains "$tool_args_log" 'argv-password-secret' 'tool argv excludes private-index password'
+  assert_file_not_contains "$tool_args_log" 'caller-secret-sentinel' 'tool argv excludes caller secret sentinel'
 done
-assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-user-secret' 'private-index username is absent from observed parent process argv'
-assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-password-secret' 'private-index password is absent from observed parent process argv'
+assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'caller-secret-sentinel' 'caller secret sentinel is absent from observed parent process argv'
 assert_file_missing "$repair_dir/candidate-1/auth-home/.netrc" 'successful repair removes private netrc immediately after tool use'
 assert_file_missing "$repair_dir/candidate-1/auth-home" 'successful repair removes its empty private authentication HOME'
 
 for hostile_index_url in \
   'https://good.example machine evil.example/simple' \
   'https://good%20example.example/simple' \
+  'https://user:password@target-index.example/simple' \
   'https://user%20name:password@target-index.example/simple' \
   'https://user:pass%0Aword@target-index.example/simple' \
   'https://user:pass%22word@target-index.example/simple' \
   'https://user:pass%5Cword@target-index.example/simple' \
+  'https://target-index.example/simple?token=secret' \
+  'https://target-index.example/simple#secret' \
   'https://target-index.example/simple%20path'; do
   if printf '%s' "$hostile_index_url" | sanitize_index_url_for_tools >/dev/null 2>&1; then
-    fail 'ambiguous netrc/index token is rejected before credentials can be written'
+    fail 'authenticated or ambiguous source-build index is rejected'
   else
-    pass 'ambiguous netrc/index token is rejected before credentials can be written'
+    pass 'authenticated or ambiguous source-build index is rejected'
   fi
 done
 assert_eq \
-  'https://target-index.example/simple' \
-  "$(printf '%s' 'https://safe%2Duser:safe%2Dpassword@target-index.example/simple' | sanitize_index_url_for_tools)" \
-  'safe percent-encoded basic credentials are accepted without entering tool argv'
-assert_eq \
   'https://[2001:db8::1]:8443/simple' \
-  "$(printf '%s' 'https://ipv6-user:ipv6-password@[2001:db8::1]:8443/simple' | sanitize_index_url_for_tools)" \
-  'IPv6 package index with an explicit port is sanitized unambiguously'
-netrc_parser_home="$FIXTURE_DIR/netrc parser auth-home"
-mkdir -m 700 -- "$netrc_parser_home"
-if printf '%s' 'https://safe%2Duser:safe%2Dpassword@target-index.example/simple' | \
-  write_private_index_auth "$netrc_parser_home" && \
-  [[ "$(python3 -B - "$netrc_parser_home/.netrc" <<'PY'
-import netrc
-import sys
+  "$(printf '%s' 'https://[2001:db8::1]:8443/simple' | sanitize_index_url_for_tools)" \
+  'unauthenticated IPv6 package index with an explicit port is accepted exactly'
 
-credentials = netrc.netrc(sys.argv[1]).authenticators('target-index.example')
-print(f'{credentials[0]}:{credentials[2]}')
-PY
-)" == 'safe-user:safe-password' ]]; then
-  pass 'strict private netrc writer preserves safe percent-decoded credentials'
+authenticated_repair_parent="$FIXTURE_DIR/authenticated repair parent"
+mkdir -p "$authenticated_repair_parent"
+authenticated_repair_dir="$authenticated_repair_parent/sdist-repair"
+authenticated_repair_log="$FIXTURE_DIR/sdist-repair-authenticated-index.log"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
+rm -f -- "$REPAIR_SECRET_STEAL_MARKER"
+if PIP_MIRROR_URL='https://auth-user-sentinel:auth-password-sentinel@target-index.example/simple' \
+  REPAIR_UV_MODE=steal-secrets CALLER_SECRET_TOKEN='environment-secret-sentinel' \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$authenticated_repair_dir" '' 1 \
+    >"$authenticated_repair_log" 2>&1; then
+  fail 'authenticated index is rejected before arbitrary source-build code can run'
 else
-  fail 'strict private netrc writer preserves safe percent-decoded credentials'
+  pass 'authenticated index is rejected before arbitrary source-build code can run'
 fi
-rm -f -- "$netrc_parser_home/.netrc"
-if printf '%s' 'https://ipv6-user:ipv6-password@[2001:db8::1]:8443/simple' | \
-  write_private_index_auth "$netrc_parser_home" && \
-  python3 -B - "$netrc_parser_home/.netrc" <<'PY'
-import netrc
-import sys
-
-credentials = netrc.netrc(sys.argv[1]).authenticators('2001:db8::1')
-assert credentials is not None
-assert credentials[0] == 'ipv6-user'
-assert credentials[2] == 'ipv6-password'
-PY
-then
-  pass 'strict private netrc writer supports an IPv6 index host with explicit port'
-else
-  fail 'strict private netrc writer supports an IPv6 index host with explicit port'
-fi
-rm -f -- "$netrc_parser_home/.netrc"
-rmdir -- "$netrc_parser_home"
-
-signal_cleanup_repair="$FIXTURE_DIR/signal cleanup/sdist-repair"
-signal_cleanup_auth="$signal_cleanup_repair/candidate-1/auth-home"
-signal_cleanup_lock="$signal_cleanup_repair/.repair-lock"
-mkdir -p "$signal_cleanup_auth" "$signal_cleanup_lock"
-chmod 700 -- "$signal_cleanup_repair" "$signal_cleanup_repair/candidate-1" \
-  "$signal_cleanup_auth" "$signal_cleanup_lock"
-printf 'machine target-index.example login signal-user password signal-password\n' \
-  >"$signal_cleanup_auth/.netrc"
-chmod 600 -- "$signal_cleanup_auth/.netrc"
-if bash -c '
-  source "$1"
-  REPAIR_AUTH_HOME_TO_CLEAN=$2
-  REPAIR_LOCK_TO_RELEASE=$3
-  REPAIR_DIR_FOR_CLEANUP=$4
-  trap cleanup_sdist_repair_state EXIT
-  trap "exit 143" TERM
-  kill -TERM "$BASHPID"
-  sleep 1
-' _ "$ROOT_DIR/plugin_repackaging.sh" "$signal_cleanup_auth" "$signal_cleanup_lock" "$signal_cleanup_repair" \
-  >"$FIXTURE_DIR/sdist-repair-signal-cleanup.log" 2>&1; then
-  fail 'TERM cleanup path exits nonzero after removing private repair state'
-else
-  signal_cleanup_status=$?
-  assert_eq 143 "$signal_cleanup_status" 'TERM cleanup path preserves its signal-derived status'
-fi
-assert_file_missing "$signal_cleanup_auth/.netrc" 'TERM cleanup removes private index credentials'
-assert_file_missing "$signal_cleanup_auth" 'TERM cleanup removes empty private authentication HOME'
-assert_file_missing "$signal_cleanup_lock" 'TERM cleanup releases the exact repair-tree lock'
+assert_file_contains "$authenticated_repair_log" \
+  'authenticated package indexes are unsupported for third-party source builds' \
+  'authenticated source-build index rejection has a fixed safe explanation'
+for secret_value in auth-user-sentinel auth-password-sentinel environment-secret-sentinel; do
+  assert_file_not_contains "$authenticated_repair_log" "$secret_value" "authenticated index rejection hides $secret_value"
+done
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'authenticated index rejection cannot invoke pip'
+assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" 'authenticated index rejection cannot invoke uv'
+assert_file_missing "$REPAIR_SECRET_STEAL_MARKER" 'adversarial backend cannot inspect HOME, netrc, or caller environment secrets'
+assert_file_missing "$authenticated_repair_dir" 'authenticated index rejection creates no source-repair staging'
 
 query_repair_parent="$FIXTURE_DIR/query repair parent"
 mkdir -p "$query_repair_parent"
@@ -1378,7 +1383,7 @@ assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'cand
 
 uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
 download_failure_log="$FIXTURE_DIR/sdist-repair-download-failure.log"
-if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple' \
+if PIP_MIRROR_URL='https://target-index.example/simple' \
   REPAIR_PIP_MODE=failure \
   without_proxy_environment repair_one_pure_sdist \
     repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 2 \
@@ -1401,7 +1406,7 @@ for sdist_mode in corrupt multiple mismatch; do
   [[ "$sdist_mode" == mismatch ]] && ordinal=5
   uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
   validation_log="$FIXTURE_DIR/sdist-repair-$sdist_mode-sdist.log"
-  if PIP_MIRROR_URL='https://validation-user:validation-password@target-index.example/simple' \
+  if PIP_MIRROR_URL='https://target-index.example/simple' \
     REPAIR_PIP_MODE="$sdist_mode" \
     without_proxy_environment repair_one_pure_sdist \
       repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
@@ -1417,7 +1422,7 @@ for sdist_mode in corrupt multiple mismatch; do
 done
 
 build_failure_log="$FIXTURE_DIR/sdist-repair-build-failure.log"
-if PIP_MIRROR_URL='https://build-user-secret:build-password-secret@target-index.example/simple' \
+if PIP_MIRROR_URL='https://target-index.example/simple' \
   REPAIR_UV_MODE=failure \
   without_proxy_environment repair_one_pure_sdist \
     repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 6 \
@@ -1439,7 +1444,7 @@ for wheel_mode in native nonpure multiple mismatch; do
   [[ "$wheel_mode" == multiple ]] && ordinal=9
   [[ "$wheel_mode" == mismatch ]] && ordinal=10
   validation_log="$FIXTURE_DIR/sdist-repair-$wheel_mode-wheel.log"
-  if PIP_MIRROR_URL='https://wheel-user:wheel-password@target-index.example/simple' \
+  if PIP_MIRROR_URL='https://target-index.example/simple' \
     REPAIR_UV_MODE="$wheel_mode" \
     without_proxy_environment repair_one_pure_sdist \
       repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
@@ -1548,6 +1553,76 @@ if ((hold_pipe_elapsed <= 3)); then
 else
   fail "supervisor cleanup deadline covers inherited build-output pipes (elapsed=${hold_pipe_elapsed}s)"
 fi
+
+cancel_repair_parent="$FIXTURE_DIR/cancel repair parent"
+mkdir -p "$cancel_repair_parent"
+cancel_repair_dir="$cancel_repair_parent/sdist-repair"
+cancel_repair_log="$FIXTURE_DIR/sdist-repair-real-term.log"
+rm -f -- "$REPAIR_CANCEL_UV_PID_FILE" "$REPAIR_CANCEL_CHILD_PID_FILE" \
+  "$REPAIR_CANCEL_DOUBLEFORK_PID_FILE"
+cancel_start_ns="$(date +%s%N)"
+PIP_MIRROR_URL='https://target-index.example/simple' \
+REPAIR_UV_MODE=cancel-block DIFY_SDIST_BUILD_TIMEOUT_SECONDS=4 \
+bash -c '
+  source "$1"
+  repair_pip_command=("$2")
+  repair_one_pure_sdist \
+    repair_pip_command "$3" docopt docopt 3.12 "$4" "" 1
+' _ "$ROOT_DIR/plugin_repackaging.sh" "$fake_bin/pip-sdist-repair" \
+  "$fake_bin/uv-sdist-repair" "$cancel_repair_dir" >"$cancel_repair_log" 2>&1 &
+cancel_launcher_pid=$!
+for _ in $(seq 1 3000); do
+  if [[ -s "$REPAIR_CANCEL_UV_PID_FILE" && -s "$REPAIR_CANCEL_CHILD_PID_FILE" && \
+    -s "$REPAIR_CANCEL_DOUBLEFORK_PID_FILE" ]]; then
+    break
+  fi
+  sleep 0.001
+done
+if [[ -s "$REPAIR_CANCEL_UV_PID_FILE" ]]; then
+  cancel_uv_pid="$(<"$REPAIR_CANCEL_UV_PID_FILE")"
+  cancel_supervisor_pid="$(awk '/^PPid:/{print $2}' "/proc/$cancel_uv_pid/status" 2>/dev/null)"
+  cancel_repair_bash_pid="$(awk '/^PPid:/{print $2}' "/proc/$cancel_supervisor_pid/status" 2>/dev/null)"
+else
+  cancel_uv_pid=
+  cancel_supervisor_pid=
+  cancel_repair_bash_pid=
+fi
+if [[ "$cancel_repair_bash_pid" =~ ^[1-9][0-9]*$ ]] && kill -TERM "$cancel_repair_bash_pid" 2>/dev/null; then
+  pass 'real cancellation sends TERM only to the active repair Bash process'
+else
+  fail 'real cancellation sends TERM only to the active repair Bash process'
+  kill -TERM "$cancel_launcher_pid" 2>/dev/null || true
+fi
+if wait "$cancel_launcher_pid"; then
+  cancel_repair_status=0
+else
+  cancel_repair_status=$?
+fi
+cancel_elapsed_ms=$(( ( $(date +%s%N) - cancel_start_ns ) / 1000000 ))
+assert_eq 143 "$cancel_repair_status" 'TERM cancellation preserves the repair Bash signal-derived status'
+if ((cancel_elapsed_ms <= 2500)); then
+  pass "TERM cancellation completes descendant cleanup within the bounded deadline (${cancel_elapsed_ms}ms)"
+else
+  fail "TERM cancellation completes descendant cleanup within the bounded deadline (elapsed=${cancel_elapsed_ms}ms)"
+fi
+for cancelled_pid_file in "$REPAIR_CANCEL_UV_PID_FILE" "$REPAIR_CANCEL_CHILD_PID_FILE" \
+  "$REPAIR_CANCEL_DOUBLEFORK_PID_FILE"; do
+  cancelled_pid="$(<"$cancelled_pid_file")"
+  if kill -0 "$cancelled_pid" 2>/dev/null; then
+    fail "TERM cancellation reaps descendant PID from $(basename -- "$cancelled_pid_file")"
+    kill -KILL "$cancelled_pid" 2>/dev/null || true
+  else
+    pass "TERM cancellation reaps descendant PID from $(basename -- "$cancelled_pid_file")"
+  fi
+done
+assert_file_missing "$cancel_repair_dir/.repair-lock" 'TERM cancellation releases the exact repair-tree lock'
+if [[ -d "$cancel_repair_dir/built-wheels" ]]; then
+  assert_eq 0 "$(find "$cancel_repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'TERM cancellation admits no wheel'
+else
+  pass 'TERM cancellation admits no wheel'
+fi
+assert_eq 0 "$(find "$cancel_repair_dir" -type f \( -name '*build*log*' -o -name '*.netrc' \) | wc -l)" \
+  'TERM cancellation removes raw build logs and retains no credential artifact'
 
 mutation_repair_parent="$FIXTURE_DIR/mutation repair parent"
 mkdir -p "$mutation_repair_parent"
@@ -1725,6 +1800,19 @@ else
 fi
 
 task3_function_source="$(sed -n '/^validate_sdist_repair_dir() {/,/^download_wheels_once() {/p' "$ROOT_DIR/plugin_repackaging.sh")"
+supervisor_function_source="$(sed -n '/^run_supervised_command_log() {/,/^build_sanitized_environment_args() {/p' "$ROOT_DIR/plugin_repackaging.sh")"
+if grep -Eq 'write_private_index_auth|remove_private_index_auth|auth-home/\.netrc' <<<"$task3_function_source"; then
+  fail 'Task3 source-build repair retains no netrc credential production path'
+else
+  pass 'Task3 source-build repair retains no netrc credential production path'
+fi
+for supervisor_identity_guard in 'os.pidfd_open' 'signal.pidfd_send_signal' '/stat"' 'starttime'; do
+  if grep -Fq "$supervisor_identity_guard" <<<"$supervisor_function_source"; then
+    pass "supervisor binds descendant signals with $supervisor_identity_guard"
+  else
+    fail "supervisor binds descendant signals with $supervisor_identity_guard"
+  fi
+done
 if grep -Eq '^[[:space:]]*chmod([[:space:]]|$)' <<<"$task3_function_source"; then
   fail 'Task3 performs no path-based chmod after a pathname safety check'
 else

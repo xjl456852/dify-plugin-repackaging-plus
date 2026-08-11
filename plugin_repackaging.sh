@@ -954,10 +954,14 @@ PY
 run_supervised_command_log() {
   local output_log=$1
   local timeout_seconds=$2
+  local supervisor_status
   shift 2
 
-  task3_python -B /dev/fd/3 "$output_log" "$timeout_seconds" "$@" 3<<'PY'
+  REPAIR_SUPERVISOR_STARTING=true
+  env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+    python3 -B /dev/fd/3 "$output_log" "$timeout_seconds" "$@" 3<<'PY' &
 import ctypes
+import errno
 import os
 import select
 import signal
@@ -1030,8 +1034,20 @@ def drain_output(wait_seconds=0.0):
         retain_output(contents)
 
 
-def process_parents():
-    parents = {}
+def read_process_identity(process_id):
+    with open(f"/proc/{process_id}/stat", "rb") as stat_file:
+        contents = stat_file.read(64 * 1024)
+    closing_parenthesis = contents.rfind(b")")
+    if closing_parenthesis < 0:
+        raise ValueError("invalid /proc stat record")
+    fields = contents[closing_parenthesis + 2:].split()
+    if len(fields) <= 19:
+        raise ValueError("short /proc stat record")
+    return int(fields[1]), int(fields[19])
+
+
+def process_snapshot():
+    snapshot = {}
     try:
         entries = os.scandir("/proc")
     except OSError as error:
@@ -1042,63 +1058,91 @@ def process_parents():
                 continue
             try:
                 process_id = int(entry.name)
-                with open(f"/proc/{entry.name}/status", "r", encoding="ascii", errors="strict") as status_file:
-                    parent_id = None
-                    for line in status_file:
-                        if line.startswith("PPid:\t"):
-                            parent_id = int(line.split()[1])
-                            break
-                if parent_id is not None:
-                    parents[process_id] = parent_id
+                snapshot[process_id] = read_process_identity(process_id)
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            except (OSError, UnicodeError, ValueError) as error:
+            except (OSError, ValueError) as error:
                 # A vanished process is harmless; every other read failure is fail-closed.
                 raise RuntimeError("cannot inspect process descendants") from error
-    return parents
+    return snapshot
 
 
 def descendants():
-    parents = process_parents()
-    found = set()
+    snapshot = process_snapshot()
+    found = {}
     frontier = {os.getpid()}
     while frontier:
         next_frontier = {
-            process_id
-            for process_id, parent_id in parents.items()
+            process_id: starttime
+            for process_id, (parent_id, starttime) in snapshot.items()
             if parent_id in frontier and process_id not in found
         }
         found.update(next_frontier)
-        frontier = next_frontier
-    found.discard(os.getpid())
+        frontier = set(next_frontier)
+    found.pop(os.getpid(), None)
     return found
 
 
-def signal_processes(process_ids, selected_signal):
-    for process_id in process_ids:
+def identity_matches(process_id, expected_starttime):
+    try:
+        _, current_starttime = read_process_identity(process_id)
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return current_starttime == expected_starttime
+
+
+def signal_one_process(process_id, expected_starttime, selected_signal):
+    if not identity_matches(process_id, expected_starttime):
+        return
+    pidfd_open = os.pidfd_open if hasattr(os, "pidfd_open") else None
+    pidfd_send_signal = signal.pidfd_send_signal if hasattr(signal, "pidfd_send_signal") else None
+    if pidfd_open is not None and pidfd_send_signal is not None:
         try:
-            os.kill(process_id, selected_signal)
+            descriptor = pidfd_open(process_id, 0)
         except ProcessLookupError:
-            continue
+            return
         except PermissionError as error:
             raise RuntimeError("cannot signal build descendant") from error
+        except OSError as error:
+            if error.errno not in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+                raise RuntimeError("cannot bind build descendant pidfd") from error
+        else:
+            try:
+                if not identity_matches(process_id, expected_starttime):
+                    return
+                pidfd_send_signal(descriptor, selected_signal, None, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError as error:
+                raise RuntimeError("cannot signal build descendant pidfd") from error
+            except OSError as error:
+                if error.errno not in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+                    raise RuntimeError("cannot signal build descendant pidfd") from error
+            else:
+                return
+            finally:
+                os.close(descriptor)
+    if not identity_matches(process_id, expected_starttime):
+        return
+    try:
+        os.kill(process_id, selected_signal)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise RuntimeError("cannot signal build descendant") from error
 
 
-def signal_original_group(selected_signal, process_ids):
+def signal_processes(process_identities, selected_signal):
+    for process_id, starttime in process_identities.items():
+        signal_one_process(process_id, starttime, selected_signal)
+
+
+def signal_original_group(selected_signal, _process_identities):
     if process is None:
         return
-    group_is_owned = process.poll() is None
-    if not group_is_owned:
-        for process_id in process_ids:
-            try:
-                if os.getpgid(process_id) == process.pid:
-                    group_is_owned = True
-                    break
-            except ProcessLookupError:
-                continue
-            except PermissionError as error:
-                raise RuntimeError("cannot inspect build process group") from error
-    if not group_is_owned:
+    # Popen cannot release/reuse this PID while poll() still reports it alive.
+    # After the leader exits, descendants are signalled only through bound PID identities.
+    if process.poll() is not None:
         return
     try:
         os.killpg(process.pid, selected_signal)
@@ -1127,10 +1171,19 @@ def request_shutdown(signal_number, _frame):
     requested_signal = signal_number
 
 
+def include_live_main(process_identities):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        _, starttime = read_process_identity(process.pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    process_identities[process.pid] = starttime
+
+
 def stop_and_reap_descendants(cleanup_deadline):
     targets = descendants()
-    if process is not None and process.poll() is None:
-        targets.add(process.pid)
+    include_live_main(targets)
     signal_original_group(signal.SIGTERM, targets)
     signal_processes(targets, signal.SIGTERM)
     term_deadline = min(cleanup_deadline, time.monotonic() + TERM_GRACE_SECONDS)
@@ -1138,8 +1191,7 @@ def stop_and_reap_descendants(cleanup_deadline):
         drain_output(0.02)
         reap_children()
         current = descendants()
-        if process is not None and process.poll() is None:
-            current.add(process.pid)
+        include_live_main(current)
         if not current:
             break
         time.sleep(0.01)
@@ -1147,8 +1199,7 @@ def stop_and_reap_descendants(cleanup_deadline):
     empty_scans = 0
     while time.monotonic() < cleanup_deadline:
         current = descendants()
-        if process is not None and process.poll() is None:
-            current.add(process.pid)
+        include_live_main(current)
         if current:
             empty_scans = 0
             signal_original_group(signal.SIGKILL, current)
@@ -1156,8 +1207,7 @@ def stop_and_reap_descendants(cleanup_deadline):
         else:
             reap_children()
             current = descendants()
-            if process is not None and process.poll() is None:
-                current.add(process.pid)
+            include_live_main(current)
             if current:
                 empty_scans = 0
             else:
@@ -1251,6 +1301,23 @@ finally:
     os.close(log_descriptor)
 raise SystemExit(result)
 PY
+  REPAIR_SUPERVISOR_PID=$!
+  REPAIR_SUPERVISOR_STARTING=false
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    kill -s "${REPAIR_CANCELLATION_SIGNAL_NAME:-TERM}" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+  fi
+  if wait "$REPAIR_SUPERVISOR_PID"; then
+    supervisor_status=0
+  else
+    supervisor_status=$?
+  fi
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    wait "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    REPAIR_SUPERVISOR_PID=
+    exit "${REPAIR_CANCELLATION_EXIT_STATUS:-143}"
+  fi
+  REPAIR_SUPERVISOR_PID=
+  return "$supervisor_status"
 }
 
 build_sanitized_environment_args() {
@@ -1406,7 +1473,7 @@ try:
     parsed = urlsplit(raw_url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError
-    if parsed.query or parsed.fragment:
+    if parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
         raise ValueError
     host = parsed.hostname
     if (
@@ -1430,137 +1497,13 @@ try:
         host = f"[{host}]"
     if port is not None:
         host = f"{host}:{port}"
-    if parsed.username is not None or parsed.password is not None:
-        if parsed.username is None or parsed.password is None:
-            raise ValueError
-        encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
-        if re.search(r"%(?![0-9A-Fa-f]{2})", encoded_userinfo):
-            raise ValueError
-        username = unquote(parsed.username, errors="strict")
-        password = unquote(parsed.password, errors="strict")
-        safe_token = re.compile(r"[A-Za-z0-9._~!$&()*+,;=:%@/-]+$")
-        if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
-            raise ValueError
     print(urlunsplit((parsed.scheme.lower(), host, parsed.path, "", "")))
 except (TypeError, UnicodeError, ValueError):
-    print("unsafe package index URL; query, fragment, or unsupported credentials are not allowed", file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
-
-write_private_index_auth() {
-  local auth_home=$1
-
-  task3_python -B /dev/fd/3 "$auth_home" 3<<'PY'
-import os
-import re
-import sys
-from pathlib import Path
-from urllib.parse import unquote, urlsplit
-
-
-raw_url = sys.stdin.read()
-auth_home = Path(sys.argv[1])
-try:
-    if any(ord(character) < 32 or ord(character) == 127 for character in raw_url):
-        raise ValueError
-    parsed = urlsplit(raw_url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        raise ValueError
-    if parsed.query or parsed.fragment:
-        raise ValueError
-    host = parsed.hostname
-    if (
-        re.fullmatch(r"[A-Za-z0-9._:-]+", host) is None
-        or any(character in host for character in "\"'\\")
-    ):
-        raise ValueError
-    parsed.port
-    if parsed.path and not parsed.path.startswith("/"):
-        raise ValueError
-    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
-        raise ValueError
-    decoded_path = unquote(parsed.path, errors="strict")
-    if (
-        any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
-        or any(character.isspace() or character in "\"'\\" for character in decoded_path)
-        or re.fullmatch(r"[/A-Za-z0-9._~!$&()*+,;=:@%+-]*", parsed.path) is None
-    ):
-        raise ValueError
-    if parsed.username is None and parsed.password is None:
-        raise SystemExit(0)
-    if parsed.username is None or parsed.password is None:
-        raise ValueError
-    encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
-    if re.search(r"%(?![0-9A-Fa-f]{2})", encoded_userinfo):
-        raise ValueError
-    username = unquote(parsed.username, errors="strict")
-    password = unquote(parsed.password, errors="strict")
-    safe_token = re.compile(r"[A-Za-z0-9._~!$&()*+,;=:%@/-]+$")
-    if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
-        raise ValueError
-    netrc_path = auth_home / ".netrc"
-    descriptor = os.open(
-        netrc_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
+    print(
+        "authenticated package indexes are unsupported for third-party source builds",
+        file=sys.stderr,
     )
-    try:
-        contents = f"machine {host} login {username} password {password}\n".encode("utf-8")
-        position = 0
-        while position < len(contents):
-            position += os.write(descriptor, contents[position:])
-        os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
-except (OSError, TypeError, UnicodeError, ValueError):
-    print("unsafe package index authentication configuration", file=sys.stderr)
     raise SystemExit(1)
-PY
-}
-
-remove_private_index_auth() {
-  local auth_home=$1
-
-  task3_python -B - "$auth_home" <<'PY'
-import errno
-import os
-import re
-import stat
-import sys
-
-
-auth_home = sys.argv[1]
-candidate_dir = os.path.dirname(auth_home)
-repair_dir = os.path.dirname(candidate_dir)
-if (
-    not os.path.isabs(auth_home)
-    or os.path.normpath(auth_home) != auth_home
-    or os.path.basename(auth_home) != "auth-home"
-    or re.fullmatch(r"candidate-[1-9][0-9]*", os.path.basename(candidate_dir)) is None
-    or os.path.basename(repair_dir) != "sdist-repair"
-):
-    raise SystemExit(1)
-try:
-    home_mode = os.lstat(auth_home).st_mode
-except FileNotFoundError:
-    raise SystemExit(0)
-if stat.S_ISLNK(home_mode) or not stat.S_ISDIR(home_mode):
-    raise SystemExit(1)
-netrc_path = os.path.join(auth_home, ".netrc")
-try:
-    netrc_mode = os.lstat(netrc_path).st_mode
-except FileNotFoundError:
-    pass
-else:
-    if stat.S_ISLNK(netrc_mode) or not stat.S_ISREG(netrc_mode):
-        raise SystemExit(1)
-    os.unlink(netrc_path)
-try:
-    os.rmdir(auth_home)
-except OSError as error:
-    if error.errno != errno.ENOTEMPTY:  # Leaves only a credential-free private HOME.
-        raise
 PY
 }
 
@@ -1763,7 +1706,7 @@ download_sdist() {
   local source_dir=$4
   local socks_site_dir=$5
   local error_log=$6
-  local proxy_url= normalized_python declaration repair_dir safe_index auth_home
+  local proxy_url= normalized_python declaration repair_dir safe_index candidate_home
   local -a download_args=()
   local -a clean_env_args=()
 
@@ -1797,9 +1740,9 @@ PY
   if ! safe_index="$(printf '%s' "$PIP_MIRROR_URL" | sanitize_index_url_for_tools)"; then
     return 1
   fi
-  auth_home="$(dirname -- "$source_dir")/auth-home"
-  [[ -d "$auth_home" && ! -L "$auth_home" ]] || return 1
-  build_sanitized_environment_args clean_env_args "$auth_home"
+  candidate_home="$(dirname -- "$source_dir")"
+  [[ -d "$candidate_home" && ! -L "$candidate_home" ]] || return 1
+  build_sanitized_environment_args clean_env_args "$candidate_home"
   proxy_url="$(detect_socks_proxy)" || true
   download_args=(
     download
@@ -2060,14 +2003,41 @@ cleanup_sdist_repair_state() {
   local original_status=$?
 
   trap - EXIT HUP INT TERM
-  if [[ -n "${REPAIR_AUTH_HOME_TO_CLEAN:-}" ]]; then
-    remove_private_index_auth "$REPAIR_AUTH_HOME_TO_CLEAN" >/dev/null 2>&1 || true
+  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    wait "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    REPAIR_SUPERVISOR_PID=
+  fi
+  if [[ -n "${REPAIR_CANDIDATE_DIR_FOR_CLEANUP:-}" && -n "${REPAIR_STAGE_LOG_TO_CLEAN:-}" ]]; then
+    remove_private_stage_log \
+      "$REPAIR_CANDIDATE_DIR_FOR_CLEANUP" "$REPAIR_STAGE_LOG_TO_CLEAN" >/dev/null 2>&1 || true
   fi
   if [[ -n "${REPAIR_LOCK_TO_RELEASE:-}" && -n "${REPAIR_DIR_FOR_CLEANUP:-}" && \
     "$REPAIR_LOCK_TO_RELEASE" == "$REPAIR_DIR_FOR_CLEANUP/.repair-lock" ]]; then
     rmdir -- "$REPAIR_LOCK_TO_RELEASE" 2>/dev/null || true
   fi
   return "$original_status"
+}
+
+cancel_sdist_repair() {
+  local signal_name=$1
+  local exit_status=$2
+
+  trap '' HUP INT TERM
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    exit "$exit_status"
+  fi
+  REPAIR_CANCELLATION_ACTIVE=true
+  REPAIR_CANCELLATION_EXIT_STATUS=$exit_status
+  REPAIR_CANCELLATION_SIGNAL_NAME=$signal_name
+  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -s "$signal_name" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "${REPAIR_SUPERVISOR_STARTING:-false}" == true ]]; then
+    return 0
+  fi
+  exit "$exit_status"
 }
 
 repair_one_pure_sdist_locked() {
@@ -2080,7 +2050,7 @@ repair_one_pure_sdist_locked() {
   local socks_site_dir=$7
   local ordinal=$8
   local safe_index=$9
-  local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir auth_home
+  local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir
   local download_log= build_log= sdist_error= wheel_error=
   local sdist_output wheel_output sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version
   local snapshot_dir= before_signature after_signature build_timeout build_status
@@ -2088,28 +2058,27 @@ repair_one_pure_sdist_locked() {
   local -a uv_build_command=()
 
   candidate_dir="$repair_dir/candidate-$ordinal"
+  REPAIR_CANDIDATE_DIR_FOR_CLEANUP=$candidate_dir
   source_dir="$candidate_dir/source"
   wheel_dir="$candidate_dir/wheel"
   built_wheels_dir="$repair_dir/built-wheels"
   uv_cache_dir="$repair_dir/uv-cache"
   uv_python_dir="$repair_dir/uv-python"
-  auth_home="$candidate_dir/auth-home"
   if ! mkdir -m 700 -- "$candidate_dir"; then
     printf 'pure Python sdist repair candidate staging is unsafe or already exists\n' >&2
     return 1
   fi
-  mkdir -m 700 -- "$source_dir" "$wheel_dir" "$auth_home" || return
-  REPAIR_AUTH_HOME_TO_CLEAN=$auth_home
+  mkdir -m 700 -- "$source_dir" "$wheel_dir" || return
   ensure_private_repair_directory "$built_wheels_dir" || return
   ensure_private_repair_directory "$uv_cache_dir" || return
   ensure_private_repair_directory "$uv_python_dir" || return
   validate_private_repair_layout \
     "$repair_dir" "$repair_dir/.repair-lock" "$candidate_dir" "$source_dir" "$wheel_dir" \
-    "$auth_home" "$built_wheels_dir" "$uv_cache_dir" "$uv_python_dir" || return
-  printf '%s' "$PIP_MIRROR_URL" | write_private_index_auth "$auth_home" || return
-  build_sanitized_environment_args clean_env_args "$auth_home"
+    "$built_wheels_dir" "$uv_cache_dir" "$uv_python_dir" || return
+  build_sanitized_environment_args clean_env_args "$candidate_dir"
 
   download_log="$(mktemp "$candidate_dir/.download-log.XXXXXXXX")" || return
+  REPAIR_STAGE_LOG_TO_CLEAN=$download_log
   if ! validate_private_stage_file "$download_log"; then
     remove_private_stage_log "$candidate_dir" "$download_log" || true
     return 1
@@ -2124,6 +2093,7 @@ repair_one_pure_sdist_locked() {
   remove_private_stage_log "$candidate_dir" "$download_log" || return
 
   sdist_error="$(mktemp "$candidate_dir/.validation-log.XXXXXXXX")" || return
+  REPAIR_STAGE_LOG_TO_CLEAN=$sdist_error
   if ! validate_private_stage_file "$sdist_error"; then
     remove_private_stage_log "$candidate_dir" "$sdist_error" || true
     return 1
@@ -2145,6 +2115,7 @@ repair_one_pure_sdist_locked() {
   fi
 
   build_log="$(mktemp "$candidate_dir/.build-log.XXXXXXXX")" || return
+  REPAIR_STAGE_LOG_TO_CLEAN=$build_log
   if ! validate_private_stage_file "$build_log"; then
     remove_private_stage_log "$candidate_dir" "$build_log" || true
     return 1
@@ -2168,13 +2139,6 @@ repair_one_pure_sdist_locked() {
   else
     build_status=$?
   fi
-  if ! remove_private_index_auth "$auth_home"; then
-    printf '%s\n' 'private package index credentials could not be removed safely' >&2
-    remove_private_stage_log "$candidate_dir" "$build_log" || true
-    return 1
-  fi
-  REPAIR_AUTH_HOME_TO_CLEAN=
-  build_sanitized_environment_args clean_env_args "$candidate_dir"
   if ((build_status != 0)); then
     redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
     remove_private_stage_log "$candidate_dir" "$build_log" || true
@@ -2196,6 +2160,7 @@ repair_one_pure_sdist_locked() {
     cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
     return 1
   }
+  REPAIR_STAGE_LOG_TO_CLEAN=$wheel_error
   if ! validate_private_stage_file "$wheel_error"; then
     remove_private_stage_log "$candidate_dir" "$wheel_error" || true
     cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
@@ -2253,13 +2218,19 @@ repair_one_pure_sdist() (
   local ordinal=$8
   local safe_index repair_lock_dir
 
-  REPAIR_AUTH_HOME_TO_CLEAN=
   REPAIR_LOCK_TO_RELEASE=
   REPAIR_DIR_FOR_CLEANUP=
+  REPAIR_CANDIDATE_DIR_FOR_CLEANUP=
+  REPAIR_STAGE_LOG_TO_CLEAN=
+  REPAIR_SUPERVISOR_PID=
+  REPAIR_SUPERVISOR_STARTING=false
+  REPAIR_CANCELLATION_ACTIVE=false
+  REPAIR_CANCELLATION_EXIT_STATUS=
+  REPAIR_CANCELLATION_SIGNAL_NAME=
   trap cleanup_sdist_repair_state EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'cancel_sdist_repair HUP 129' HUP
+  trap 'cancel_sdist_repair INT 130' INT
+  trap 'cancel_sdist_repair TERM 143' TERM
 
   validate_sdist_repair_dir "$repair_dir" || return
   validate_sdist_repair_identifiers \
