@@ -1,0 +1,22 @@
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_22ba1cbd2837f1 122-123,133-138,146-149,244
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_4175bafaf8dbd4 42-61,182-191,236-241
+  s_c1a60985b94e3d::t_f5430950415aea 242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "a8c661b094de36530a68c11410e2aa2e6cc8364c",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
