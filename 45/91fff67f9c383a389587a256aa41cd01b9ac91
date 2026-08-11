@@ -1,0 +1,42 @@
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_dece4f5ffe9917 35-44,229-244,449,465,473,503-533,536-549,551,559
+  s_c1a60985b94e3d::t_9c48e05beccf1d 260,264,613,615,617,620-623,629,633-634,636-638,649-655,657,659,661,664-666,672-673,676-677,679-682
+  s_c1a60985b94e3d::t_0a75bac0cc32d3 245,247-259,261-263,265-275,552-555,557,569-612,683-699
+  s_c1a60985b94e3d::t_4ab69ca002607a 534-535,550
+  s_c1a60985b94e3d::t_1454c8cb85287a 614,616,618-619,624-628,631-632,635,658,660,662-663,667-671,674-675,678
+  s_c1a60985b94e3d::t_1796aa8cb09a65 630,639-648,656
+  s_c1a60985b94e3d::t_2d49cf37aba9da 246
+  s_c1a60985b94e3d::t_bc401c97f7f97f 556
+  s_c1a60985b94e3d::t_214f69b8c1e08c 558
+  s_c1a60985b94e3d::t_63592fa8290fd1 560
+  s_c1a60985b94e3d::t_ac78447f83c801 700
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_7670fa075c29cd 86-87,119-127
+  s_c1a60985b94e3d::t_68989e966f11be 129-132
+  s_c1a60985b94e3d::t_dc1fcc63ed4c92 33,100-103,108-109,111,114,118
+  s_c33dcd76011975::t_c23381856b6427 128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "4591fff67f9c383a389587a256aa41cd01b9ac91",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    },
+    "s_c33dcd76011975": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbf99-11e9-7430-9d8e-ed7006a077ac",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
