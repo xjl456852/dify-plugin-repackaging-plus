@@ -183,8 +183,40 @@ assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'un
 write_missing_wheel_log "$missing_log" 'DocOpt == 0.6.2' 'docopt==0.6.2'
 assert_eq 'docopt==0.6.2' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'constrained missing wheel is normalized and classified'
 
+write_missing_wheel_log \
+  "$missing_log" \
+  'Acme.Widget_Name-extra >= 1.0, < 2.0' \
+  'acme-widget-name-extra>=1.0,<2.0'
+assert_eq \
+  'acme-widget-name-extra>=1.0,<2.0' \
+  "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
+  'standard name separators and compound PEP 440 comparisons are normalized'
+
+for safe_marker_requirement in network==1.0 proxy 'ssl>=1.0,<2' traceback; do
+  write_missing_wheel_log "$missing_log" "$safe_marker_requirement"
+  assert_eq \
+    "$safe_marker_requirement" \
+    "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
+    "diagnostic word remains valid inside exact missing requirement: $safe_marker_requirement"
+done
+
+for safe_marker_requirement in network==1.0 proxy 'ssl>=1.0,<2' traceback; do
+  write_missing_wheel_log "$missing_log" "$safe_marker_requirement"
+  printf 'Collecting legitimate package %s\n' "$safe_marker_requirement" >>"$missing_log"
+  assert_eq \
+    "$safe_marker_requirement" \
+    "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
+    "benign pip progress does not turn a package name into a failure marker: $safe_marker_requirement"
+done
+
 for unsafe_failure_marker in \
   'ProxyError' \
+  'NameResolutionError' \
+  'Name or service not known' \
+  'Could not resolve host: mirror.example' \
+  'No route to host' \
+  'HTTP Error 407.' \
+  'Access denied.' \
   'ConnectTimeoutError' \
   'ReadTimeoutError' \
   'connection refused' \
@@ -417,7 +449,8 @@ download_once_wheel_dir="$download_once_case_dir/wheels"
 download_once_log="$download_once_case_dir/pip-output.log"
 local_built_wheels="$download_once_case_dir/built wheels"
 mkdir -p "$download_once_wheel_dir" "$local_built_wheels"
-if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+if PIP_MIRROR_URL='https://target-index.example/simple' \
+  DIFY_PIP_COMMAND="$fake_bin/pip-download" \
   without_proxy_environment download_wheels_once \
     "$metadata_dir/download.txt" \
     "$download_once_wheel_dir" \
@@ -431,6 +464,8 @@ else
   fail 'one-shot wheel download accepts a local built-wheel directory'
 fi
 assert_file_contains "$PIP_ARGS_LOG" '--only-binary=:all:' 'one-shot wheel download keeps binary-only policy'
+assert_eq 1 "$(grep -Fxc -- '--index-url' "$PIP_ARGS_LOG")" 'one-shot wheel download passes one index option'
+assert_eq 1 "$(grep -Fxc -- 'https://target-index.example/simple' "$PIP_ARGS_LOG")" 'one-shot wheel download passes the exact configured index'
 assert_file_contains "$PIP_ARGS_LOG" '--python-version' 'one-shot wheel download keeps target Python'
 assert_file_contains "$PIP_ARGS_LOG" 'cp312' 'one-shot wheel download keeps target ABI'
 assert_file_contains "$PIP_ARGS_LOG" 'manylinux_2_28_aarch64' 'one-shot wheel download keeps target platform'

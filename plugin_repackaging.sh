@@ -216,18 +216,52 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 
+missing_version_matches = list(re.finditer(
+    r"^[ \t]*(?:ERROR:[ \t]*)?Could not find a version that satisfies the requirement "
+    r"(.+?) \(from versions: none\)[ \t\r]*$",
+    log,
+    re.MULTILINE,
+))
+missing_distribution_matches = list(re.finditer(
+    r"^[ \t]*(?:ERROR:[ \t]*)?No matching distribution found for (.+?)[ \t\r]*$",
+    log,
+    re.MULTILINE,
+))
+if len(missing_version_matches) != 1 or len(missing_distribution_matches) != 1:
+    raise SystemExit(1)
+
+diagnostic_parts = []
+cursor = 0
+for match in sorted(
+    (missing_version_matches[0], missing_distribution_matches[0]),
+    key=lambda item: item.start(),
+):
+    diagnostic_parts.append(log[cursor:match.start()])
+    cursor = match.end()
+diagnostic_parts.append(log[cursor:])
+diagnostics = "".join(diagnostic_parts)
+
 unsafe_failure_patterns = (
-    r"\bproxy(?:error)?\b",
-    r"\bnetwork\b",
-    r"\b(?:connect(?:ion|error)?|(?:new)?connectionerror)\b",
+    r"\bproxyerror\b",
+    r"\bproxy[\s_-]+(?:authentication|connection|error|failure|failed)\b",
+    r"\bnetwork(?:error|[\s_-]+(?:error|failure|failed|unreachable))\b",
+    r"\b(?:connecterror|(?:new)?connectionerror)\b",
+    r"\bconnection[\s_-]+(?:aborted|failed|refused|reset|unreachable)\b",
     r"\b(?:(?:connect|read)?timeouterror|timeout|timed\s+out)\b",
-    r"\b(?:(?:ssl|tls)error|ssl|tls|certificate)\b",
+    r"\b(?:ssl|tls)error\b",
+    r"\b(?:ssl|tls)[\s_-]+(?:connection|handshake).{0,80}\bfailed\b",
     r"certificate(?:_|[\s-])+verify(?:_|[\s-])+failed",
+    r"name[\s._-]*resolution[\s._-]*error",
+    r"name\s+or\s+service\s+not\s+known",
+    r"could\s+not\s+resolve(?:\s+the)?\s+host",
+    r"no\s+route\s+to\s+host",
+    r"http\s*(?:error|status)?\s*[:#-]?\s*(?:401|403|407)\b",
+    r"access[\s_-]+denied",
     r"\b(?:authentication|authorization|unauthorized|forbidden|credentials?)\b",
-    r"(?:http(?:\s+status|\s+error)?\s*)?(?:401|403)\b",
-    r"\btraceback\b",
-    r"\bresolution(?:impossible)?\b",
-    r"\bconflict(?:ing)?\b",
+    r"(?m)^\s*traceback\s*\(",
+    r"\bresolutionimpossible\b",
+    r"\bdependency[\s_-]+conflict\b",
+    r"\bconflicting[\s_-]+dependencies\b",
     r"cannot install .+ because these package versions have conflicting dependencies",
     r"packages do not match the hashes",
     r"hash(?:es)? (?:are required|mismatch|do not match|failed)",
@@ -236,21 +270,7 @@ unsafe_failure_patterns = (
     r"could not fetch url",
     r"max retries exceeded",
 )
-if any(re.search(pattern, log, re.IGNORECASE) for pattern in unsafe_failure_patterns):
-    raise SystemExit(1)
-
-missing_versions = re.findall(
-    r"^\s*(?:ERROR:\s*)?Could not find a version that satisfies the requirement "
-    r"(.+?) \(from versions: none\)\s*$",
-    log,
-    re.MULTILINE,
-)
-missing_distributions = re.findall(
-    r"^\s*(?:ERROR:\s*)?No matching distribution found for (.+?)\s*$",
-    log,
-    re.MULTILINE,
-)
-if len(missing_versions) != 1 or len(missing_distributions) != 1:
+if any(re.search(pattern, diagnostics, re.IGNORECASE) for pattern in unsafe_failure_patterns):
     raise SystemExit(1)
 
 dependency_context = re.compile(r"\s+\(from [^()\r\n]+\)\s*$", re.IGNORECASE)
@@ -282,8 +302,8 @@ def normalize_requirement(value, strip_context=False):
 
 
 try:
-    first = normalize_requirement(missing_versions[0], strip_context=True)
-    second = normalize_requirement(missing_distributions[0])
+    first = normalize_requirement(missing_version_matches[0].group(1), strip_context=True)
+    second = normalize_requirement(missing_distribution_matches[0].group(1))
 except ValueError:
     raise SystemExit(1)
 if first != second:
