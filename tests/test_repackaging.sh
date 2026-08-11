@@ -178,24 +178,24 @@ write_missing_wheel_log() {
 
 missing_log="$FIXTURE_DIR/missing-wheel.log"
 write_missing_wheel_log "$missing_log" 'docopt (from records)' docopt
-assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'unconstrained missing wheel is classified from exact paired pip errors'
+assert_eq $'docopt\tdocopt' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'unconstrained missing wheel includes a canonical-name field'
 
 write_missing_wheel_log "$missing_log" 'DocOpt == 0.6.2' 'docopt==0.6.2'
-assert_eq 'docopt==0.6.2' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'constrained missing wheel is normalized and classified'
+assert_eq $'docopt==0.6.2\tdocopt' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'constrained missing wheel includes its canonical name'
 
 write_missing_wheel_log \
   "$missing_log" \
   'Acme.Widget_Name-extra >= 1.0, < 2.0' \
   'acme-widget-name-extra>=1.0,<2.0'
 assert_eq \
-  'acme-widget-name-extra>=1.0,<2.0' \
+  $'acme-widget-name-extra>=1.0,<2.0\tacme-widget-name-extra' \
   "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
   'standard name separators and compound PEP 440 comparisons are normalized'
 
 for safe_marker_requirement in network==1.0 proxy 'ssl>=1.0,<2' traceback; do
   write_missing_wheel_log "$missing_log" "$safe_marker_requirement"
   assert_eq \
-    "$safe_marker_requirement" \
+    "$safe_marker_requirement"$'\t'"${safe_marker_requirement%%[=<>!~]*}" \
     "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
     "diagnostic word remains valid inside exact missing requirement: $safe_marker_requirement"
 done
@@ -204,7 +204,7 @@ for safe_marker_requirement in network==1.0 proxy 'ssl>=1.0,<2' traceback; do
   write_missing_wheel_log "$missing_log" "$safe_marker_requirement"
   printf 'Collecting legitimate package %s\n' "$safe_marker_requirement" >>"$missing_log"
   assert_eq \
-    "$safe_marker_requirement" \
+    "$safe_marker_requirement"$'\t'"${safe_marker_requirement%%[=<>!~]*}" \
     "$(extract_missing_requirement "$missing_log" 2>/dev/null)" \
     "benign pip progress does not turn a package name into a failure marker: $safe_marker_requirement"
 done
@@ -228,7 +228,7 @@ INFO: pip is looking at multiple versions of records to determine which version 
 ERROR: Could not find a version that satisfies the requirement docopt (from records) (from versions: none)
 ERROR: No matching distribution found for docopt
 EOF
-assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'realistic benign resolver progress still classifies docopt'
+assert_eq $'docopt\tdocopt' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'realistic benign resolver progress includes the canonical name'
 
 for unsafe_failure_marker in \
   'ProxyError' \
@@ -304,7 +304,7 @@ printf '%s\r\n%s\r\n' \
   $'\tERROR: Could not find a version that satisfies the requirement docopt (from versions: none)' \
   $'\tERROR: No matching distribution found for docopt' \
   >"$missing_log"
-assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'ordinary TAB indentation and CRLF remain accepted'
+assert_eq $'docopt\tdocopt' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'ordinary TAB indentation and CRLF remain accepted'
 
 write_missing_wheel_log "$missing_log" docopt click
 if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
@@ -1943,6 +1943,622 @@ assert_file_contains "$socks_repair_log" 'retrying once with PIP_USE_DEPRECATED=
 assert_eq 0 "$(find "$socks_repair_dir" -type f -name '*download*log*' | wc -l)" 'successful SOCKS retry removes all raw attempt diagnostics'
 set -e
 
+cat >"$fake_bin/pip-repair-coordinator" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+is_strict=false
+dest=
+find_links=
+previous=
+for argument in "$@"; do
+  if [[ "$argument" == --only-binary=:all: ]]; then
+    is_strict=true
+  fi
+  if [[ "$previous" == --dest ]]; then
+    dest=$argument
+  elif [[ "$previous" == --find-links ]]; then
+    find_links=$argument
+  fi
+  previous=$argument
+done
+if [[ "$is_strict" != true ]]; then
+  exec "$COORDINATOR_SOURCE_PIP" "$@"
+fi
+attempt=0
+[[ -f "$COORDINATOR_STRICT_STATE" ]] && attempt="$(<"$COORDINATOR_STRICT_STATE")"
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >"$COORDINATOR_STRICT_STATE"
+{
+  printf 'CALL:%s\n' "$attempt"
+  printf 'ARG:%s\n' "$@"
+} >>"$COORDINATOR_STRICT_ARGS_LOG"
+[[ -n "$dest" ]]
+mkdir -p -- "$dest"
+if ((attempt == 1)); then
+  touch -- "$dest/partial-from-failed-attempt.whl"
+  printf '%s\n' \
+    'Looking in indexes: https://strict-user:strict-password@mirror.example/simple?token=strict-query#strict-fragment' \
+    'ERROR: Could not find a version that satisfies the requirement docopt (from records) (from versions: none)' \
+    'ERROR: No matching distribution found for docopt'
+  exit 1
+fi
+[[ -n "$find_links" && -d "$find_links" ]]
+cp -- "$find_links"/*.whl "$dest/"
+touch -- "$dest/runtime-1.0-py3-none-any.whl"
+EOF
+chmod +x "$fake_bin/pip-repair-coordinator"
+
+coordinator_parent="$FIXTURE_DIR/coordinator --option parent"
+coordinator_wheels="$coordinator_parent/wheels"
+coordinator_repair_dir="$coordinator_parent/sdist-repair"
+coordinator_requirements="$coordinator_parent/requirements.txt"
+coordinator_output="$coordinator_parent/output.log"
+mkdir -p -- "$coordinator_wheels"
+printf 'records~=0.6.0\n' >"$coordinator_requirements"
+touch -- "$coordinator_wheels/stale-before-coordinator.whl"
+export COORDINATOR_SOURCE_PIP="$fake_bin/pip-sdist-repair"
+export COORDINATOR_STRICT_STATE="$coordinator_parent/strict.state"
+export COORDINATOR_STRICT_ARGS_LOG="$coordinator_parent/strict.args"
+: >"$REPAIR_PIP_ARGS_LOG"
+: >"$REPAIR_UV_ARGS_LOG"
+: >"$COORDINATOR_STRICT_ARGS_LOG"
+rm -f -- "$COORDINATOR_STRICT_STATE"
+if PIP_MIRROR_URL='https://target-index.example/simple' \
+  DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator" \
+  DIFY_UV_COMMAND="$fake_bin/uv-sdist-repair" \
+  without_proxy_environment download_wheels \
+    "$coordinator_requirements" "$coordinator_wheels" aarch64 3.12 '' "$coordinator_repair_dir" \
+    >"$coordinator_output" 2>&1; then
+  pass 'coordinator repairs one missing pure Python wheel and fully re-resolves'
+else
+  fail 'coordinator repairs one missing pure Python wheel and fully re-resolves'
+  sed 's/^/# coordinator: /' "$coordinator_output"
+fi
+assert_eq 2 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'one repaired candidate causes exactly two strict resolver attempts'
+assert_eq 1 "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'one repaired candidate downloads exactly one source distribution'
+assert_eq 1 "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" 'one repaired candidate invokes uv exactly once'
+assert_eq 2 "$(grep -c '^ARG:--only-binary=:all:$' "$COORDINATOR_STRICT_ARGS_LOG")" 'every strict retry remains binary-only'
+assert_eq 2 "$(grep -c '^ARG:--python-version$' "$COORDINATOR_STRICT_ARGS_LOG")" 'every strict retry keeps target Python'
+assert_eq 2 "$(grep -c '^ARG:cp312$' "$COORDINATOR_STRICT_ARGS_LOG")" 'every strict retry keeps target ABI'
+assert_eq 4 "$(grep -c '^ARG:--platform$' "$COORDINATOR_STRICT_ARGS_LOG")" 'every strict retry keeps every target platform'
+assert_eq 1 "$(grep -c '^ARG:--find-links$' "$COORDINATOR_STRICT_ARGS_LOG")" 'only the retry adds one admitted-wheel directory'
+assert_eq 1 "$(grep -Fxc -- "ARG:$coordinator_repair_dir/built-wheels" "$COORDINATOR_STRICT_ARGS_LOG")" 'retry uses the validated built-wheels directory as one argument'
+if [[ -f "$coordinator_wheels/docopt-0.6.2-py2.py3-none-any.whl" && \
+  -f "$coordinator_wheels/runtime-1.0-py3-none-any.whl" ]]; then
+  pass 'successful retry wheelhouse contains repaired and runtime wheels'
+else
+  fail 'successful retry wheelhouse contains repaired and runtime wheels'
+fi
+assert_file_missing "$coordinator_wheels/partial-from-failed-attempt.whl" 'failed-attempt partial wheel is removed before full retry'
+assert_file_missing "$coordinator_wheels/stale-before-coordinator.whl" 'preexisting stale wheel is removed before initial resolution'
+assert_file_contains "$coordinator_output" 'Pure Python sdist repair candidate: docopt' 'coordinator reports the safe classified candidate'
+assert_file_contains "$coordinator_output" 'Source build target: Python 3.12, ABI cp312, architecture aarch64' 'coordinator reports the exact source build target'
+assert_file_contains "$coordinator_output" 'Pure Python wheel admitted: docopt-0.6.2-py2.py3-none-any.whl' 'coordinator reports validated admission'
+
+cat >"$fake_bin/pip-repair-coordinator-dynamic" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+is_strict=false
+dest=
+find_links=
+previous=
+for argument in "$@"; do
+  [[ "$argument" == --only-binary=:all: ]] && is_strict=true
+  if [[ "$previous" == --dest ]]; then
+    dest=$argument
+  elif [[ "$previous" == --find-links ]]; then
+    find_links=$argument
+  fi
+  previous=$argument
+done
+[[ -n "$dest" ]]
+if [[ "$is_strict" == true ]]; then
+  attempt=0
+  [[ -f "$COORDINATOR_STRICT_STATE" ]] && attempt="$(<"$COORDINATOR_STRICT_STATE")"
+  attempt=$((attempt + 1))
+  printf '%s\n' "$attempt" >"$COORDINATOR_STRICT_STATE"
+  {
+    printf 'CALL:%s\n' "$attempt"
+    printf 'ARG:%s\n' "$@"
+    if [[ -n "$find_links" && -d "$find_links" ]]; then
+      while IFS= read -r wheel; do
+        printf 'BUILT:%s\n' "$(basename -- "$wheel")"
+      done < <(find "$find_links" -maxdepth 1 -type f -name '*.whl' -print | sort)
+    fi
+    log_dir="$(find "$(dirname -- "$dest")" -maxdepth 1 -type d -name '.pip-coordinator.*' -print -quit)"
+    if [[ -n "$log_dir" ]]; then
+      printf 'LOGPARENTMODE:%s\n' "$(stat -c '%a' "$log_dir")"
+      log_file="$(find "$log_dir" -maxdepth 1 -type f -name '*.log' -print -quit)"
+      [[ -n "$log_file" ]] && printf 'LOGMODE:%s\n' "$(stat -c '%a' "$log_file")"
+    fi
+  } >>"$COORDINATOR_STRICT_ARGS_LOG"
+  mkdir -p -- "$dest"
+  sequence="$(sed -n "${attempt}p" "$COORDINATOR_SEQUENCE_FILE")"
+  if [[ "$sequence" == SUCCESS ]]; then
+    if [[ -n "$find_links" ]]; then
+      cp -- "$find_links"/*.whl "$dest/"
+    fi
+    touch -- "$dest/runtime-1.0-py3-none-any.whl"
+    exit 0
+  fi
+  touch -- "$dest/partial-attempt-$attempt.whl"
+  if [[ "$sequence" == RAW\|* ]]; then
+    diagnostic=${sequence#RAW|}
+    if [[ "$diagnostic" == CONTROL ]]; then
+      printf '\vunsafe-control\n'
+    elif [[ "$diagnostic" == FLOOD ]]; then
+      head -c $((2 * 1024 * 1024)) /dev/zero | tr '\0' X
+    else
+      printf '%s\n' "$diagnostic"
+    fi
+    exit 1
+  fi
+  printf '%s\n' \
+    'Looking in indexes: https://strict-user:strict-password@mirror.example/simple?token=strict-query#strict-fragment' \
+    "ERROR: Could not find a version that satisfies the requirement $sequence (from dependency) (from versions: none)" \
+    "ERROR: No matching distribution found for $sequence"
+  exit 1
+fi
+
+requirement=${!#}
+{
+  printf 'CALL\n'
+  printf 'ARG:%s\n' "$@"
+  printf 'REQUIREMENT:%s\n' "$requirement"
+} >>"$COORDINATOR_SOURCE_ARGS_LOG"
+case "${COORDINATOR_SOURCE_MODE:-success}" in
+  failure)
+    printf 'source failed via https://source-user:source-password@mirror.example/simple?token=source-query#source-fragment\n' >&2
+    exit 41
+    ;;
+esac
+python3 - "$dest" "$requirement" <<'PY'
+from pathlib import Path
+import io
+import re
+import sys
+import tarfile
+
+
+destination = Path(sys.argv[1])
+requirement = sys.argv[2]
+raw_name = re.split(r"[<>=!~]", requirement, maxsplit=1)[0]
+name = re.sub(r"[-_.]+", "-", raw_name).lower()
+version = "1.0"
+prefix = f"{name}-{version}"
+metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n".encode()
+destination.mkdir(parents=True, exist_ok=True)
+with tarfile.open(destination / f"{prefix}.tar.gz", "w:gz") as archive:
+    for member_name, contents in (
+        (f"{prefix}/PKG-INFO", metadata),
+        (f"{prefix}/setup.py", b"from setuptools import setup\nsetup()\n"),
+    ):
+        info = tarfile.TarInfo(member_name)
+        info.size = len(contents)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(contents))
+PY
+EOF
+
+cat >"$fake_bin/uv-repair-coordinator-dynamic" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+{
+  printf 'CALL\n'
+  printf 'ARG:%s\n' "$@"
+} >>"$COORDINATOR_UV_ARGS_LOG"
+case "${COORDINATOR_UV_MODE:-success}" in
+  failure)
+    printf 'build failed via socks5h://build-user:build-password@10.10.10.10:28802/path?token=build-query#build-fragment\n' >&2
+    exit 51
+    ;;
+esac
+out_dir=
+previous=
+for argument in "$@"; do
+  if [[ "$previous" == --out-dir ]]; then
+    out_dir=$argument
+  fi
+  previous=$argument
+done
+sdist=${!#}
+[[ -n "$out_dir" && -f "$sdist" ]]
+python3 - "$out_dir" "$sdist" "${COORDINATOR_UV_MODE:-success}" <<'PY'
+from email.parser import BytesParser
+from pathlib import Path
+import re
+import sys
+import tarfile
+import zipfile
+
+
+output_dir = Path(sys.argv[1])
+sdist = Path(sys.argv[2])
+mode = sys.argv[3]
+with tarfile.open(sdist, "r:gz") as archive:
+    member = next(item for item in archive if item.name.endswith("/PKG-INFO"))
+    stream = archive.extractfile(member)
+    assert stream is not None
+    metadata_bytes = stream.read()
+metadata = BytesParser().parsebytes(metadata_bytes)
+name = re.sub(r"[-_.]+", "-", metadata["Name"]).lower()
+version = metadata["Version"]
+if mode == "mismatch":
+    name = "different-package"
+distribution = name.replace("-", "_")
+dist_info = f"{distribution}-{version}.dist-info"
+root_is_pure = "false" if mode == "nonpure" else "true"
+wheel_metadata = (
+    "Wheel-Version: 1.0\n"
+    "Generator: coordinator-test\n"
+    f"Root-Is-Purelib: {root_is_pure}\n"
+    "Tag: py3-none-any\n\n"
+).encode()
+output_dir.mkdir(parents=True, exist_ok=True)
+wheel_path = output_dir / f"{distribution}-{version}-py3-none-any.whl"
+with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr(f"{dist_info}/METADATA", (
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n"
+    ).encode())
+    archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
+    if mode == "native":
+        archive.writestr(f"{distribution}/native", b"\x7fELF" + b"\0" * 32)
+    else:
+        archive.writestr(f"{distribution}.py", b"VALUE = 1\n")
+PY
+EOF
+chmod +x "$fake_bin/pip-repair-coordinator-dynamic" "$fake_bin/uv-repair-coordinator-dynamic"
+
+prepare_dynamic_coordinator_case() {
+  local case_name=$1
+  shift
+  DYNAMIC_CASE_DIR="$FIXTURE_DIR/coordinator-$case_name"
+  DYNAMIC_WHEELS="$DYNAMIC_CASE_DIR/wheels"
+  DYNAMIC_REPAIR_DIR="$DYNAMIC_CASE_DIR/sdist-repair"
+  DYNAMIC_REQUIREMENTS="$DYNAMIC_CASE_DIR/requirements.txt"
+  DYNAMIC_OUTPUT="$DYNAMIC_CASE_DIR/output.log"
+  COORDINATOR_SEQUENCE_FILE="$DYNAMIC_CASE_DIR/sequence.txt"
+  COORDINATOR_STRICT_STATE="$DYNAMIC_CASE_DIR/strict.state"
+  COORDINATOR_STRICT_ARGS_LOG="$DYNAMIC_CASE_DIR/strict.args"
+  COORDINATOR_SOURCE_ARGS_LOG="$DYNAMIC_CASE_DIR/source.args"
+  COORDINATOR_UV_ARGS_LOG="$DYNAMIC_CASE_DIR/uv.args"
+  export COORDINATOR_SEQUENCE_FILE COORDINATOR_STRICT_STATE COORDINATOR_STRICT_ARGS_LOG
+  export COORDINATOR_SOURCE_ARGS_LOG COORDINATOR_UV_ARGS_LOG
+  mkdir -p -- "$DYNAMIC_WHEELS"
+  printf 'runtime-dependency\n' >"$DYNAMIC_REQUIREMENTS"
+  printf '%s\n' "$@" >"$COORDINATOR_SEQUENCE_FILE"
+  : >"$COORDINATOR_STRICT_ARGS_LOG"
+  : >"$COORDINATOR_SOURCE_ARGS_LOG"
+  : >"$COORDINATOR_UV_ARGS_LOG"
+  rm -f -- "$COORDINATOR_STRICT_STATE"
+}
+
+run_dynamic_coordinator() {
+  PIP_MIRROR_URL="${COORDINATOR_INDEX_URL:-https://target-index.example/simple}" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator-dynamic" \
+    DIFY_UV_COMMAND="$fake_bin/uv-repair-coordinator-dynamic" \
+    without_proxy_environment download_wheels \
+      "$DYNAMIC_REQUIREMENTS" "$DYNAMIC_WHEELS" aarch64 3.12 '' "$DYNAMIC_REPAIR_DIR"
+}
+
+prepare_dynamic_coordinator_case two-candidates alpha beta SUCCESS
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'coordinator repairs two distinct pure Python candidates'
+else
+  fail 'coordinator repairs two distinct pure Python candidates'
+  sed 's/^/# two candidates: /' "$DYNAMIC_OUTPUT"
+fi
+assert_eq 3 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'two repairs cause three complete strict resolver attempts'
+assert_eq 2 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'two repairs download exactly two source distributions'
+assert_eq 2 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'two repairs build exactly two wheels'
+assert_eq 2 "$(grep -c '^BUILT:alpha-1.0-py3-none-any.whl$' "$COORDINATOR_STRICT_ARGS_LOG")" 'second retry sees the first admitted wheel and the third retains it'
+assert_eq 1 "$(grep -c '^BUILT:beta-1.0-py3-none-any.whl$' "$COORDINATOR_STRICT_ARGS_LOG")" 'third retry sees the second admitted wheel'
+assert_eq 2 "$(grep -c '^ARG:--find-links$' "$COORDINATOR_STRICT_ARGS_LOG")" 'each post-admission retry uses one local wheel directory'
+assert_eq 3 "$(find "$DYNAMIC_WHEELS" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'final full resolver pass contains two repaired wheels and runtime'
+assert_eq 0 "$(find "$DYNAMIC_WHEELS" -maxdepth 1 -type f -name 'partial-*' | wc -l)" 'full retry reset removes every earlier partial wheel'
+
+prepare_dynamic_coordinator_case repeated-canonical My_Pkg 'my-pkg>=2'
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'canonical separator/case repeat stops the repair loop'
+else
+  pass 'canonical separator/case repeat stops the repair loop'
+fi
+assert_eq 2 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'repeated candidate performs only two strict attempts'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'repeated canonical candidate is built only once'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'repeated canonical candidate invokes uv only once'
+assert_file_contains "$DYNAMIC_OUTPUT" 'repeated pure Python sdist repair candidate: my-pkg>=2' 'repeat diagnostic reports the safe changed constraint'
+
+limit_candidates=()
+for candidate_number in $(seq -w 1 17); do
+  limit_candidates+=("pkg$candidate_number")
+done
+prepare_dynamic_coordinator_case repair-limit "${limit_candidates[@]}"
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'seventeenth candidate reaches the bounded repair limit'
+else
+  pass 'seventeenth candidate reaches the bounded repair limit'
+fi
+assert_eq 17 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'repair limit is checked after the seventeenth strict classification'
+assert_eq 16 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'repair limit permits only sixteen source downloads'
+assert_eq 16 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'repair limit permits only sixteen builds'
+assert_file_contains "$DYNAMIC_OUTPUT" 'pure Python sdist repair limit reached: 16' 'repair limit diagnostic is explicit'
+assert_file_not_contains "$COORDINATOR_SOURCE_ARGS_LOG" 'REQUIREMENT:pkg17' 'seventeenth candidate is never downloaded as source'
+
+for disabled_value in 0 false FALSE no NO; do
+  prepare_dynamic_coordinator_case "disabled-$disabled_value" docopt
+  if DIFY_AUTO_BUILD_PURE_SDIST="$disabled_value" run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+    fail "automatic pure repair disabled value fails safely: $disabled_value"
+  else
+    pass "automatic pure repair disabled value fails safely: $disabled_value"
+  fi
+  assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" "disabled value performs one strict attempt: $disabled_value"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" "disabled value downloads no source: $disabled_value"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "disabled value invokes no uv: $disabled_value"
+  assert_file_missing "$DYNAMIC_REPAIR_DIR" "disabled value creates no repair staging: $disabled_value"
+  assert_file_contains "$DYNAMIC_OUTPUT" 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.' "disabled value reports its switch: $disabled_value"
+done
+
+prepare_dynamic_coordinator_case normal-success SUCCESS
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'normal binary-only success preserves the one-pass path'
+else
+  fail 'normal binary-only success preserves the one-pass path'
+fi
+assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'normal success runs one strict resolver pass'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'normal success downloads no source'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'normal success invokes no uv'
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'normal success creates no repair directory'
+
+prepare_dynamic_coordinator_case default-repair-dir docopt SUCCESS
+uv_space_dir="$FIXTURE_DIR/coordinator tools with spaces"
+uv_space_command="$uv_space_dir/uv dynamic"
+mkdir -p -- "$uv_space_dir"
+cp -- "$fake_bin/uv-repair-coordinator-dynamic" "$uv_space_command"
+chmod +x "$uv_space_command"
+if PIP_MIRROR_URL='https://target-index.example/simple' \
+  DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator-dynamic" \
+  DIFY_UV_COMMAND="$uv_space_command" \
+  without_proxy_environment download_wheels \
+    "$DYNAMIC_REQUIREMENTS" "$DYNAMIC_WHEELS" aarch64 3.12 '' \
+    >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'default sibling repair directory and exact uv path with spaces are supported'
+else
+  fail 'default sibling repair directory and exact uv path with spaces are supported'
+fi
+assert_eq 2 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'default repair directory performs a complete retry'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'exact configured uv command is invoked once'
+if [[ -f "$DYNAMIC_REPAIR_DIR/built-wheels/docopt-1.0-py3-none-any.whl" ]]; then
+  pass 'omitted sixth argument defaults to sibling sdist-repair staging'
+else
+  fail 'omitted sixth argument defaults to sibling sdist-repair staging'
+fi
+
+prepare_dynamic_coordinator_case log-setup-failure SUCCESS
+if (
+  mktemp() {
+    if [[ "${1:-}" == -d ]]; then
+      command mktemp "$@"
+    else
+      return 70
+    fi
+  }
+  run_dynamic_coordinator
+) >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'coordinator log-file setup failure stops safely'
+else
+  pass 'coordinator log-file setup failure stops safely'
+fi
+assert_eq 0 "$(find "$DYNAMIC_CASE_DIR" -maxdepth 1 -type d -name '.pip-coordinator.*' | wc -l)" 'coordinator cleans its private directory when log-file setup fails'
+
+prepare_dynamic_coordinator_case empty-requirements docopt
+: >"$DYNAMIC_REQUIREMENTS"
+touch -- "$DYNAMIC_WHEELS/stale-before-empty.whl"
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'empty requirements preserve the no-resolver path'
+else
+  fail 'empty requirements preserve the no-resolver path'
+fi
+assert_eq 0 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'empty requirements invoke no strict resolver'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'empty requirements download no source'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'empty requirements invoke no uv'
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'empty requirements create no repair directory'
+assert_file_missing "$DYNAMIC_WHEELS/stale-before-empty.whl" 'empty requirements retain existing wheelhouse reset behavior'
+
+blocked_names=(network dns proxy auth tls cert timeout hash conflict resolution unknown control)
+blocked_messages=(
+  'Network is unreachable'
+  'NameResolutionError: DNS lookup failed'
+  'ProxyError: cannot connect to proxy'
+  '401 authentication required for https://auth-user:auth-password@mirror.example/simple?token=auth-query'
+  'TLS handshake failed'
+  'certificate verify failed'
+  'operation timed out'
+  'THESE PACKAGES DO NOT MATCH THE HASHES'
+  'version conflict detected'
+  'ResolutionImpossible: conflicting dependencies'
+  'UNEXPECTED-DIAGNOSTIC-SENTINEL'
+  'CONTROL'
+)
+for blocked_index in "${!blocked_names[@]}"; do
+  blocked_name=${blocked_names[$blocked_index]}
+  blocked_message=${blocked_messages[$blocked_index]}
+  prepare_dynamic_coordinator_case "blocked-$blocked_name" "RAW|$blocked_message"
+  if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+    fail "blocked strict failure never triggers repair: $blocked_name"
+  else
+    pass "blocked strict failure never triggers repair: $blocked_name"
+  fi
+  assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" "blocked failure performs one strict attempt: $blocked_name"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" "blocked failure downloads no source: $blocked_name"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "blocked failure invokes no uv: $blocked_name"
+  assert_file_missing "$DYNAMIC_REPAIR_DIR" "blocked failure creates no repair staging: $blocked_name"
+  assert_file_contains "$DYNAMIC_OUTPUT" 'failed to download a complete binary wheel dependency set' "blocked failure receives standard target report: $blocked_name"
+  for secret_value in auth-user auth-password auth-query; do
+    assert_file_not_contains "$DYNAMIC_OUTPUT" "$secret_value" "blocked diagnostic redacts $secret_value: $blocked_name"
+  done
+done
+
+prepare_dynamic_coordinator_case blocked-flood 'RAW|FLOOD'
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'oversized unknown strict diagnostic fails closed'
+else
+  pass 'oversized unknown strict diagnostic fails closed'
+fi
+if (( $(stat -c '%s' "$DYNAMIC_OUTPUT") <= 1100000 )); then
+  pass 'coordinator strict diagnostic display remains bounded'
+else
+  fail 'coordinator strict diagnostic display remains bounded'
+fi
+assert_file_contains "$DYNAMIC_OUTPUT" 'diagnostic output truncated' 'bounded coordinator diagnostic reports truncation'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'oversized unknown strict diagnostic downloads no source'
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'oversized unknown strict diagnostic creates no repair staging'
+
+prepare_dynamic_coordinator_case task3-download-failure docopt
+if COORDINATOR_SOURCE_MODE=failure run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'Task3 source download failure stops the coordinator immediately'
+else
+  pass 'Task3 source download failure stops the coordinator immediately'
+fi
+assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'source download failure performs no next strict retry'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'source download failure invokes one source request'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'source download failure never invokes uv'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.' 'source download failure reports the repair kill switch'
+for secret_value in source-user source-password source-query; do
+  assert_file_not_contains "$DYNAMIC_OUTPUT" "$secret_value" "source download failure redacts $secret_value"
+done
+
+for failed_uv_mode in failure native nonpure mismatch; do
+  prepare_dynamic_coordinator_case "task3-$failed_uv_mode" docopt
+  if COORDINATOR_UV_MODE="$failed_uv_mode" run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+    fail "Task3 $failed_uv_mode failure stops the coordinator immediately"
+  else
+    pass "Task3 $failed_uv_mode failure stops the coordinator immediately"
+  fi
+  assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" "Task3 $failed_uv_mode failure performs no next strict retry"
+  assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" "Task3 $failed_uv_mode failure downloads one source"
+  assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "Task3 $failed_uv_mode failure invokes uv once"
+  assert_file_contains "$DYNAMIC_OUTPUT" 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.' "Task3 $failed_uv_mode failure reports the repair kill switch"
+  for secret_value in build-user build-password build-query; do
+    assert_file_not_contains "$DYNAMIC_OUTPUT" "$secret_value" "Task3 $failed_uv_mode diagnostic redacts $secret_value"
+  done
+done
+
+prepare_dynamic_coordinator_case authenticated-index docopt
+if COORDINATOR_INDEX_URL='https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'authenticated package index remains fail-closed for source repair'
+else
+  pass 'authenticated package index remains fail-closed for source repair'
+fi
+assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'authenticated index failure performs no next strict retry'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'authenticated index rejection occurs before source download'
+assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'authenticated index rejection occurs before uv'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Pure Python sdist repair rejected the configured package index' 'authenticated index rejection remains explicit'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.' 'authenticated index rejection reports the repair kill switch'
+for secret_value in index-user index-password index-query; do
+  assert_file_not_contains "$DYNAMIC_OUTPUT" "$secret_value" "authenticated index rejection redacts $secret_value"
+done
+
+prepare_dynamic_coordinator_case final-unclassifiable gamma 'RAW|UNEXPECTED-FINAL-RESOLUTION-DIAGNOSTIC'
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'unclassifiable re-resolution failure stops after one admission'
+else
+  pass 'unclassifiable re-resolution failure stops after one admission'
+fi
+assert_eq 2 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'unclassifiable re-resolution performs exactly two strict attempts'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'unclassifiable re-resolution admits only one source candidate'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Initial strict wheel-resolution diagnostics:' 'distinct first failure diagnostics are labelled'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Final strict wheel-resolution diagnostics:' 'distinct final failure diagnostics are labelled'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Pure Python sdist repair failed during resolution after 1 admitted wheel(s).' 'post-admission resolution failure reports its admission count'
+assert_file_not_contains "$DYNAMIC_OUTPUT" 'strict-user' 'post-admission diagnostics redact initial index username'
+assert_file_not_contains "$DYNAMIC_OUTPUT" 'strict-password' 'post-admission diagnostics redact initial index password'
+assert_file_not_contains "$DYNAMIC_OUTPUT" 'strict-query' 'post-admission diagnostics redact initial index query'
+
+prepare_dynamic_coordinator_case identical-repeat docopt docopt
+if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'identical repeated candidate fails without rebuilding'
+else
+  pass 'identical repeated candidate fails without rebuilding'
+fi
+assert_eq 1 "$(grep -c '^Strict wheel-resolution diagnostics:$' "$DYNAMIC_OUTPUT")" 'identical initial/final diagnostics use one display section'
+assert_eq 1 "$(grep -c 'Could not find a version that satisfies the requirement docopt' "$DYNAMIC_OUTPUT")" 'identical raw resolver diagnostics are displayed only once'
+assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'identical repeated candidate is built only once'
+
+for cancellation_status in 124 125 130 143; do
+  prepare_dynamic_coordinator_case "cancel-$cancellation_status" docopt
+  if (
+    repair_one_pure_sdist() { return "$cancellation_status"; }
+    run_dynamic_coordinator
+  ) >"$DYNAMIC_OUTPUT" 2>&1; then
+    observed_cancellation_status=0
+  else
+    observed_cancellation_status=$?
+  fi
+  assert_eq "$cancellation_status" "$observed_cancellation_status" "Task3 cancellation status propagates: $cancellation_status"
+  assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" "Task3 cancellation permits no extra strict retry: $cancellation_status"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" "Task3 cancellation fixture downloads no source: $cancellation_status"
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "Task3 cancellation fixture invokes no uv: $cancellation_status"
+  assert_file_missing "$DYNAMIC_REPAIR_DIR/.repair-lock" "Task3 cancellation leaves no repair lock: $cancellation_status"
+done
+
+if grep '^LOGPARENTMODE:' "$COORDINATOR_STRICT_ARGS_LOG" | grep -qv '^LOGPARENTMODE:700$'; then
+  fail 'coordinator raw-log parent remains private while pip runs'
+else
+  pass 'coordinator raw-log parent remains private while pip runs'
+fi
+assert_eq 0 "$(grep '^LOGMODE:' "$COORDINATOR_STRICT_ARGS_LOG" | grep -vc '^LOGMODE:600$' || true)" 'coordinator raw logs use mode 0600 while pip runs'
+assert_eq 0 "$(find "$FIXTURE_DIR" -type d -name '.pip-coordinator.*' | wc -l)" 'coordinator removes every private raw-log directory after success and failure'
+if [[ -d "$coordinator_repair_dir" && -f "$coordinator_repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl" ]]; then
+  pass 'coordinator log cleanup preserves the admitted repair tree'
+else
+  fail 'coordinator log cleanup preserves the admitted repair tree'
+fi
+
+coordinator_function_source="$(sed -n '/^download_wheels() (/,/^)/p' "$ROOT_DIR/plugin_repackaging.sh")"
+for source_specific_name in docopt records database-plus uxdb; do
+  if grep -Fiq -- "$source_specific_name" <<<"$coordinator_function_source"; then
+    fail "coordinator production remains generic: $source_specific_name"
+  else
+    pass "coordinator production remains generic: $source_specific_name"
+  fi
+done
+if grep -Eq '(^|[[:space:]])eval([[:space:]]|$)|--no-binary|manylinux.*x86_64.*aarch64|aarch64.*x86_64' <<<"$coordinator_function_source"; then
+  fail 'coordinator contains no eval, native-source mode, or host-architecture fallback'
+else
+  pass 'coordinator contains no eval, native-source mode, or host-architecture fallback'
+fi
+if grep -Fq '${#repaired_candidates' <<<"$coordinator_function_source"; then
+  fail 'coordinator associative set avoids Bash 4.3 nounset-unsafe length expansion'
+else
+  pass 'coordinator associative set avoids Bash 4.3 nounset-unsafe length expansion'
+fi
+if bash43_command="$(command -v bash4.3 2>/dev/null)" && [[ -n "$bash43_command" ]]; then
+  prepare_dynamic_coordinator_case bash43-success SUCCESS
+  if env \
+    -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    ROOT_DIR="$ROOT_DIR" \
+    DYNAMIC_REQUIREMENTS="$DYNAMIC_REQUIREMENTS" \
+    DYNAMIC_WHEELS="$DYNAMIC_WHEELS" \
+    DYNAMIC_REPAIR_DIR="$DYNAMIC_REPAIR_DIR" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator-dynamic" \
+    DIFY_UV_COMMAND="$fake_bin/uv-repair-coordinator-dynamic" \
+    COORDINATOR_SEQUENCE_FILE="$COORDINATOR_SEQUENCE_FILE" \
+    COORDINATOR_STRICT_STATE="$COORDINATOR_STRICT_STATE" \
+    COORDINATOR_STRICT_ARGS_LOG="$COORDINATOR_STRICT_ARGS_LOG" \
+    COORDINATOR_SOURCE_ARGS_LOG="$COORDINATOR_SOURCE_ARGS_LOG" \
+    COORDINATOR_UV_ARGS_LOG="$COORDINATOR_UV_ARGS_LOG" \
+    "$bash43_command" -uc \
+      'source "$ROOT_DIR/plugin_repackaging.sh"; download_wheels "$DYNAMIC_REQUIREMENTS" "$DYNAMIC_WHEELS" aarch64 3.12 "" "$DYNAMIC_REPAIR_DIR"' \
+      >"$DYNAMIC_OUTPUT" 2>&1; then
+    pass 'Bash 4.3 executes the coordinator under nounset'
+  else
+    fail 'Bash 4.3 executes the coordinator under nounset'
+  fi
+else
+  pass 'Bash 4.3 runtime unavailable; coordinator associative-set regressions are covered statically'
+fi
+
 cat >"$fake_bin/pip-fail" <<'EOF'
 #!/usr/bin/env bash
 exit 23
@@ -1968,6 +2584,7 @@ assert_file_contains "$pip_download_failure_log" 'Target platforms: manylinux_2_
 assert_file_contains "$pip_download_failure_log" 'Package index: https://mirror.example/simple' 'download failure reports package index'
 assert_file_contains "$pip_download_failure_log" 'no compatible binary wheel' 'download failure explains binary wheel boundary'
 assert_file_contains "$pip_download_failure_log" 'additional package index' 'download failure mentions private or specialized indexes'
+assert_file_contains "$pip_download_failure_log" 'Only validated pure Python universal wheels may be built from source' 'standard failure report preserves the pure-only source boundary'
 
 empty_requirements="$FIXTURE_DIR/empty-requirements.txt"
 : >"$empty_requirements"

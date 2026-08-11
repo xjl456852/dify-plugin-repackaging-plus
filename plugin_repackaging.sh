@@ -348,17 +348,19 @@ def normalize_requirement(value, strip_context=False):
     name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
     spec = match.group("spec") or ""
     spec = re.sub(r"\s+", "", spec)
-    return name + spec
+    return name + spec, name
 
 
 try:
-    first = normalize_requirement(missing_version_matches[0].group(1), strip_context=True)
-    second = normalize_requirement(missing_distribution_matches[0].group(1))
+    first, first_name = normalize_requirement(
+        missing_version_matches[0].group(1), strip_context=True
+    )
+    second, second_name = normalize_requirement(missing_distribution_matches[0].group(1))
 except ValueError:
     raise SystemExit(1)
-if first != second:
+if first != second or first_name != second_name:
     raise SystemExit(1)
-print(first)
+print(f"{first}\t{first_name}")
 PY
 }
 
@@ -861,7 +863,7 @@ report_wheel_download_failure() {
     "Target platforms: $platform_list" \
     "Package index: $safe_index_url" \
     'Common causes: no compatible binary wheel for the target, conflicting version constraints, an additional package index is required, or the proxy/index is unreachable.' \
-    'The packager will not compile source distributions or fall back to the build host architecture.' >&2
+    'Only validated pure Python universal wheels may be built from source; native source builds and build-host architecture fallbacks remain disabled.' >&2
 }
 
 reset_wheels_dir() {
@@ -1382,6 +1384,7 @@ run_pip_with_socks_retry() {
   local allow_legacy_retry=${5:-false}
   local clean_env_args_name=${6:-}
   local bounded_capture=${7:-false}
+  local display_output=${8:-true}
   local pip_status retry_status
   local truststore_error="TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'"
 
@@ -1395,7 +1398,9 @@ run_pip_with_socks_retry() {
   else
     pip_status=$?
   fi
-  redact_pip_log <"$pip_output_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
+  if [[ "$display_output" == true ]]; then
+    redact_pip_log <"$pip_output_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
+  fi
   if ((pip_status == 0)); then
     return 0
   fi
@@ -1415,7 +1420,9 @@ run_pip_with_socks_retry() {
   else
     retry_status=$?
   fi
-  redact_pip_log <"$pip_output_log" >&2 || printf 'pip retry output could not be displayed safely\n' >&2
+  if [[ "$display_output" == true ]]; then
+    redact_pip_log <"$pip_output_log" >&2 || printf 'pip retry output could not be displayed safely\n' >&2
+  fi
   return "$retry_status"
 }
 
@@ -2283,6 +2290,8 @@ download_wheels_once() {
   local pip_output_log=$5
   local bootstrap_dir=${6:-}
   local local_wheels_dir=${7:-}
+  local bounded_capture=${8:-false}
+  local display_output=${9:-true}
   local abi platform socks_proxy_url= socks_site_dir=
   local -a pip_command=()
   local -a platform_args=()
@@ -2332,17 +2341,123 @@ download_wheels_once() {
     download_args \
     "$socks_site_dir" \
     "$pip_output_log" \
-    "$([[ -n "$socks_proxy_url" ]] && printf true || printf false)"
+    "$([[ -n "$socks_proxy_url" ]] && printf true || printf false)" \
+    '' \
+    "$bounded_capture" \
+    "$display_output"
 }
 
-download_wheels() {
+validate_coordinator_log_file() {
+  local log_file=$1
+  local log_dir=$2
+
+  task3_python -B - "$log_file" "$log_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+path, parent = sys.argv[1:]
+try:
+    parent_mode = os.lstat(parent).st_mode
+    mode = os.lstat(path).st_mode
+    if (
+        os.path.dirname(path) != parent
+        or stat.S_ISLNK(parent_mode)
+        or not stat.S_ISDIR(parent_mode)
+        or stat.S_IMODE(parent_mode) != 0o700
+        or stat.S_ISLNK(mode)
+        or not stat.S_ISREG(mode)
+        or stat.S_IMODE(mode) != 0o600
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+cleanup_download_coordinator_logs() {
+  local log_dir=${1:-}
+  local initial_log=${2:-}
+  local current_log=${3:-}
+  local log_file
+
+  [[ -n "$log_dir" && -d "$log_dir" && ! -L "$log_dir" && \
+    "$(basename -- "$log_dir")" == .pip-coordinator.* ]] || return 0
+  for log_file in "$initial_log" "$current_log"; do
+    if [[ -n "$log_file" && "$(dirname -- "$log_file")" == "$log_dir" && \
+      "$(basename -- "$log_file")" == *.log ]]; then
+      rm -f -- "$log_file"
+    fi
+  done
+  rmdir -- "$log_dir" 2>/dev/null || true
+}
+
+display_distinct_coordinator_logs() {
+  local initial_log=$1
+  local current_log=$2
+  local log_dir=$3
+
+  if ! validate_coordinator_log_file "$initial_log" "$log_dir"; then
+    printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
+    return 1
+  fi
+  if [[ -z "$current_log" ]] || cmp -s -- "$initial_log" "$current_log"; then
+    printf 'Strict wheel-resolution diagnostics:\n' >&2
+    redact_pip_log <"$initial_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
+    return 0
+  fi
+  if ! validate_coordinator_log_file "$current_log" "$log_dir"; then
+    printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
+    return 1
+  fi
+  printf 'Initial strict wheel-resolution diagnostics:\n' >&2
+  redact_pip_log <"$initial_log" >&2 || printf 'initial pip output could not be displayed safely\n' >&2
+  printf 'Final strict wheel-resolution diagnostics:\n' >&2
+  redact_pip_log <"$current_log" >&2 || printf 'final pip output could not be displayed safely\n' >&2
+}
+
+validate_repair_built_wheels_dir() {
+  local repair_dir=$1
+  local built_wheels_dir=$2
+
+  task3_python -B - "$repair_dir" "$built_wheels_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+repair_dir, built_wheels_dir = sys.argv[1:]
+try:
+    if (
+        built_wheels_dir != os.path.join(repair_dir, "built-wheels")
+        or not os.path.isabs(built_wheels_dir)
+    ):
+        raise ValueError
+    for path in (repair_dir, built_wheels_dir):
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+download_wheels() (
+  umask 077
   local requirements=$1
   local wheels_dir=$2
   local target_arch=$3
   local python_version=$4
   local bootstrap_dir=${5:-}
-  local abi platform pip_output_log wheels_parent
+  local repair_dir=${6:-}
+  local abi platform wheels_parent coordinator_log_dir= initial_log= current_log=
+  local attempt_log missing_record requirement canonical_name uv_command
+  local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status
+  local repair_count=0
   local -a platform_names=()
+  local -a pip_command=()
+  local -A repaired_candidates=()
 
   reset_wheels_dir "$wheels_dir" || return
   if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
@@ -2354,26 +2469,111 @@ download_wheels() {
       platform_names+=("$platform")
     fi
   done < <(default_platforms "$target_arch")
-  wheels_parent="$(dirname -- "$wheels_dir")"
-  pip_output_log="$(mktemp "$wheels_parent/.pip-download.XXXXXX")" || return
-  if download_wheels_once \
-    "$requirements" \
-    "$wheels_dir" \
-    "$target_arch" \
-    "$python_version" \
-    "$pip_output_log" \
-    "$bootstrap_dir"; then
-    rm -f -- "$pip_output_log"
-    return 0
+  wheels_parent="$(realpath -m -- "$(dirname -- "$wheels_dir")")" || return
+  if [[ -z "$repair_dir" ]]; then
+    repair_dir="$wheels_parent/sdist-repair"
   fi
-  rm -f -- "$pip_output_log"
-  report_wheel_download_failure \
-    "$target_arch" \
-    "$python_version" \
-    "$abi" \
-    "${platform_names[@]}"
-  return 1
-}
+  coordinator_log_dir="$(mktemp -d "$wheels_parent/.pip-coordinator.XXXXXXXX")" || return
+  trap 'cleanup_download_coordinator_logs "$coordinator_log_dir" "$initial_log" "$current_log"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  chmod 700 -- "$coordinator_log_dir" || return
+  initial_log="$(mktemp "$coordinator_log_dir/initial.XXXXXXXX.log")" || return
+  current_log="$(mktemp "$coordinator_log_dir/current.XXXXXXXX.log")" || return
+  chmod 600 -- "$initial_log" "$current_log" || return
+
+  while :; do
+    reset_wheels_dir "$wheels_dir" || return
+    if ((repair_count == 0)); then
+      attempt_log=$initial_log
+      local_wheels_dir=
+    else
+      attempt_log=$current_log
+      local_wheels_dir="$repair_dir/built-wheels"
+      if ! validate_repair_built_wheels_dir "$repair_dir" "$local_wheels_dir"; then
+        printf 'validated built-wheel directory is unsafe\n' >&2
+        return 1
+      fi
+    fi
+    if download_wheels_once \
+      "$requirements" "$wheels_dir" "$target_arch" "$python_version" "$attempt_log" \
+      "$bootstrap_dir" "$local_wheels_dir" true false; then
+      return 0
+    fi
+    validate_coordinator_log_file "$attempt_log" "$coordinator_log_dir" || {
+      printf 'strict wheel-resolution diagnostics are unsafe\n' >&2
+      return 1
+    }
+    if ! missing_record="$(extract_missing_requirement "$attempt_log")"; then
+      display_distinct_coordinator_logs "$initial_log" "$([[ "$attempt_log" == "$initial_log" ]] && printf '' || printf '%s' "$attempt_log")" "$coordinator_log_dir" || true
+      if ((repair_count > 0)); then
+        printf 'Pure Python sdist repair failed during resolution after %s admitted wheel(s).\n' "$repair_count" >&2
+      fi
+      report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
+      return 1
+    fi
+    [[ "$missing_record" == *$'\t'* && "$missing_record" != *$'\t'*$'\t'* ]] || {
+      printf 'invalid missing-wheel classification record\n' >&2
+      return 1
+    }
+    requirement=${missing_record%%$'\t'*}
+    canonical_name=${missing_record#*$'\t'}
+    case "${DIFY_AUTO_BUILD_PURE_SDIST:-1}" in
+      0 | false | FALSE | no | NO)
+        display_distinct_coordinator_logs "$initial_log" '' "$coordinator_log_dir" || true
+        printf 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.\n' >&2
+        report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
+        return 1
+        ;;
+    esac
+    uv_command=${DIFY_UV_COMMAND:-uv}
+    resolve_pip_command pip_command || return
+    validate_sdist_repair_identifiers \
+      pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" "$((repair_count + 1))" || return
+    validate_sdist_repair_dir "$repair_dir" || return
+    if [[ -n "${repaired_candidates[$canonical_name]+present}" ]]; then
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      printf 'repeated pure Python sdist repair candidate: %s\n' "$requirement" >&2
+      report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
+      return 1
+    fi
+    if ((repair_count >= 16)); then
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      printf 'pure Python sdist repair limit reached: 16\n' >&2
+      report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
+      return 1
+    fi
+    socks_proxy_url="$(detect_socks_proxy)" || true
+    if [[ -n "$socks_proxy_url" ]]; then
+      validate_pip_bootstrap_dir "$bootstrap_dir" || return
+    fi
+    prepare_pip_socks_support pip_command "$bootstrap_dir" socks_site_dir || return
+    repair_count=$((repair_count + 1))
+    repaired_candidates[$canonical_name]=1
+    printf 'Pure Python sdist repair candidate: %s\n' "$requirement"
+    printf 'Source build target: Python %s, ABI %s, architecture %s\n' \
+      "$python_version" "$abi" "$target_arch"
+    if repair_one_pure_sdist \
+      pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" \
+      "$repair_dir" "$socks_site_dir" "$repair_count"; then
+      repair_status=0
+    else
+      repair_status=$?
+    fi
+    if ((repair_status != 0)); then
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      printf 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.\n' >&2
+      case "$repair_status" in
+        124 | 125 | 130 | 143)
+          return "$repair_status"
+          ;;
+      esac
+      report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
+      return 1
+    fi
+  done
+)
 
 target_triple() {
   case "$(normalize_arch "$1")" in
