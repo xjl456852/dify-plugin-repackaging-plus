@@ -1,0 +1,33 @@
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_247e5650ccbef7 63-86,169-175,248-272
+  s_c1a60985b94e3d::t_91a2dee568ebff 274-280
+  s_c1a60985b94e3d::t_9c84114c91ed5b 131
+  s_c1a60985b94e3d::t_a0134b3a412e35 182-192
+  s_c1a60985b94e3d::t_755523c405ef2f 3
+  s_c1a60985b94e3d::t_b19ce4c5fc0073 176
+  s_c1a60985b94e3d::t_ea9173e110b204 273
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_011bcc10afa9ad 54-55,57
+  s_c1a60985b94e3d::t_a262176c5243de 5,20-29,40-47,56,58-61,80-81,84,96-98,111-112,115,132-134,139-142,146-168,172-185,188-194
+  s_c1a60985b94e3d::t_3309403ac7ff92 206-208,220,243,277,282,303,307,312,317
+  s_c1a60985b94e3d::t_dcba1a6a8b1b6b 143-145
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_011bcc10afa9ad 72
+  s_c1a60985b94e3d::t_2a76e83c6b092b 77-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "bf42096f99aa2aa46f82b506a0e7ac25afe2629a",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
