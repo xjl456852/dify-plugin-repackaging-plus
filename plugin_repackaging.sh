@@ -12,6 +12,7 @@ TARGET_ARCH=
 PACKAGER_BINARY=
 ACTIVE_STAGING=
 ACTIVE_OUTPUT=
+ACTIVE_DOWNLOAD_PID=
 BUILD_SUCCEEDED=false
 
 normalize_arch() {
@@ -2322,7 +2323,7 @@ repair_one_pure_sdist_locked() {
   printf 'Pure Python wheel admitted: %s\n' "$(basename -- "$wheel_path")"
 }
 
-repair_one_pure_sdist() (
+repair_one_pure_sdist_impl() {
   umask 077
   local pip_command_name=$1
   local uv_command=$2
@@ -2376,6 +2377,10 @@ repair_one_pure_sdist() (
   repair_one_pure_sdist_locked \
     "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" \
     "$repair_dir" "$socks_site_dir" "$ordinal" "$safe_index"
+}
+
+repair_one_pure_sdist() (
+  repair_one_pure_sdist_impl "$@"
 )
 
 download_wheels_once() {
@@ -2893,7 +2898,27 @@ except (OSError, ValueError):
 PY
 }
 
-download_wheels() (
+cancel_managed_child_and_exit() {
+  local signal_name=$1
+  local exit_status=$2
+  local child_pid=${3:-}
+
+  trap '' HUP INT TERM
+  case "$signal_name:$exit_status" in
+    HUP:129 | INT:130 | TERM:143)
+      ;;
+    *)
+      exit 125
+      ;;
+  esac
+  if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -s "$signal_name" "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+  fi
+  exit "$exit_status"
+}
+
+download_wheels_impl() {
   umask 077
   local requirements=$1
   local wheels_dir=$2
@@ -2905,6 +2930,7 @@ download_wheels() (
   local abi platform
   local attempt_log missing_record requirement canonical_name uv_command
   local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status
+  local active_repair_pid=
   local repair_count=0
   local -a platform_names=()
   local -a pip_command=()
@@ -2921,10 +2947,10 @@ download_wheels() (
     fi
   done < <(default_platforms "$target_arch")
   coordinator_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)" || return
-  trap 'cleanup_coordinator_workspace "$coordinator_workspace" || true' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
+  trap "cleanup_coordinator_workspace '$coordinator_workspace' || true" EXIT
+  trap 'cancel_managed_child_and_exit INT 130 "${active_repair_pid:-}"' INT
+  trap 'cancel_managed_child_and_exit TERM 143 "${active_repair_pid:-}"' TERM
+  trap 'cancel_managed_child_and_exit HUP 129 "${active_repair_pid:-}"' HUP
   chmod 700 -- "$coordinator_workspace" || return
   validate_coordinator_workspace "$coordinator_workspace" || {
     printf 'failed to create a private coordinator workspace under /tmp\n' >&2
@@ -3010,13 +3036,16 @@ download_wheels() (
     printf 'Pure Python sdist repair candidate: %s\n' "$requirement"
     printf 'Source build target: Python %s, ABI %s, architecture %s\n' \
       "$python_version" "$abi" "$target_arch"
-    if repair_one_pure_sdist \
+    repair_one_pure_sdist_impl \
       pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" \
-      "$repair_dir" "$socks_site_dir" "$repair_count"; then
+      "$repair_dir" "$socks_site_dir" "$repair_count" &
+    active_repair_pid=$!
+    if wait "$active_repair_pid"; then
       repair_status=0
     else
       repair_status=$?
     fi
+    active_repair_pid=
     if ((repair_status != 0)); then
       display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_workspace" || true
       printf 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.\n' >&2
@@ -3029,7 +3058,15 @@ download_wheels() (
       return 1
     fi
   done
-)
+}
+
+download_wheels() {
+  if [[ "${DOWNLOAD_WHEELS_RUN_IN_PLACE:-false}" == true ]]; then
+    download_wheels_impl "$@"
+  else
+    (download_wheels_impl "$@")
+  fi
+}
 
 target_triple() {
   case "$(normalize_arch "$1")" in
@@ -3172,7 +3209,7 @@ initialize_runtime() {
 
 repackage() {
   local package_path=$1
-  local package_filename staging plugin_dir output python_version
+  local package_filename staging plugin_dir output python_version download_status
   local requires_wheel=false
   local requires_pyproject=false
 
@@ -3196,12 +3233,20 @@ repackage() {
   fi
   [[ -f "$plugin_dir/pyproject.toml" ]] && requires_pyproject=true
 
-  download_wheels \
+  DOWNLOAD_WHEELS_RUN_IN_PLACE=true download_wheels \
     "$staging/download-requirements.txt" \
     "$plugin_dir/wheels" \
     "$TARGET_ARCH" \
     "$python_version" \
-    "$staging/pip-bootstrap"
+    "$staging/pip-bootstrap" &
+  ACTIVE_DOWNLOAD_PID=$!
+  if wait "$ACTIVE_DOWNLOAD_PID"; then
+    download_status=0
+  else
+    download_status=$?
+  fi
+  ACTIVE_DOWNLOAD_PID=
+  ((download_status == 0)) || return "$download_status"
   write_offline_metadata \
     "$plugin_dir" \
     "$staging/download-requirements.txt" \
@@ -3287,6 +3332,9 @@ github_source() {
 main() {
   initialize_runtime
   trap cleanup_runtime EXIT
+  trap 'cancel_managed_child_and_exit HUP 129 "${ACTIVE_DOWNLOAD_PID:-}"' HUP
+  trap 'cancel_managed_child_and_exit INT 130 "${ACTIVE_DOWNLOAD_PID:-}"' INT
+  trap 'cancel_managed_child_and_exit TERM 143 "${ACTIVE_DOWNLOAD_PID:-}"' TERM
 
   case "${1:-}" in
     local)

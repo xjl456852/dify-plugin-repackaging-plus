@@ -2768,7 +2768,7 @@ prepare_dynamic_coordinator_case stale-pre-pip-retry docopt SUCCESS
 stale_retry_repair_count="$DYNAMIC_CASE_DIR/repair.count"
 stale_retry_mutation_marker="$DYNAMIC_CASE_DIR/mutated"
 if (
-  repair_one_pure_sdist() {
+  repair_one_pure_sdist_impl() {
     local repair_dir=$6 count=0
     [[ -f "$stale_retry_repair_count" ]] && count="$(<"$stale_retry_repair_count")"
     count=$((count + 1))
@@ -3150,7 +3150,7 @@ assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'identical repe
 for cancellation_status in 124 125 129 130 143; do
   prepare_dynamic_coordinator_case "cancel-$cancellation_status" docopt
   if (
-    repair_one_pure_sdist() { return "$cancellation_status"; }
+    repair_one_pure_sdist_impl() { return "$cancellation_status"; }
     run_dynamic_coordinator_default
   ) >"$DYNAMIC_OUTPUT" 2>&1; then
     observed_cancellation_status=0
@@ -3169,7 +3169,7 @@ done
 
 prepare_dynamic_coordinator_case cancel-mutated-workspace docopt
 if (
-  repair_one_pure_sdist() {
+  repair_one_pure_sdist_impl() {
     mutated_workspace="$(dirname -- "$6")"
     mkdir -p -- "$mutated_workspace/unreadable/nested"
     printf 'cleanup sentinel\n' >"$mutated_workspace/unreadable/nested/file"
@@ -3201,7 +3201,7 @@ else
   fail 'coordinator log cleanup preserves the admitted repair tree'
 fi
 
-coordinator_function_source="$(sed -n '/^download_wheels() (/,/^)/p' "$ROOT_DIR/plugin_repackaging.sh")"
+coordinator_function_source="$(sed -n '/^download_wheels_impl() {/,/^download_wheels() {/p' "$ROOT_DIR/plugin_repackaging.sh")"
 for source_specific_name in docopt records database-plus uxdb; do
   if grep -Fiq -- "$source_specific_name" <<<"$coordinator_function_source"; then
     fail "coordinator production remains generic: $source_specific_name"
@@ -3786,7 +3786,7 @@ assert_file_contains "$FIXTURE_DIR/uv-old.log" '0.7.21 or newer' 'old uv error r
 
 input_plugin_dir="$FIXTURE_DIR/input-plugin"
 input_package="$FIXTURE_DIR/source plugin.difypkg"
-mkdir -p "$input_plugin_dir/provider" "$input_plugin_dir/models/llm"
+mkdir -p "$input_plugin_dir/provider" "$input_plugin_dir/models/llm" "$input_plugin_dir/wheels"
 printf '%s\n' \
   'version: 0.0.1' \
   'type: plugin' \
@@ -3870,6 +3870,8 @@ printf '%s\n' \
   '' \
   'class OfflineFixtureLargeLanguageModel(OAICompatLargeLanguageModel):' \
   '    pass' >"$input_plugin_dir/models/llm/llm.py"
+printf 'stale host wheel\n' >"$input_plugin_dir/wheels/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+printf 'stale partial attempt\n' >"$input_plugin_dir/wheels/partial-from-original-attempt.whl"
 (
   cd "$input_plugin_dir"
   python3 - "$input_package" <<'PY'
@@ -3888,6 +3890,400 @@ GENERATED_TEST_OUTPUT="$ROOT_DIR/source plugin-offline.difypkg"
 rm -f -- "$GENERATED_TEST_OUTPUT"
 export UV_ARGS_LOG="$FIXTURE_DIR/uv-runtime.args"
 export PACKAGER_ARGS_LOG="$FIXTURE_DIR/packager.args"
+
+cat >"$fake_bin/pip-full-repackage" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+is_strict=false
+dest=
+find_links=
+previous=
+for argument in "$@"; do
+  [[ "$argument" == --only-binary=:all: ]] && is_strict=true
+  if [[ "$previous" == --dest || "$previous" == -d ]]; then
+    dest=$argument
+  elif [[ "$previous" == --find-links ]]; then
+    find_links=$argument
+  fi
+  previous=$argument
+done
+[[ -n "$dest" ]]
+workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" \
+  -name 'dify-plugin-coordinator.*' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+[[ -z "$workspace" ]] || printf 'WORKSPACE:%s\n' "$workspace" >>"$FULL_WORKSPACE_LOG"
+
+if [[ "$is_strict" == true ]]; then
+  attempt=0
+  [[ -f "$FULL_STRICT_STATE" ]] && attempt="$(<"$FULL_STRICT_STATE")"
+  attempt=$((attempt + 1))
+  printf '%s\n' "$attempt" >"$FULL_STRICT_STATE"
+  {
+    printf 'STRICT:%s\n' "$attempt"
+    printf 'ARG:%s\n' "$@"
+  } >>"$FULL_PIP_LOG"
+  mkdir -p -- "$dest"
+  if [[ "${FULL_REPAIR_MODE:-success}" == wheel-only ]]; then
+    touch -- "$dest/runtime-target-1.0-py3-none-any.whl"
+    exit 0
+  fi
+  if ((attempt == 1)); then
+    touch -- "$dest/partial-from-failed-attempt.whl"
+    printf '%s\n' \
+      'Looking in indexes: https://strict-user:strict-password@mirror.example/simple?token=strict-query#fragment' \
+      'ERROR: Could not find a version that satisfies the requirement docopt (from records) (from versions: none)' \
+      'ERROR: No matching distribution found for docopt'
+    exit 1
+  fi
+  if [[ "${FULL_REPAIR_MODE:-success}" == resolution-failure ]]; then
+    printf 'unexpected final resolution via https://final-user:final-password@mirror.example/simple?token=final-query#fragment\v\n'
+    exit 1
+  fi
+  [[ -n "$find_links" && -d "$find_links" ]]
+  cp -- "$find_links"/*.whl "$dest/"
+  touch -- "$dest/runtime-target-1.0-py3-none-any.whl"
+  exit 0
+fi
+
+printf 'SOURCE\n' >>"$FULL_PIP_LOG"
+if [[ "${FULL_REPAIR_MODE:-success}" == download-failure ]]; then
+  printf 'download failed via https://download-user:download-password@mirror.example/simple?token=download-query#fragment\v\n' >&2
+  exit 41
+fi
+python3 - "$dest" <<'PY'
+from pathlib import Path
+import io
+import tarfile
+import sys
+
+destination = Path(sys.argv[1])
+destination.mkdir(parents=True, exist_ok=True)
+prefix = "docopt-0.6.2"
+metadata = b"Metadata-Version: 2.1\nName: docopt\nVersion: 0.6.2\n\n"
+with tarfile.open(destination / f"{prefix}.tar.gz", "w:gz") as archive:
+    for member_name, contents in (
+        (f"{prefix}/PKG-INFO", metadata),
+        (f"{prefix}/setup.py", b"from setuptools import setup\nsetup()\n"),
+    ):
+        info = tarfile.TarInfo(member_name)
+        info.size = len(contents)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(contents))
+PY
+EOF
+
+cat >"$fake_bin/uv-full-repackage" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${1:-}" == --version ]]; then
+  printf 'uv 0.11.24\n'
+  exit 0
+fi
+printf 'CALL:%s\n' "$*" >>"$FULL_UV_LOG"
+if [[ "${1:-}" != build ]]; then
+  exit "${FULL_VERIFY_STATUS:-0}"
+fi
+if [[ "${FULL_REPAIR_MODE:-success}" == build-failure ]]; then
+  printf 'build failed via socks5h://build-user:build-password@10.10.10.10:28802/path?token=build-query#fragment\v\n' >&2
+  exit 51
+fi
+if [[ "${FULL_REPAIR_MODE:-success}" == cancel ]]; then
+  printf '%s\n' "$$" >"$FULL_CHILD_PID_FILE"
+  : >"$FULL_CANCEL_MARKER"
+  trap '' HUP INT TERM
+  while :; do sleep 1; done
+fi
+out_dir=
+previous=
+for argument in "$@"; do
+  if [[ "$previous" == --out-dir ]]; then
+    out_dir=$argument
+  fi
+  previous=$argument
+done
+[[ -n "$out_dir" ]]
+python3 - "$out_dir" "${FULL_REPAIR_MODE:-success}" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+
+output_dir = Path(sys.argv[1])
+mode = sys.argv[2]
+output_dir.mkdir(parents=True, exist_ok=True)
+wheel = output_dir / "docopt-0.6.2-py2.py3-none-any.whl"
+wheel_metadata = (
+    "Wheel-Version: 1.0\n"
+    "Generator: full-repackage-test\n"
+    "Root-Is-Purelib: true\n"
+    "Tag: py2-none-any\n"
+    "Tag: py3-none-any\n\n"
+).encode()
+with zipfile.ZipFile(wheel, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr(
+        "docopt-0.6.2.dist-info/METADATA",
+        b"Metadata-Version: 2.1\nName: docopt\nVersion: 0.6.2\n\n",
+    )
+    archive.writestr("docopt-0.6.2.dist-info/WHEEL", wheel_metadata)
+    if mode == "native":
+        archive.writestr("docopt/native.bin", b"\x7fELF" + b"\0" * 32)
+    else:
+        archive.writestr("docopt.py", b"__version__ = '0.6.2'\n")
+PY
+EOF
+
+cat >"$fake_bin/dify-packager-full" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+plugin_dir=
+output=
+while (($#)); do
+  case "$1" in
+    package)
+      shift
+      plugin_dir=${1:-}
+      ;;
+    -o)
+      shift
+      output=${1:-}
+      ;;
+  esac
+  shift
+done
+[[ -n "$plugin_dir" && -n "$output" ]]
+if [[ -e "$output" ]]; then
+  printf 'OUTPUT_WAS_ABSENT:false\n' >>"$FULL_PACKAGER_LOG"
+  exit 87
+fi
+printf 'OUTPUT_WAS_ABSENT:true\n' >>"$FULL_PACKAGER_LOG"
+python3 - "$plugin_dir" "$output" <<'PY'
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+import sys
+
+root = Path(sys.argv[1])
+with ZipFile(sys.argv[2], "w", ZIP_DEFLATED) as archive:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(root))
+PY
+EOF
+chmod +x "$fake_bin/pip-full-repackage" "$fake_bin/uv-full-repackage" "$fake_bin/dify-packager-full"
+
+export FULL_STRICT_STATE="$FIXTURE_DIR/full-strict.state"
+export FULL_PIP_LOG="$FIXTURE_DIR/full-pip.args"
+export FULL_UV_LOG="$FIXTURE_DIR/full-uv.args"
+export FULL_PACKAGER_LOG="$FIXTURE_DIR/full-packager.args"
+export FULL_WORKSPACE_LOG="$FIXTURE_DIR/full-workspaces.log"
+export FULL_CANCEL_MARKER="$FIXTURE_DIR/full-cancel.ready"
+export FULL_CHILD_PID_FILE="$FIXTURE_DIR/full-cancel-child.pid"
+input_package_sha256="$(sha256sum "$input_package" | cut -d' ' -f1)"
+
+prepare_full_repackage_case() {
+  rm -f -- "$GENERATED_TEST_OUTPUT" "$FULL_STRICT_STATE" "$FULL_CANCEL_MARKER" "$FULL_CHILD_PID_FILE"
+  : >"$FULL_PIP_LOG"
+  : >"$FULL_UV_LOG"
+  : >"$FULL_PACKAGER_LOG"
+  : >"$FULL_WORKSPACE_LOG"
+}
+
+run_full_repackage_case() {
+  local mode=$1
+  local log=$2
+  shift 2
+  env -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    FULL_REPAIR_MODE="$mode" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+    DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+    DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+    DIFY_TARGET_ARCH=aarch64 \
+    "$@" \
+    bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$log" 2>&1
+}
+
+assert_full_repackage_cleanup() {
+  local name=$1
+  local workspace
+  assert_eq 0 "$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*' | wc -l)" "$name cleans repository staging"
+  while IFS= read -r workspace; do
+    [[ -z "$workspace" ]] && continue
+    if [[ "$workspace" == /tmp/dify-plugin-coordinator.* && ! -e "$workspace" ]]; then
+      continue
+    fi
+    fail "$name cleans its secure coordinator workspace"
+    return
+  done < <(sed -n 's/^WORKSPACE://p' "$FULL_WORKSPACE_LOG" | sort -u)
+  if grep -q '^WORKSPACE:' "$FULL_WORKSPACE_LOG"; then
+    pass "$name cleans its secure coordinator workspace"
+  else
+    fail "$name observes a secure coordinator workspace"
+  fi
+}
+
+prepare_full_repackage_case
+full_success_log="$FIXTURE_DIR/full-repackage-success.log"
+if run_full_repackage_case success "$full_success_log"; then
+  pass 'full local command self-heals a pure Python sdist dependency'
+else
+  fail 'full local command self-heals a pure Python sdist dependency'
+  sed 's/^/# full self-heal: /' "$full_success_log"
+fi
+assert_file_contains "$full_success_log" 'Pure Python sdist repair candidate: docopt' 'full self-heal reports its candidate'
+assert_file_contains "$full_success_log" 'Pure Python wheel admitted: docopt-0.6.2-py2.py3-none-any.whl' 'full self-heal reports validated admission'
+assert_file_contains "$full_success_log" 'Repackage success.' 'full self-heal reports package success'
+if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
+  full_archive_entries="$(unzip -Z1 "$GENERATED_TEST_OUTPUT")"
+  if unzip -tq "$GENERATED_TEST_OUTPUT" >/dev/null; then
+    pass 'full self-healed archive passes ZIP integrity verification'
+  else
+    fail 'full self-healed archive passes ZIP integrity verification'
+  fi
+  assert_eq 1 "$(grep -c '^wheels/docopt-0.6.2-py2.py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains exactly one admitted docopt wheel'
+  assert_eq 1 "$(grep -c '^wheels/runtime-target-1.0-py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains its target runtime wheel'
+  assert_eq 2 "$(grep -c '^wheels/.*\.whl$' <<<"$full_archive_entries")" 'full archive contains only the resolved wheel set'
+  assert_eq 0 "$(grep -Eci '(^|/)(candidate-[^/]*|built-wheels|uv-cache|uv-python|pip-bootstrap)(/|$)|\.tar\.gz$|\.zip$|(^|/)[^/]*build[^/]*\.log$|coordinator' <<<"$full_archive_entries" || true)" 'full archive excludes source-repair and coordinator artifacts'
+  assert_eq 0 "$(grep -Eci 'x86_64|win32|win_amd64|macosx|\.so$|\.pyd$|\.dll$|\.dylib$' <<<"$full_archive_entries" || true)" 'full archive excludes host and native binaries'
+  assert_eq 0 "$(grep -Ec 'stale|partial-from' <<<"$full_archive_entries" || true)" 'full archive excludes original and failed-attempt wheels'
+else
+  fail 'full self-healed archive is created only after successful packaging'
+fi
+assert_file_contains "$FULL_PACKAGER_LOG" 'OUTPUT_WAS_ABSENT:true' 'packager receives no partial pre-existing output'
+assert_full_repackage_cleanup 'full self-heal success'
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'full self-heal leaves its input package unchanged'
+if [[ "$ROOT_DIR" == /mnt/?/* ]]; then
+  if grep -Eq '^WORKSPACE:/tmp/dify-plugin-coordinator\.' "$FULL_WORKSPACE_LOG"; then
+    pass 'DrvFS full self-heal keeps coordinator state on the Linux /tmp filesystem'
+  else
+    fail 'DrvFS full self-heal keeps coordinator state on the Linux /tmp filesystem'
+  fi
+else
+  pass 'DrvFS full-flow check is not applicable outside a mounted Windows workspace'
+fi
+
+prepare_full_repackage_case
+full_wheel_only_log="$FIXTURE_DIR/full-repackage-wheel-only.log"
+if run_full_repackage_case wheel-only "$full_wheel_only_log"; then
+  pass 'normal wheel-only full package remains successful'
+else
+  fail 'normal wheel-only full package remains successful'
+fi
+assert_file_not_contains "$full_wheel_only_log" 'Pure Python sdist repair candidate:' 'normal wheel-only flow emits no source-repair message'
+assert_eq 0 "$(grep -c '^SOURCE$' "$FULL_PIP_LOG" || true)" 'normal wheel-only flow downloads no source'
+if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
+  wheel_only_entries="$(unzip -Z1 "$GENERATED_TEST_OUTPUT")"
+  assert_eq 1 "$(grep -c '^wheels/runtime-target-1.0-py3-none-any.whl$' <<<"$wheel_only_entries")" 'normal wheel-only archive preserves its target wheel'
+  assert_eq 0 "$(grep -Eci 'sdist|candidate-|built-wheels|uv-cache|uv-python|coordinator' <<<"$wheel_only_entries" || true)" 'normal wheel-only archive contains no repair artifacts'
+else
+  fail 'normal wheel-only full package creates its offline output'
+fi
+assert_full_repackage_cleanup 'normal wheel-only success'
+
+prepare_full_repackage_case
+full_disabled_log="$FIXTURE_DIR/full-repackage-disabled.log"
+if run_full_repackage_case success "$full_disabled_log" DIFY_AUTO_BUILD_PURE_SDIST=0; then
+  fail 'disabled automatic source repair stops the full package'
+else
+  pass 'disabled automatic source repair stops the full package'
+fi
+assert_eq 1 "$(grep -c '^STRICT:' "$FULL_PIP_LOG")" 'disabled full flow performs one strict attempt'
+assert_eq 0 "$(grep -c '^SOURCE$' "$FULL_PIP_LOG" || true)" 'disabled full flow performs no source download'
+assert_file_contains "$full_disabled_log" 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.' 'disabled full flow reports the switch explicitly'
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'disabled full flow creates no offline output'
+assert_full_repackage_cleanup 'disabled full flow'
+
+for full_failure_mode in download-failure build-failure native resolution-failure; do
+  prepare_full_repackage_case
+  full_failure_log="$FIXTURE_DIR/full-repackage-$full_failure_mode.log"
+  if run_full_repackage_case "$full_failure_mode" "$full_failure_log"; then
+    fail "full $full_failure_mode repair failure stops packaging"
+  else
+    pass "full $full_failure_mode repair failure stops packaging"
+  fi
+  case "$full_failure_mode" in
+    download-failure)
+      assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during download:' 'full source download failure identifies its stage'
+      ;;
+    build-failure)
+      assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during build:' 'full source build failure identifies its stage'
+      ;;
+    native)
+      assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during validation:' 'full native wheel rejection identifies validation'
+      assert_file_contains "$full_failure_log" 'native' 'full native wheel rejection exposes a safe validator reason'
+      ;;
+    resolution-failure)
+      assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during resolution after 1 admitted wheel(s).' 'full final resolution failure identifies its stage'
+      ;;
+  esac
+  assert_file_missing "$GENERATED_TEST_OUTPUT" "full $full_failure_mode failure creates no partial offline output"
+  assert_full_repackage_cleanup "full $full_failure_mode failure"
+  for secret_value in download-user download-password download-query build-user build-password build-query final-user final-password final-query; do
+    assert_file_not_contains "$full_failure_log" "$secret_value" "full $full_failure_mode output redacts $secret_value"
+  done
+  if LC_ALL=C grep -q $'\v' "$full_failure_log"; then
+    fail "full $full_failure_mode output strips control characters"
+  else
+    pass "full $full_failure_mode output strips control characters"
+  fi
+done
+
+prepare_full_repackage_case
+full_cancel_log="$FIXTURE_DIR/full-repackage-cancel.log"
+setsid env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  FULL_REPAIR_MODE=cancel \
+  DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+  DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$full_cancel_log" 2>&1 &
+full_cancel_pid=$!
+for _ in {1..200}; do
+  [[ -f "$FULL_CANCEL_MARKER" ]] && break
+  kill -0 "$full_cancel_pid" 2>/dev/null || break
+  sleep 0.05
+done
+if [[ -f "$FULL_CANCEL_MARKER" ]]; then
+  kill -TERM "$full_cancel_pid" 2>/dev/null || true
+else
+  fail 'full cancellation fixture reaches the supervised source build'
+  kill -TERM -- "-$full_cancel_pid" 2>/dev/null || true
+fi
+if wait "$full_cancel_pid"; then
+  full_cancel_status=0
+else
+  full_cancel_status=$?
+fi
+assert_eq 143 "$full_cancel_status" 'full local command preserves TERM status 143'
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'cancelled full flow creates no partial offline output'
+assert_full_repackage_cleanup 'cancelled full flow'
+if [[ -f "$FULL_CHILD_PID_FILE" ]] && ! kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/dev/null; then
+  pass 'full cancellation reaps the third-party build process'
+else
+  fail 'full cancellation reaps the third-party build process'
+fi
+# A failing cancellation assertion must not leave the diagnostic fixture alive.
+# This is test sanitation after recording the immediate post-return state, not a
+# grace period in the behavior under test.
+if [[ -f "$FULL_CHILD_PID_FILE" ]] && kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/dev/null; then
+  printf '# cancellation diagnostic: top=%s returned=%s child=%s remained alive\n' \
+    "$full_cancel_pid" "$full_cancel_status" "$(<"$FULL_CHILD_PID_FILE")"
+  kill -TERM -- "-$full_cancel_pid" 2>/dev/null || true
+  for _ in {1..200}; do
+    kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/dev/null || break
+    sleep 0.05
+  done
+fi
+
+repackage_function_source="$(sed -n '/^repackage() {/,/^}/p' "$ROOT_DIR/plugin_repackaging.sh")"
+if grep -Fq '"$staging/sdist-repair"' <<<"$repackage_function_source"; then
+  fail 'production repackage keeps source repair state out of DrvFS staging'
+else
+  pass 'production repackage keeps source repair state out of DrvFS staging'
+fi
+if grep -Eq 'rm -rf -- "\$SCRIPT_DIR"|chmod[^\n]*"\$SCRIPT_DIR"' <<<"$(sed -n '/^cleanup_runtime() {/,/^}/p' "$ROOT_DIR/plugin_repackaging.sh")"; then
+  fail 'runtime cleanup never deletes or changes permissions on the broad repository path'
+else
+  pass 'runtime cleanup never deletes or changes permissions on the broad repository path'
+fi
 
 run_log="$FIXTURE_DIR/repackage.log"
 if env -u http_proxy -u https_proxy -u all_proxy \
@@ -4056,6 +4452,17 @@ if grep -q 'DIFY_TARGET_ARCH=aarch64' "$ROOT_DIR/plugin_repackaging_amd64_to_arm
 else
   fail 'cross-architecture wrapper delegates to unified script'
 fi
+
+assert_file_contains "$ROOT_DIR/README.md" 'DIFY_AUTO_BUILD_PURE_SDIST=0' 'README documents the pure-sdist repair switch'
+assert_file_contains "$ROOT_DIR/README.md" '第三方 PEP 517' 'README warns that source repair executes third-party build code'
+assert_file_contains "$ROOT_DIR/README.md" 'none-any' 'README documents the universal pure-wheel admission boundary'
+assert_file_contains "$ROOT_DIR/README.md" '原生扩展' 'README documents that native source builds remain unsupported'
+assert_file_contains "$ROOT_DIR/README.md" '认证索引' 'README documents the authenticated-index source-repair limitation'
+assert_file_contains "$ROOT_DIR/README.md" '/tmp' 'README documents private Linux temporary state'
+assert_file_contains "$ROOT_DIR/README.md" 'DrvFS' 'README explains the WSL DrvFS boundary'
+assert_file_contains "$ROOT_DIR/README.md" 'Conda' 'README promises not to mutate the caller Conda environment'
+assert_file_contains "$ROOT_DIR/README.md" 'records[all]' 'README uses records/docopt only as a generic behavior example'
+assert_file_contains "$ROOT_DIR/README.md" 'docopt' 'README includes the generic missing-wheel example'
 
 printf '%s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))
