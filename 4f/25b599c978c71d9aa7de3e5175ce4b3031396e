@@ -1,0 +1,27 @@
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_46ccc532162267 113,115
+  s_c1a60985b94e3d::t_25dab9dd5ed6c0 26-57,59,75-112,114,129-131,311,313,315,317-318,391,396
+  s_c1a60985b94e3d::t_992739f4f8c39e 379-388
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_ed8ddef4cb46be 293-305
+  s_c1a60985b94e3d::t_59d656a712e785 32-35,134-140,262-266,269,275-277,279-280,282-292,306-308,310-362
+  s_c1a60985b94e3d::t_75c343eacb1d69 278,281
+  s_c1a60985b94e3d::t_ba9ec9613d1c1c 309
+  s_c1a60985b94e3d::t_8ecfed62ee992a 363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "4f25b599c978c71d9aa7de3e5175ce4b3031396e",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
