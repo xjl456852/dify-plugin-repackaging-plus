@@ -69,10 +69,15 @@ assert_toml_valid() {
   fi
 }
 
-if python3 -m unittest -v "$ROOT_DIR/tests/test_validate_python_distribution.py"; then
+if python3 -B -m unittest -v "$ROOT_DIR/tests/test_validate_python_distribution.py"; then
   pass 'Python distribution archive validator suite passes'
 else
   fail 'Python distribution archive validator suite passes'
+fi
+if [[ ! -e "$ROOT_DIR/tests/__pycache__" && ! -e "$ROOT_DIR/tools/__pycache__" ]]; then
+  pass 'Python validator suite leaves no bytecode cache'
+else
+  fail 'Python validator suite leaves no bytecode cache'
 fi
 
 source "$ROOT_DIR/plugin_repackaging.sh"

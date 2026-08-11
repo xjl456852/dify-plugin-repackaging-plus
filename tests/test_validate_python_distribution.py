@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -59,6 +60,30 @@ def patch_zip_member_compression(path, member_name, method=99):
         position += 46 + name_length
 
 
+def corrupt_gzip_trailer(path):
+    with Path(path).open("r+b") as artifact:
+        artifact.seek(-8, os.SEEK_END)
+        value = artifact.read(1)
+        artifact.seek(-8, os.SEEK_END)
+        artifact.write(bytes([value[0] ^ 0xFF]))
+
+
+def patch_zip_member_size(path, member_name, size):
+    target = member_name.encode()
+    data = bytearray(Path(path).read_bytes())
+    position = 0
+    while True:
+        position = data.find(b"PK\x01\x02", position)
+        if position < 0:
+            raise AssertionError(f"central directory entry not found: {member_name}")
+        name_length = int.from_bytes(data[position + 28:position + 30], "little")
+        if bytes(data[position + 46:position + 46 + name_length]) == target:
+            data[position + 24:position + 28] = size.to_bytes(4, "little")
+            Path(path).write_bytes(data)
+            return
+        position += 46 + name_length
+
+
 class DistributionFixture:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -103,7 +128,7 @@ class DistributionFixture:
 
     def wheel(self, filename="docopt-0.6.2-py2.py3-none-any.whl", name="docopt",
               version="0.6.2", purelib="true", tags=None, extra=None):
-        dist_info = f"{name.replace('-', '_')}-{version}.dist-info"
+        dist_info = f"{re.sub(r'[^A-Za-z0-9.]+', '_', name)}-{re.sub(r'[^A-Za-z0-9.]+', '_', version)}.dist-info"
         entries = [
             (f"{dist_info}/METADATA", pkg_info(name, version), "file"),
             (f"{dist_info}/WHEEL", wheel_metadata(name, version, purelib, tags), "file"),
@@ -141,10 +166,29 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
 
+    def test_sdist_rejects_bad_gzip_trailer(self):
+        artifact = self.fixture.tar("docopt-0.6.2.tar.gz", [
+            ("docopt-0.6.2/PKG-INFO", pkg_info(), "file"),
+            ("docopt-0.6.2/data.txt", b"payload", "file"),
+        ])
+        corrupt_gzip_trailer(artifact)
+        self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "invalid tar.gz sdist")
+
     def test_multiple_sdist_candidates_are_rejected(self):
         self.fixture.tar("a.tar.gz", [("a/PKG-INFO", pkg_info(), "file")])
         self.fixture.zip("b.zip", [("b/PKG-INFO", pkg_info(), "file")])
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "exactly one sdist")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "requires non-root POSIX permissions")
+    def test_unreadable_candidate_directory_is_normalized(self):
+        directory = self.fixture.directory
+        os.chmod(directory, 0)
+        try:
+            result = self.run_validator("sdist", directory, "--name", "docopt")
+        finally:
+            os.chmod(directory, 0o700)
+        self.assert_error(result, "candidate directory cannot be inspected")
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_sdist_parent_traversal_is_rejected(self):
         self.fixture.tar("docopt.tar.gz", [("../PKG-INFO", pkg_info(), "file")])
@@ -200,6 +244,39 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
+
+    def test_pure_wheel_with_dotted_build_tag_is_accepted(self):
+        self.fixture.wheel(filename="docopt-0.6.2-1.local-py3-none-any.whl")
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_wheel_epoch_local_filename_identity_is_accepted(self):
+        artifact = self.fixture.wheel(
+            filename="docopt-1_2.0_local-py3-none-any.whl", version="1!2.0+local",
+        )
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "1!2.0+local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t1!2.0+local\n")
+
+    def test_wheel_invalid_metadata_version_is_rejected(self):
+        self.fixture.wheel(filename="docopt-bad!-py3-none-any.whl", version="bad!")
+        self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "bad!"), "invalid metadata version")
+
+    def test_wheel_control_character_metadata_is_rejected(self):
+        self.fixture.wheel(name="doc\topt")
+        self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "invalid metadata Name")
+
+    def test_wheel_oversize_metadata_declaration_is_rejected(self):
+        artifact = self.fixture.wheel()
+        patch_zip_member_size(artifact, "docopt-0.6.2.dist-info/METADATA", 16 * 1024 * 1024 + 1)
+        self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "metadata exceeds size limit")
+
+    def test_wheel_aggregate_size_declaration_is_rejected(self):
+        artifact = self.fixture.wheel(extra=[("payload-a", b"a", "file"), ("payload-b", b"b", "file")])
+        declared_size = 3 * 1024 * 1024 * 1024
+        for member_name in ("docopt.py", "payload-a", "payload-b"):
+            patch_zip_member_size(artifact, member_name, declared_size)
+        self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "archive size limit exceeded")
 
     def test_platform_wheel_is_rejected(self):
         self.fixture.wheel(filename="docopt-0.6.2-py3-none-manylinux.whl")
