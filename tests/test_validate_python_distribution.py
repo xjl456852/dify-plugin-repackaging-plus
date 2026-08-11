@@ -72,6 +72,9 @@ class DistributionFixture:
                     if kind == "symlink":
                         info.create_system = 3
                         info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    elif kind == "directory_no_slash":
+                        info.create_system = 3
+                        info.external_attr = (stat.S_IFDIR | 0o755) << 16
                     archive.writestr(info, data)
         finally:
             if context:
@@ -187,6 +190,13 @@ class ValidatePythonDistributionTests(unittest.TestCase):
     def test_false_universal_wheel_with_elf_binary_is_rejected(self):
         self.fixture.wheel(extra=[("payload.bin", b"\x7fELFpayload", "file")])
         self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "ELF binary")
+
+    def test_wheel_rejects_directory_mode_entry_without_directory_name(self):
+        self.fixture.wheel(extra=[("docopt/payload.bin", b"\x7fELFpayload", "directory_no_slash")])
+        self.assert_error(
+            self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"),
+            "unsafe archive entry",
+        )
 
     def test_wheel_corrupt_payload_after_first_four_bytes_is_rejected(self):
         artifact = self.fixture.wheel(extra=[("payload.bin", b"0" * 8192, "file")])

@@ -89,7 +89,11 @@ def validate_zip_members(archive):
             raise ValidationError("link entry")
         if kind and kind not in (stat.S_IFREG, stat.S_IFDIR):
             raise ValidationError("unsafe archive entry")
-        if not info.is_dir() and kind != stat.S_IFDIR:
+        if kind == stat.S_IFDIR and not info.is_dir():
+            raise ValidationError("unsafe archive entry")
+        if kind == stat.S_IFREG and info.is_dir():
+            raise ValidationError("unsafe archive entry")
+        if not info.is_dir():
             regular.append(info)
     return regular
 
