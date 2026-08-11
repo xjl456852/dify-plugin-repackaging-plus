@@ -226,7 +226,7 @@ run_bounded_capture_race() {
   (
     if printf 'attacker controlled replacement\n' | \
       DIFY_TEST_RACE_READY="$ready_path" DIFY_TEST_RACE_GO="$go_path" \
-      python3 -B "$bounded_capture_python" "$log_path"; then
+      python3 -B "$bounded_capture_python" "$log_path" 2>/dev/null; then
       capture_status=0
     else
       capture_status=$?
@@ -1015,16 +1015,101 @@ if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
     "$download_once_log" \
     '' \
     "$download_once_case_dir/missing-built-wheels" \
+    true \
+    false \
     >/dev/null 2>&1; then
-  fail 'invalid local wheel directory stops one-shot download'
+  fail 'invalid local wheel directory stops bounded one-shot download'
 else
-  pass 'invalid local wheel directory stops one-shot download'
+  pass 'invalid local wheel directory stops bounded one-shot download'
 fi
+assert_eq 0 "$(stat -c '%s' "$download_once_log")" 'missing built-wheels pre-pip failure empties the bounded attempt log'
 if extract_missing_requirement "$download_once_log" >/dev/null 2>&1; then
-  fail 'pre-pip failure cannot leave stale classifiable output'
+  fail 'missing built-wheels pre-pip failure cannot leave stale classifiable output'
 else
-  pass 'pre-pip failure cannot leave stale classifiable output'
+  pass 'missing built-wheels pre-pip failure cannot leave stale classifiable output'
 fi
+
+write_missing_wheel_log "$download_once_log" docopt
+if https_proxy='socks5h://10.10.10.10:28802' HTTPS_PROXY= HTTP_PROXY= http_proxy= \
+  ALL_PROXY= all_proxy= DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$download_once_log" \
+    '' \
+    '' \
+    true \
+    false \
+    >/dev/null 2>&1; then
+  fail 'invalid SOCKS bootstrap stops bounded one-shot download before pip'
+else
+  pass 'invalid SOCKS bootstrap stops bounded one-shot download before pip'
+fi
+assert_eq 0 "$(stat -c '%s' "$download_once_log")" 'SOCKS bootstrap pre-pip failure empties the bounded attempt log'
+if extract_missing_requirement "$download_once_log" >/dev/null 2>&1; then
+  fail 'SOCKS bootstrap pre-pip failure cannot leave stale classifiable output'
+else
+  pass 'SOCKS bootstrap pre-pip failure cannot leave stale classifiable output'
+fi
+
+write_missing_wheel_log "$download_once_log" docopt
+if (
+  resolve_pip_command() { return 1; }
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$download_once_log" \
+    '' \
+    '' \
+    true \
+    false
+) >/dev/null 2>&1; then
+  fail 'pip command resolution failure stops bounded one-shot download before pip'
+else
+  pass 'pip command resolution failure stops bounded one-shot download before pip'
+fi
+assert_eq 0 "$(stat -c '%s' "$download_once_log")" 'pip resolution pre-pip failure empties the bounded attempt log'
+if extract_missing_requirement "$download_once_log" >/dev/null 2>&1; then
+  fail 'pip resolution pre-pip failure cannot leave stale classifiable output'
+else
+  pass 'pip resolution pre-pip failure cannot leave stale classifiable output'
+fi
+
+pre_pip_symlink_victim="$download_once_case_dir/pre-pip-symlink-victim.txt"
+pre_pip_symlink_log="$download_once_case_dir/pre-pip-symlink.log"
+printf 'pre-pip-symlink-victim\n' >"$pre_pip_symlink_victim"
+chmod 600 -- "$pre_pip_symlink_victim"
+ln -s -- "$pre_pip_symlink_victim" "$pre_pip_symlink_log"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" "$download_once_wheel_dir" aarch64 3.12 \
+    "$pre_pip_symlink_log" '' "$download_once_case_dir/missing-built-wheels" true false \
+    >/dev/null 2>&1; then
+  fail 'pre-pip log reset rejects a symlink path'
+else
+  pass 'pre-pip log reset rejects a symlink path'
+fi
+assert_eq 'pre-pip-symlink-victim' "$(<"$pre_pip_symlink_victim")" 'pre-pip log reset never truncates a symlink victim'
+
+pre_pip_hardlink_victim="$download_once_case_dir/pre-pip-hardlink-victim.txt"
+pre_pip_hardlink_log="$download_once_case_dir/pre-pip-hardlink.log"
+printf 'pre-pip-hardlink-victim\n' >"$pre_pip_hardlink_victim"
+chmod 600 -- "$pre_pip_hardlink_victim"
+ln -- "$pre_pip_hardlink_victim" "$pre_pip_hardlink_log"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" "$download_once_wheel_dir" aarch64 3.12 \
+    "$pre_pip_hardlink_log" '' "$download_once_case_dir/missing-built-wheels" true false \
+    >/dev/null 2>&1; then
+  fail 'pre-pip log reset rejects a hardlink path'
+else
+  pass 'pre-pip log reset rejects a hardlink path'
+fi
+assert_eq 'pre-pip-hardlink-victim' "$(<"$pre_pip_hardlink_victim")" 'pre-pip log reset never truncates a hardlink victim'
 
 bounded_log_victim="$download_once_case_dir/bounded-log-victim.txt"
 bounded_log_symlink="$download_once_case_dir/bounded-log-symlink.log"
@@ -2678,6 +2763,48 @@ if sudo -n chown 0:0 -- "$foreign_built_dir" 2>/dev/null; then
 else
   pass 'foreign built-wheels ownership fixture requires passwordless sudo; production ownership check is covered statically'
 fi
+
+prepare_dynamic_coordinator_case stale-pre-pip-retry docopt SUCCESS
+stale_retry_repair_count="$DYNAMIC_CASE_DIR/repair.count"
+stale_retry_mutation_marker="$DYNAMIC_CASE_DIR/mutated"
+if (
+  repair_one_pure_sdist() {
+    local repair_dir=$6 count=0
+    [[ -f "$stale_retry_repair_count" ]] && count="$(<"$stale_retry_repair_count")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$stale_retry_repair_count"
+    mkdir -p -- "$repair_dir/built-wheels"
+    chmod 700 -- "$repair_dir" "$repair_dir/built-wheels"
+    touch -- "$repair_dir/built-wheels/repaired-$count-py3-none-any.whl"
+    printf 'Pure Python wheel admitted: repaired-%s-py3-none-any.whl\n' "$count"
+  }
+  validate_repair_built_wheels_dir() {
+    local repair_dir=$1 built_wheels_dir=$2 workspace current_attempt_log
+    if [[ ! -e "$stale_retry_mutation_marker" ]]; then
+      workspace="$(dirname -- "$repair_dir")"
+      [[ "$repair_dir" == /tmp/dify-plugin-coordinator.*/sdist-repair && \
+        "$built_wheels_dir" == "$repair_dir/built-wheels" ]] || return 1
+      current_attempt_log="$(find "$workspace" -maxdepth 1 -type f -name 'current.*.log' -print -quit)"
+      [[ -n "$current_attempt_log" ]] || return 1
+      write_missing_wheel_log "$current_attempt_log" stale_second_candidate
+      mv -- "$built_wheels_dir" "$repair_dir/built-wheels.removed"
+      : >"$stale_retry_mutation_marker"
+    fi
+    return 0
+  }
+  run_dynamic_coordinator_default
+) >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'pre-pip retry failure with a seeded stale log fails closed'
+else
+  pass 'pre-pip retry failure with a seeded stale log fails closed'
+fi
+assert_eq 1 "$(<"$stale_retry_repair_count")" 'pre-pip retry failure invokes no extra pure-sdist repair from stale diagnostics'
+assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'pre-pip retry failure runs no extra strict pip attempt'
+assert_file_not_contains "$DYNAMIC_OUTPUT" 'Pure Python sdist repair candidate: stale-second-candidate' 'pre-pip retry failure never classifies the seeded stale candidate'
+assert_file_contains "$DYNAMIC_OUTPUT" 'Pure Python sdist repair failed during resolution after 1 admitted wheel(s).' 'empty current attempt log receives the post-admission failure report'
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'pre-pip retry failure removes its secure coordinator workspace'
 
 prepare_dynamic_coordinator_case two-candidates alpha beta SUCCESS
 if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then

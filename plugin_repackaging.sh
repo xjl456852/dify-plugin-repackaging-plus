@@ -899,6 +899,12 @@ task3_python() {
   env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV python3 "$@"
 }
 
+reset_private_command_log() {
+  local output_log=$1
+
+  run_bounded_command_log "$output_log" :
+}
+
 run_bounded_command_log() {
   local output_log=$1
   shift
@@ -2387,9 +2393,7 @@ download_wheels_once() {
   local -a platform_args=()
   local -a download_args=()
 
-  if [[ "$bounded_capture" != true ]]; then
-    : >"$pip_output_log" || return
-  fi
+  reset_private_command_log "$pip_output_log" || return
   if [[ -n "$local_wheels_dir" ]]; then
     if [[ ! -d "$local_wheels_dir" ]]; then
       printf 'local built-wheel directory not found: %s\n' "$local_wheels_dir" >&2
