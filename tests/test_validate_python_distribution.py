@@ -32,6 +32,16 @@ def pkg_info(name="docopt", version="0.6.2"):
     return f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n".encode()
 
 
+def pax_record(key, value):
+    body = f"{key}={value}\n".encode()
+    size = len(body) + 2
+    while True:
+        record = str(size).encode() + b" " + body
+        if len(record) == size:
+            return record
+        size = len(record)
+
+
 def wheel_metadata(name="docopt", version="0.6.2", purelib="true", tags=None):
     if tags is None:
         tags = ["py2-none-any", "py3-none-any"]
@@ -216,6 +226,53 @@ class DistributionFixture:
             archive.addfile(member, io.BytesIO(contents))
         return path
 
+    def tar_with_interleaved_global_extensions(self, filename, payloads):
+        path = self.directory / filename
+        with tarfile.open(path, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+            for index, payload in enumerate(payloads):
+                extension = tarfile.TarInfo("././@Extension")
+                extension.type = tarfile.XGLTYPE
+                extension.size = len(payload)
+                archive.addfile(extension, io.BytesIO(payload))
+                contents = b"# pure python\n"
+                member = tarfile.TarInfo(f"docopt/member{index}.py")
+                member.size = len(contents)
+                archive.addfile(member, io.BytesIO(contents))
+            metadata = pkg_info()
+            member = tarfile.TarInfo("docopt/PKG-INFO")
+            member.size = len(metadata)
+            archive.addfile(member, io.BytesIO(metadata))
+        return path
+
+    def tar_with_old_gnu_sparse(self, filename):
+        path = self.directory / filename
+        with tarfile.open(path, "w:gz", format=tarfile.GNU_FORMAT) as archive:
+            metadata = pkg_info()
+            member = tarfile.TarInfo("docopt/PKG-INFO")
+            member.size = len(metadata)
+            archive.addfile(member, io.BytesIO(metadata))
+            sparse = tarfile.TarInfo("docopt/sparse.bin")
+            sparse.type = tarfile.GNUTYPE_SPARSE
+            sparse.size = 0
+            archive.addfile(sparse, io.BytesIO(b""))
+        return path
+
+    def tar_with_pax_sparse(self, filename, payload, extension_type=tarfile.XHDTYPE):
+        path = self.directory / filename
+        with tarfile.open(path, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+            extension = tarfile.TarInfo("././@Extension")
+            extension.type = extension_type
+            extension.size = len(payload)
+            archive.addfile(extension, io.BytesIO(payload))
+            sparse = tarfile.TarInfo("docopt/sparse.bin")
+            sparse.size = 0
+            archive.addfile(sparse, io.BytesIO(b""))
+            metadata = pkg_info()
+            member = tarfile.TarInfo("docopt/PKG-INFO")
+            member.size = len(metadata)
+            archive.addfile(member, io.BytesIO(metadata))
+        return path
+
     def zip(self, filename, entries, duplicate_warning=False):
         path = self.directory / filename
         context = warnings.catch_warnings() if duplicate_warning else None
@@ -389,7 +446,7 @@ raise SystemExit(validator.main(sys.argv[3:]))
         self.assertEqual(str(caught), "tar extension header exceeds size limit")
         process.assert_not_called()
 
-    def test_tar_extension_chain_count_limit_precedes_recursive_processing(self):
+    def test_tar_extension_chain_depth_limit_precedes_recursive_processing(self):
         self.fixture.tar_with_extensions(
             "docopt-0.6.2.tar.gz", tarfile.XGLTYPE, b"5 x=\n", 4,
         )
@@ -405,7 +462,7 @@ raise SystemExit(validator.main(sys.argv[3:]))
             return original_process(member, archive)
 
         caught = None
-        with mock.patch.object(validator, "MAX_TAR_EXTENSION_HEADERS", 3, create=True), \
+        with mock.patch.object(validator, "MAX_TAR_EXTENSION_DEPTH", 3, create=True), \
                 mock.patch.object(tarfile.TarInfo, "_proc_pax", new=process_with_limit):
             try:
                 validator.validate_sdist(self.fixture.directory, "docopt")
@@ -413,7 +470,7 @@ raise SystemExit(validator.main(sys.argv[3:]))
                 caught = error
 
         self.assertIsInstance(caught, validator.ValidationError)
-        self.assertEqual(str(caught), "tar extension header count limit exceeded")
+        self.assertEqual(str(caught), "tar extension header depth limit exceeded")
         self.assertEqual(processed, 3)
 
     def test_tar_extension_chain_aggregate_limit_precedes_payload_processing(self):
@@ -443,6 +500,64 @@ raise SystemExit(validator.main(sys.argv[3:]))
         self.assertEqual(str(caught), "tar extension header aggregate size limit exceeded")
         self.assertEqual(processed, 1)
 
+    def test_tar_extension_archive_count_limit_precedes_payload_processing(self):
+        payloads = (
+            pax_record("global.one", "first"),
+            pax_record("global.two", "second"),
+        )
+        self.fixture.tar_with_interleaved_global_extensions("docopt-0.6.2.tar.gz", payloads)
+        validator = load_validator_module()
+        original_process = tarfile.TarInfo._proc_pax
+        processed = 0
+
+        def process_with_limit(member, archive):
+            nonlocal processed
+            processed += 1
+            if processed > 1:
+                raise AssertionError("PAX archive count processed past limit")
+            return original_process(member, archive)
+
+        caught = None
+        with mock.patch.object(validator, "MAX_TAR_EXTENSION_HEADERS", 1, create=True), \
+                mock.patch.object(tarfile.TarInfo, "_proc_pax", new=process_with_limit):
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header count limit exceeded")
+        self.assertEqual(processed, 1)
+
+    def test_tar_extension_archive_aggregate_limit_precedes_payload_processing(self):
+        payloads = (
+            b"5 x=\n",
+            b"5 y=\n",
+        )
+        self.fixture.tar_with_interleaved_global_extensions("docopt-0.6.2.tar.gz", payloads)
+        validator = load_validator_module()
+        original_process = tarfile.TarInfo._proc_pax
+        processed = 0
+
+        def process_with_limit(member, archive):
+            nonlocal processed
+            processed += 1
+            if processed > 1:
+                raise AssertionError("PAX archive payload processed past limit")
+            return original_process(member, archive)
+
+        caught = None
+        with mock.patch.object(validator, "MAX_TOTAL_TAR_EXTENSION_BYTES", 9), \
+                mock.patch.object(tarfile.TarInfo, "_proc_pax", new=process_with_limit):
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header aggregate size limit exceeded")
+        self.assertEqual(processed, 1)
+
     def test_sdist_rejects_long_tar_extension_chain_without_traceback(self):
         self.fixture.tar_with_extensions(
             "docopt-0.6.2.tar.gz", tarfile.XGLTYPE, b"5 x=\n", 129,
@@ -450,6 +565,138 @@ raise SystemExit(validator.main(sys.argv[3:]))
         result = self.run_validator("sdist", self.fixture.directory, "--name", "docopt")
         self.assert_error(result, "tar extension header count limit exceeded")
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_old_gnu_sparse_is_rejected_before_sparse_header_processing(self):
+        self.fixture.tar_with_old_gnu_sparse("docopt-0.6.2.tar.gz")
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(
+            tarfile.TarInfo, "_proc_sparse", side_effect=AssertionError("GNU sparse header processed"),
+        ) as process:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "unsupported sparse archive entry")
+        process.assert_not_called()
+
+    def test_pax_sparse_is_rejected_before_sparse_map_processing(self):
+        cases = (
+            ("0.0", pax_record("GNU.sparse.size", "0"), "_proc_gnusparse_00"),
+            ("0.1", pax_record("GNU.sparse.map", "0,0"), "_proc_gnusparse_01"),
+            (
+                "1.0",
+                pax_record("GNU.sparse.major", "1") + pax_record("GNU.sparse.minor", "0"),
+                "_proc_gnusparse_10",
+            ),
+        )
+        for version, payload, process_name in cases:
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                fixture.tar_with_pax_sparse("docopt-0.6.2.tar.gz", payload)
+                validator = load_validator_module()
+                caught = None
+                with mock.patch.object(
+                    tarfile.TarInfo, process_name,
+                    side_effect=AssertionError(f"PAX sparse {version} processed"),
+                ) as process:
+                    try:
+                        validator.validate_sdist(directory, "docopt")
+                    except Exception as error:
+                        caught = error
+
+                self.assertIsInstance(caught, validator.ValidationError)
+                self.assertEqual(str(caught), "unsupported sparse archive entry")
+                process.assert_not_called()
+
+    def test_pax_sparse_metadata_is_rejected_before_pax_state_application(self):
+        cases = (
+            ("global 0.0", tarfile.XGLTYPE, pax_record("GNU.sparse.size", "not-an-integer")),
+            (
+                "global 1.0",
+                tarfile.XGLTYPE,
+                pax_record("GNU.sparse.major", "1")
+                + pax_record("GNU.sparse.minor", "0")
+                + pax_record("GNU.sparse.realsize", "not-an-integer"),
+            ),
+            (
+                "local incomplete",
+                tarfile.XHDTYPE,
+                pax_record("GNU.sparse.realsize", "not-an-integer"),
+            ),
+        )
+        original_apply = tarfile.TarInfo._apply_pax_info
+        for label, extension_type, payload in cases:
+            with self.subTest(format=label), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                fixture.tar_with_pax_sparse(
+                    "docopt-0.6.2.tar.gz", payload, extension_type=extension_type,
+                )
+                validator = load_validator_module()
+                caught = None
+                sparse_applications = 0
+
+                def apply_pax(member, pax_headers, encoding, errors):
+                    nonlocal sparse_applications
+                    if any(keyword.startswith("GNU.sparse.") for keyword in pax_headers):
+                        sparse_applications += 1
+                        raise AssertionError(f"PAX sparse {label} state applied")
+                    return original_apply(member, pax_headers, encoding, errors)
+
+                with mock.patch.object(tarfile.TarInfo, "_apply_pax_info", new=apply_pax):
+                    try:
+                        validator.validate_sdist(directory, "docopt")
+                    except Exception as error:
+                        caught = error
+
+                self.assertIsInstance(caught, validator.ValidationError)
+                self.assertEqual(str(caught), "unsupported sparse archive entry")
+                self.assertEqual(sparse_applications, 0)
+
+    def test_sdist_normalizes_malformed_and_incomplete_pax_sparse_headers(self):
+        cases = (
+            ("global 0.0", tarfile.XGLTYPE, pax_record("GNU.sparse.size", "not-an-integer")),
+            (
+                "global 1.0",
+                tarfile.XGLTYPE,
+                pax_record("GNU.sparse.major", "1")
+                + pax_record("GNU.sparse.minor", "0")
+                + pax_record("GNU.sparse.realsize", "not-an-integer"),
+            ),
+            (
+                "local incomplete",
+                tarfile.XHDTYPE,
+                pax_record("GNU.sparse.realsize", "not-an-integer"),
+            ),
+        )
+        for label, extension_type, payload in cases:
+            with self.subTest(format=label), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                fixture.tar_with_pax_sparse(
+                    "docopt.tar.gz", payload, extension_type=extension_type,
+                )
+                result = self.run_validator("sdist", directory, "--name", "docopt")
+                self.assert_error(result, "unsupported sparse archive entry")
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_sdist_rejects_old_gnu_and_pax_sparse_without_traceback(self):
+        cases = (
+            ("old GNU", lambda fixture: fixture.tar_with_old_gnu_sparse("docopt.tar.gz")),
+            (
+                "PAX 0.1",
+                lambda fixture: fixture.tar_with_pax_sparse(
+                    "docopt.tar.gz", pax_record("GNU.sparse.map", "0,0"),
+                ),
+            ),
+        )
+        for label, create_archive in cases:
+            with self.subTest(format=label), tempfile.TemporaryDirectory() as directory:
+                create_archive(DistributionFixture(directory))
+                result = self.run_validator("sdist", directory, "--name", "docopt")
+                self.assert_error(result, "unsupported sparse archive entry")
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_archive_path_length_limit_applies_to_standard_and_pax_tar_paths(self):
         cases = (

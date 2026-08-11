@@ -30,6 +30,7 @@ MAX_TOTAL_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_CENTRAL_DIRECTORY_BYTES = 64 * 1024 * 1024
 MAX_TAR_EXTENSION_BYTES = 1024 * 1024
 MAX_TAR_EXTENSION_HEADERS = 128
+MAX_TAR_EXTENSION_DEPTH = 128
 MAX_TOTAL_TAR_EXTENSION_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_PATH_LENGTH = 4096
 STREAM_CHUNK_SIZE = 1024 * 1024
@@ -82,6 +83,8 @@ WHEEL_DISTRIBUTION_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?$"
 
 class BoundedTarInfo(tarfile.TarInfo):
     def _proc_member(self, archive):
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise ValidationError("unsupported sparse archive entry")
         extension_types = (
             tarfile.GNUTYPE_LONGNAME,
             tarfile.GNUTYPE_LONGLINK,
@@ -94,22 +97,39 @@ class BoundedTarInfo(tarfile.TarInfo):
         if self.size < 0 or self.size > MAX_TAR_EXTENSION_BYTES:
             raise ValidationError("tar extension header exceeds size limit")
 
-        previous_count = getattr(archive, "_validator_tar_extension_count", 0)
-        previous_bytes = getattr(archive, "_validator_tar_extension_bytes", 0)
-        extension_count = previous_count + 1
-        extension_bytes = previous_bytes + self.size
+        extension_count = getattr(archive, "_validator_tar_extension_count", 0) + 1
+        extension_bytes = getattr(archive, "_validator_tar_extension_bytes", 0) + self.size
+        previous_depth = getattr(archive, "_validator_tar_extension_depth", 0)
+        extension_depth = previous_depth + 1
         if extension_count > MAX_TAR_EXTENSION_HEADERS:
             raise ValidationError("tar extension header count limit exceeded")
         if extension_bytes > MAX_TOTAL_TAR_EXTENSION_BYTES:
             raise ValidationError("tar extension header aggregate size limit exceeded")
+        if extension_depth > MAX_TAR_EXTENSION_DEPTH:
+            raise ValidationError("tar extension header depth limit exceeded")
 
+        # Count and bytes are archive-lifetime budgets. Only recursive depth unwinds.
         archive._validator_tar_extension_count = extension_count
         archive._validator_tar_extension_bytes = extension_bytes
+        archive._validator_tar_extension_depth = extension_depth
         try:
             return super()._proc_member(archive)
         finally:
-            archive._validator_tar_extension_count = previous_count
-            archive._validator_tar_extension_bytes = previous_bytes
+            archive._validator_tar_extension_depth = previous_depth
+
+    def _proc_gnusparse_00(self, next_member, raw_headers):
+        raise ValidationError("unsupported sparse archive entry")
+
+    def _proc_gnusparse_01(self, next_member, pax_headers):
+        raise ValidationError("unsupported sparse archive entry")
+
+    def _proc_gnusparse_10(self, next_member, pax_headers, archive):
+        raise ValidationError("unsupported sparse archive entry")
+
+    def _apply_pax_info(self, pax_headers, encoding, errors):
+        if any(keyword.startswith("GNU.sparse.") for keyword in pax_headers):
+            raise ValidationError("unsupported sparse archive entry")
+        return super()._apply_pax_info(pax_headers, encoding, errors)
 
 
 class Parser(argparse.ArgumentParser):
