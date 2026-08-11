@@ -2079,7 +2079,9 @@ if (
   set -T
   trap '
     if [[ "$BASH_COMMAND" == "REPAIR_SUPERVISOR_PID=" && \
-      "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+      "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ && \
+      -d "$late_cancel_repair_dir/candidate-1/wheel" ]] && \
+      compgen -G "$late_cancel_repair_dir/candidate-1/wheel/*.whl" >/dev/null; then
       trap - DEBUG
       printf "triggered\n" >"$late_cancel_trigger_file"
       kill -TERM "$BASHPID"
@@ -2510,8 +2512,7 @@ if [[ "$is_strict" == true ]]; then
         printf 'BUILT:%s\n' "$(basename -- "$wheel")"
       done < <(find "$find_links" -maxdepth 1 -type f -name '*.whl' -print | sort)
     fi
-    coordinator_workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" \
-      -name 'dify-plugin-coordinator.*' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+    coordinator_workspace=${DIFY_INTERNAL_COORDINATOR_WORKSPACE:-}
     if [[ -n "$coordinator_workspace" ]]; then
       printf 'WORKSPACE:%s\n' "$coordinator_workspace"
       printf 'LOGPARENTMODE:%s\n' "$(stat -c '%a' "$coordinator_workspace")"
@@ -3911,8 +3912,7 @@ for argument in "$@"; do
   previous=$argument
 done
 [[ -n "$dest" ]]
-workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" \
-  -name 'dify-plugin-coordinator.*' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+workspace=${DIFY_INTERNAL_COORDINATOR_WORKSPACE:-}
 [[ -z "$workspace" ]] || printf 'WORKSPACE:%s\n' "$workspace" >>"$FULL_WORKSPACE_LOG"
 
 if [[ "$is_strict" == true ]]; then
@@ -3925,6 +3925,33 @@ if [[ "$is_strict" == true ]]; then
     printf 'ARG:%s\n' "$@"
   } >>"$FULL_PIP_LOG"
   mkdir -p -- "$dest"
+  if { [[ "${FULL_REPAIR_MODE:-success}" == cancel-initial-pip && "$attempt" == 1 ]] || \
+    [[ "${FULL_REPAIR_MODE:-success}" == cancel-final-pip && "$attempt" == 2 ]]; }; then
+    python3 - "$FULL_PIP_CANCEL_MARKER" "$FULL_PIP_CANCEL_CHILD_PID_FILE" <<'PY' &
+import os
+import signal
+import sys
+import time
+
+
+marker, pid_file = sys.argv[1:]
+if os.fork() != 0:
+    os._exit(0)
+os.setsid()
+if os.fork() != 0:
+    os._exit(0)
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, signal.SIG_IGN)
+with open(pid_file, "w", encoding="ascii") as stream:
+    stream.write(f"{os.getpid()}\n")
+open(marker, "wb").close()
+while True:
+    print("strict-user:strict-password?token=strict-query", flush=True)
+    time.sleep(0.1)
+PY
+    trap '' HUP INT TERM
+    while :; do sleep 1; done
+  fi
   if [[ "${FULL_REPAIR_MODE:-success}" == wheel-only ]]; then
     touch -- "$dest/runtime-target-1.0-py3-none-any.whl"
     exit 0
@@ -4053,6 +4080,7 @@ while (($#)); do
 done
 [[ -n "$plugin_dir" && -n "$output" ]]
 printf 'OUTPUT_PATH:%s\n' "$output" >>"$FULL_PACKAGER_LOG"
+printf 'PACKAGER_WORKSPACE:%s\n' "${DIFY_INTERNAL_PACKAGER_WORKSPACE:-}" >>"$FULL_PACKAGER_LOG"
 if [[ -e "${FULL_FORMAL_OUTPUT:-}" ]]; then
   printf 'FORMAL_AT_START:%s\n' "$(sha256sum "$FULL_FORMAL_OUTPUT" | cut -d' ' -f1)" >>"$FULL_PACKAGER_LOG"
 else
@@ -4078,7 +4106,7 @@ case "${FULL_PACKAGER_MODE:-success}" in
     ;;
   slow-success)
     printf 'partial package\n' >"$output"
-    printf '%s\n' "$$" >"$FULL_PACKAGER_CHILD_PID_FILE"
+    printf '%s %s\n' "$$" "$(awk '{print $22}' "/proc/$$/stat")" >"$FULL_PACKAGER_CHILD_PID_FILE"
     : >"$FULL_PACKAGER_MARKER"
     while [[ ! -e "$FULL_PACKAGER_RELEASE" ]]; do sleep 0.05; done
     ;;
@@ -4094,6 +4122,31 @@ with ZipFile(sys.argv[2], "w", ZIP_DEFLATED) as archive:
         if path.is_file():
             archive.write(path, path.relative_to(root))
 PY
+if [[ "${FULL_PACKAGER_MODE:-success}" == descendant ]]; then
+  python3 - "$output" "$FULL_PACKAGER_DESCENDANT_MARKER" \
+    "$FULL_PACKAGER_DESCENDANT_PID_FILE" "$FULL_PACKAGER_DESCENDANT_RELEASE" <<'PY' &
+import os
+import signal
+import sys
+import time
+
+
+output, marker, pid_file, release = sys.argv[1:]
+descriptor = os.open(output, os.O_WRONLY)
+os.setsid()
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, signal.SIG_IGN)
+with open(pid_file, "w", encoding="ascii") as stream:
+    stream.write(f"{os.getpid()}\n")
+open(marker, "wb").close()
+while not os.path.exists(release):
+    time.sleep(0.02)
+os.lseek(descriptor, 0, os.SEEK_SET)
+os.write(descriptor, b"unverified descendant mutation\n")
+os.ftruncate(descriptor, len(b"unverified descendant mutation\n"))
+os.close(descriptor)
+PY
+fi
 EOF
 chmod +x "$fake_bin/pip-full-repackage" "$fake_bin/uv-full-repackage" "$fake_bin/dify-packager-full"
 
@@ -4108,12 +4161,20 @@ export FULL_FORMAL_OUTPUT="$GENERATED_TEST_OUTPUT"
 export FULL_PACKAGER_MARKER="$FIXTURE_DIR/full-packager.ready"
 export FULL_PACKAGER_RELEASE="$FIXTURE_DIR/full-packager.release"
 export FULL_PACKAGER_CHILD_PID_FILE="$FIXTURE_DIR/full-packager-child.pid"
+export FULL_PACKAGER_DESCENDANT_MARKER="$FIXTURE_DIR/full-packager-descendant.ready"
+export FULL_PACKAGER_DESCENDANT_PID_FILE="$FIXTURE_DIR/full-packager-descendant.pid"
+export FULL_PACKAGER_DESCENDANT_RELEASE="$FIXTURE_DIR/full-packager-descendant.release"
+export FULL_PIP_CANCEL_MARKER="$FIXTURE_DIR/full-pip-cancel.ready"
+export FULL_PIP_CANCEL_CHILD_PID_FILE="$FIXTURE_DIR/full-pip-cancel-child.pid"
 input_package_sha256="$(sha256sum "$input_package" | cut -d' ' -f1)"
 
 prepare_full_repackage_case() {
   rm -f -- \
     "$GENERATED_TEST_OUTPUT" "$FULL_STRICT_STATE" "$FULL_CANCEL_MARKER" "$FULL_CHILD_PID_FILE" \
     "$FULL_PACKAGER_MARKER" "$FULL_PACKAGER_RELEASE" "$FULL_PACKAGER_CHILD_PID_FILE"
+  rm -f -- "$FULL_PACKAGER_DESCENDANT_MARKER" "$FULL_PACKAGER_DESCENDANT_PID_FILE" \
+    "$FULL_PACKAGER_DESCENDANT_RELEASE"
+  rm -f -- "$FULL_PIP_CANCEL_MARKER" "$FULL_PIP_CANCEL_CHILD_PID_FILE"
   : >"$FULL_PIP_LOG"
   : >"$FULL_UV_LOG"
   : >"$FULL_PACKAGER_LOG"
@@ -4163,6 +4224,19 @@ assert_full_repackage_cleanup() {
     pass "$name cleans its secure coordinator workspace"
   else
     pass "$name creates no coordinator workspace before early exit"
+  fi
+  while IFS= read -r workspace; do
+    [[ -z "$workspace" ]] && continue
+    if [[ "$workspace" == /tmp/dify-plugin-packager.* && ! -e "$workspace" ]]; then
+      continue
+    fi
+    fail "$name cleans its exact packager supervisor workspace"
+    return
+  done < <(sed -n 's/^PACKAGER_WORKSPACE://p' "$FULL_PACKAGER_LOG" | sort -u)
+  if grep -q '^PACKAGER_WORKSPACE:/tmp/dify-plugin-packager\.' "$FULL_PACKAGER_LOG"; then
+    pass "$name cleans its exact packager supervisor workspace"
+  else
+    pass "$name creates no packager workspace before early exit"
   fi
   assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" "$name leaves its input package unchanged"
 }
@@ -4322,6 +4396,36 @@ for full_packager_failure_mode in nonzero crash invalid; do
 done
 
 prepare_full_repackage_case
+seed_prior_full_output
+full_packager_descendant_log="$FIXTURE_DIR/full-packager-descendant.log"
+if run_full_repackage_case wheel-only "$full_packager_descendant_log" \
+  FULL_PACKAGER_MODE=descendant; then
+  full_packager_descendant_status=0
+else
+  full_packager_descendant_status=$?
+fi
+assert_eq 0 "$full_packager_descendant_status" 'packager with an abandoned descendant completes after supervised cleanup'
+if [[ -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]] && \
+  ! kill -0 "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null; then
+  pass 'packager supervisor reaps a setsid descendant before archive verification'
+else
+  fail 'packager supervisor reaps a setsid descendant before archive verification'
+fi
+: >"$FULL_PACKAGER_DESCENDANT_RELEASE"
+sleep 0.1
+if unzip -tq "$GENERATED_TEST_OUTPUT" >/dev/null; then
+  pass 'a terminated packager descendant cannot mutate the published archive through an inherited descriptor'
+else
+  fail 'a terminated packager descendant cannot mutate the published archive through an inherited descriptor'
+fi
+assert_full_repackage_cleanup 'packager descendant supervision'
+# Test sanitation after recording the immediate post-return state.
+if [[ -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]] && \
+  kill -0 "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null; then
+  kill -KILL "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null || true
+fi
+
+prepare_full_repackage_case
 full_atomic_success_log="$FIXTURE_DIR/full-packager-atomic-success.log"
 setsid env -u http_proxy -u https_proxy -u all_proxy \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
@@ -4391,11 +4495,18 @@ fi
 assert_eq 143 "$full_atomic_cancel_status" 'TERM during packaging preserves status 143'
 assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" 'TERM during packaging preserves the prior valid output'
 assert_full_repackage_cleanup 'TERM during atomic package creation'
-if [[ -f "$FULL_PACKAGER_CHILD_PID_FILE" ]] && ! kill -0 "$(<"$FULL_PACKAGER_CHILD_PID_FILE")" 2>/dev/null; then
+read -r full_packager_recorded_pid full_packager_recorded_starttime <"$FULL_PACKAGER_CHILD_PID_FILE" || true
+full_packager_current_starttime=
+if [[ "${full_packager_recorded_pid:-}" =~ ^[1-9][0-9]*$ && -r "/proc/$full_packager_recorded_pid/stat" ]]; then
+  full_packager_current_starttime="$(awk '{print $22}' "/proc/$full_packager_recorded_pid/stat" 2>/dev/null || true)"
+fi
+if [[ -n "${full_packager_recorded_pid:-}" && \
+  "$full_packager_current_starttime" != "$full_packager_recorded_starttime" ]]; then
   pass 'TERM during packaging reaps the packager process'
 else
   fail 'TERM during packaging reaps the packager process'
-  [[ ! -f "$FULL_PACKAGER_CHILD_PID_FILE" ]] || kill -TERM "$(<"$FULL_PACKAGER_CHILD_PID_FILE")" 2>/dev/null || true
+  [[ ! "${full_packager_recorded_pid:-}" =~ ^[1-9][0-9]*$ ]] || \
+    kill -TERM "$full_packager_recorded_pid" 2>/dev/null || true
 fi
 
 prepare_full_repackage_case
@@ -4448,6 +4559,74 @@ if [[ -f "$FULL_CHILD_PID_FILE" ]] && kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/de
   done
 fi
 
+cat >"$fake_bin/signal-reset-launcher" <<'PY'
+#!/usr/bin/env python3
+import os
+import signal
+import sys
+
+
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])
+PY
+chmod +x "$fake_bin/signal-reset-launcher"
+
+for strict_cancel_phase in initial final; do
+  for strict_cancel_index in 0 1 2; do
+    # These arrays are declared below for the DEBUG matrix; use the literal
+    # mapping here so this cancellation fixture remains order-independent.
+    case "$strict_cancel_index" in
+      0) strict_cancel_signal=HUP; strict_cancel_expected=129 ;;
+      1) strict_cancel_signal=INT; strict_cancel_expected=130 ;;
+      2) strict_cancel_signal=TERM; strict_cancel_expected=143 ;;
+    esac
+    prepare_full_repackage_case
+    seed_prior_full_output
+    strict_cancel_log="$FIXTURE_DIR/full-strict-$strict_cancel_phase-$strict_cancel_signal.log"
+    setsid "$fake_bin/signal-reset-launcher" env -u http_proxy -u https_proxy -u all_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+      FULL_REPAIR_MODE="cancel-$strict_cancel_phase-pip" \
+      DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+      DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+      DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+      DIFY_TARGET_ARCH=aarch64 \
+      bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$strict_cancel_log" 2>&1 &
+    strict_cancel_top_pid=$!
+    for _ in {1..300}; do
+      [[ -f "$FULL_PIP_CANCEL_MARKER" ]] && break
+      kill -0 "$strict_cancel_top_pid" 2>/dev/null || break
+      sleep 0.02
+    done
+    if [[ -f "$FULL_PIP_CANCEL_MARKER" ]]; then
+      pass "$strict_cancel_phase strict pip reaches its supervised cancellation fixture"
+      kill -s "$strict_cancel_signal" "$strict_cancel_top_pid" 2>/dev/null || true
+    else
+      fail "$strict_cancel_phase strict pip reaches its supervised cancellation fixture"
+      kill -TERM "$strict_cancel_top_pid" 2>/dev/null || true
+    fi
+    if wait "$strict_cancel_top_pid"; then
+      strict_cancel_status=0
+    else
+      strict_cancel_status=$?
+    fi
+    assert_eq "$strict_cancel_expected" "$strict_cancel_status" "$strict_cancel_phase strict pip preserves $strict_cancel_signal status"
+    if [[ -f "$FULL_PIP_CANCEL_CHILD_PID_FILE" ]] && \
+      ! kill -0 "$(<"$FULL_PIP_CANCEL_CHILD_PID_FILE")" 2>/dev/null; then
+      pass "$strict_cancel_phase strict pip reaps its double-fork setsid descendant"
+    else
+      fail "$strict_cancel_phase strict pip reaps its double-fork setsid descendant"
+    fi
+    assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" "$strict_cancel_phase strict pip cancellation preserves the prior output"
+    assert_initial_strict_secrets_redacted "$strict_cancel_log" "$strict_cancel_phase strict pip cancellation"
+    assert_full_repackage_cleanup "$strict_cancel_phase strict pip $strict_cancel_signal cancellation"
+    if [[ -f "$FULL_PIP_CANCEL_CHILD_PID_FILE" ]] && \
+      kill -0 "$(<"$FULL_PIP_CANCEL_CHILD_PID_FILE")" 2>/dev/null; then
+      kill -KILL "$(<"$FULL_PIP_CANCEL_CHILD_PID_FILE")" 2>/dev/null || true
+    fi
+  done
+done
+
 FULL_DEBUG_ENV="$FIXTURE_DIR/full-debug-injection.sh"
 FULL_DEBUG_LOG="$FIXTURE_DIR/full-debug-injection.log"
 FULL_DEBUG_MARKER="$FIXTURE_DIR/full-debug-injection.marker"
@@ -4470,8 +4649,13 @@ trap '
       printf "CANDIDATE:%s\n" "$candidate" >>"$FULL_DEBUG_LOG"
     fi
     : >"$FULL_DEBUG_MARKER"
+    if [[ -n "${FULL_DEBUG_ACTION:-}" ]]; then
+      source "$FULL_DEBUG_ACTION"
+    fi
     trap - DEBUG
-    kill -s "${FULL_DEBUG_SIGNAL:-TERM}" "$BASHPID"
+    if [[ -n "${FULL_DEBUG_SIGNAL:-}" ]]; then
+      kill -s "$FULL_DEBUG_SIGNAL" "$BASHPID"
+    fi
   fi
 ' DEBUG
 EOF
@@ -4618,7 +4802,7 @@ packager_launch_window_commands=(
   'RUNTIME_PENDING_STATUS='
   'RUNTIME_CHILD_KIND=packager'
   'RUNTIME_CHILD_STATE=starting'
-  '"$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output"'
+  'DIFY_INTERNAL_PACKAGER_WORKSPACE="$ACTIVE_PACKAGER_WORKSPACE" run_runtime_supervised_command_log "$packager_log" "$packager_timeout" "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output"'
   'ACTIVE_PACKAGER_PID=$!'
 )
 for debug_index in "${!debug_signals[@]}"; do
@@ -4642,9 +4826,133 @@ for debug_index in "${!debug_signals[@]}"; do
   done
 done
 
+run_tracked_temp_collision_signal_case() {
+  local tracking_variable=$1
+  local parent=$2
+  local prefix=$3
+  local window_name=$4
+  local debug_command=$5
+  local signal_name=$6
+  local expected_status=$7
+  local token=0123456789abcdef0123456789abcdef
+  local collision="$parent/$prefix$token"
+  local sentinel="$collision/foreign-sentinel"
+  local collision_status
+
+  [[ ! -e "$collision" && ! -L "$collision" ]] || {
+    fail "$window_name starts without a stale test collision"
+    return
+  }
+  mkdir -m 700 -- "$collision"
+  printf 'foreign collision sentinel\n' >"$sentinel"
+  if (
+    task3_python() {
+      if [[ "$*" == *'secrets.token_hex(16)'* ]]; then
+        printf '%s\n' 0123456789abcdef0123456789abcdef
+      else
+        env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV python3 "$@"
+      fi
+    }
+    set -T
+    trap 'request_runtime_cancellation HUP 129' HUP
+    trap 'request_runtime_cancellation INT 130' INT
+    trap 'request_runtime_cancellation TERM 143' TERM
+    trap '
+      if [[ "${COLLISION_DEBUG_FIRED:-0}" != 1 && "$BASH_COMMAND" == "$debug_command" && \
+        "${TRACKED_TEMP_CREATION_STATE:-idle}" == creating && "${candidate:-}" == "$collision" ]]; then
+        COLLISION_DEBUG_FIRED=1
+        trap - DEBUG
+        kill -s "$signal_name" "$BASHPID"
+      fi
+    ' DEBUG
+    create_tracked_temp_dir "$parent" "$prefix" "$tracking_variable"
+  ); then
+    collision_status=0
+  else
+    collision_status=$?
+  fi
+  assert_eq "$expected_status" "$collision_status" "$window_name collision preserves $signal_name status"
+  assert_eq 'foreign collision sentinel' "$(<"$sentinel")" "$window_name collision never deletes the unowned sentinel"
+  rm -f -- "$sentinel"
+  rmdir -- "$collision"
+}
+
+collision_tracking_variables=(ACTIVE_STAGING ACTIVE_OUTPUT_TEMP_DIR ACTIVE_COORDINATOR_WORKSPACE)
+collision_parents=("$ROOT_DIR" "$ROOT_DIR" /tmp)
+collision_prefixes=(.dify-repackaging. .dify-output. dify-plugin-coordinator.)
+collision_windows=(mkdir-failure clear-after-failure)
+collision_commands=('mkdir -m 700 -- "$candidate"' 'tracked_path=')
+for collision_signal_index in "${!debug_signals[@]}"; do
+  for collision_type_index in "${!collision_tracking_variables[@]}"; do
+    for collision_window_index in "${!collision_windows[@]}"; do
+      run_tracked_temp_collision_signal_case \
+        "${collision_tracking_variables[$collision_type_index]}" \
+        "${collision_parents[$collision_type_index]}" \
+        "${collision_prefixes[$collision_type_index]}" \
+        "${collision_tracking_variables[$collision_type_index]}-${collision_windows[$collision_window_index]}" \
+        "${collision_commands[$collision_window_index]}" \
+        "${debug_signals[$collision_signal_index]}" "${debug_statuses[$collision_signal_index]}"
+    done
+  done
+done
+
+FULL_ARCHIVE_SWAP_ACTION="$FIXTURE_DIR/full-archive-swap-action"
+cat >"$FULL_ARCHIVE_SWAP_ACTION" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+target=${ACTIVE_OUTPUT_BOUND_FILE:-${ACTIVE_OUTPUT_TEMP_FILE:-}}
+[[ -n "$target" ]]
+replacement="$target.replacement"
+printf 'unverified pathname replacement\n' >"$replacement"
+mv -f -- "$replacement" "$target"
+EOF
+FULL_ARCHIVE_MUTATE_ACTION="$FIXTURE_DIR/full-archive-mutate-action"
+cat >"$FULL_ARCHIVE_MUTATE_ACTION" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+target=${ACTIVE_OUTPUT_BOUND_FILE:-${ACTIVE_OUTPUT_TEMP_FILE:-}}
+[[ -n "$target" ]]
+printf 'unverified in-place mutation\n' >"$target"
+EOF
+chmod +x "$FULL_ARCHIVE_SWAP_ACTION" "$FULL_ARCHIVE_MUTATE_ACTION"
+
+run_full_post_validation_attack_case() {
+  local attack_name=$1
+  local action=$2
+  local attack_log="$FIXTURE_DIR/full-post-validation-$attack_name.log"
+  local attack_status
+
+  prepare_full_repackage_case
+  seed_prior_full_output
+  : >"$FULL_DEBUG_LOG"
+  rm -f -- "$FULL_DEBUG_MARKER"
+  if setsid env -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    BASH_ENV="$FULL_DEBUG_ENV" \
+    FULL_DEBUG_COMMAND='output_non_publication_barrier after-verify' \
+    FULL_DEBUG_ACTION="$action" \
+    FULL_DEBUG_SIGNAL= \
+    FULL_REPAIR_MODE=wheel-only \
+    DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+    DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+    DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+    DIFY_TARGET_ARCH=aarch64 \
+    bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$attack_log" 2>&1; then
+    attack_status=0
+  else
+    attack_status=$?
+  fi
+  assert_eq 1 "$attack_status" "$attack_name after validation fails closed"
+  assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" "$attack_name preserves the prior output byte-for-byte"
+  assert_full_repackage_cleanup "$attack_name after validation"
+}
+
+run_full_post_validation_attack_case pathname-swap "$FULL_ARCHIVE_SWAP_ACTION"
+run_full_post_validation_attack_case in-place-mutation "$FULL_ARCHIVE_MUTATE_ACTION"
+
 tracked_temp_window_names=(repo-staging-register repo-staging-mkdir repo-staging-created)
 tracked_temp_window_commands=(
-  'printf -v "$tracking_variable" '\''%s'\'' "$candidate"'
+  'tracked_path=$candidate'
   'mkdir -m 700 -- "$candidate"'
   'return 0'
 )
@@ -4732,7 +5040,7 @@ for debug_index in "${!debug_signals[@]}"; do
     before-publish 'output_non_publication_barrier before-publish' \
     "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" wheel-only
   run_full_commit_signal_case \
-    committing-before-replace 'publish_output_archive "$temp_output" "$output"' \
+    committing-before-replace 'publish_output_archive "$ACTIVE_OUTPUT_BOUND_FILE" "$output" "$ACTIVE_OUTPUT_BOUND_SIGNATURE"' \
     "${debug_signals[$debug_index]}"
   run_full_commit_signal_case \
     replace-return-before-committed 'OUTPUT_PUBLICATION_STATE=committed' \
@@ -4961,6 +5269,10 @@ assert_file_contains "$ROOT_DIR/README.md" 'docopt' 'README includes the generic
 assert_file_contains "$ROOT_DIR/README.md" '原子替换' 'README documents atomic final-output publication'
 assert_file_contains "$ROOT_DIR/README.md" '保留已有' 'README documents prior-output preservation on failure'
 assert_file_contains "$ROOT_DIR/README.md" '提交点' 'README defines the atomic output commit point'
+assert_file_contains "$ROOT_DIR/README.md" 'Bash 4.3+' 'README documents the nameref-compatible Bash baseline'
+assert_file_contains "$ROOT_DIR/README.md" 'double-fork' 'README documents full tool-process-tree supervision'
+assert_file_contains "$ROOT_DIR/README.md" '同文件系统硬链接' 'README documents the verified-inode publication requirement'
+assert_file_contains "$ROOT_DIR/README.md" '设备号、inode、大小' 'README documents the bound archive signature'
 
 printf '%s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

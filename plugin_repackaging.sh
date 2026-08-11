@@ -11,10 +11,25 @@ HOST_ARCH=
 TARGET_ARCH=
 PACKAGER_BINARY=
 ACTIVE_STAGING=
+ACTIVE_STAGING_OWNED=false
+ACTIVE_STAGING_IDENTITY=
 ACTIVE_OUTPUT=
 ACTIVE_OUTPUT_TEMP_DIR=
+ACTIVE_OUTPUT_TEMP_DIR_OWNED=false
+ACTIVE_OUTPUT_TEMP_DIR_IDENTITY=
 ACTIVE_OUTPUT_TEMP_FILE=
+ACTIVE_OUTPUT_BOUND_FILE=
+ACTIVE_OUTPUT_BOUND_SIGNATURE=
 ACTIVE_COORDINATOR_WORKSPACE=
+ACTIVE_COORDINATOR_WORKSPACE_OWNED=false
+ACTIVE_COORDINATOR_WORKSPACE_IDENTITY=
+ACTIVE_PACKAGER_WORKSPACE=
+ACTIVE_PACKAGER_WORKSPACE_OWNED=false
+ACTIVE_PACKAGER_WORKSPACE_IDENTITY=
+TRACKED_TEMP_CREATION_STATE=idle
+TRACKED_TEMP_PENDING_SIGNAL=
+TRACKED_TEMP_PENDING_STATUS=
+TRACKED_TEMP_SIGNAL_DOMAIN=runtime
 ACTIVE_DOWNLOAD_PID=
 ACTIVE_PACKAGER_PID=
 RUNTIME_CHILD_STATE=idle
@@ -1009,7 +1024,7 @@ PY
 run_supervised_command_log() {
   local output_log=$1
   local timeout_seconds=$2
-  local supervisor_status
+  local supervisor_status supervisor_starttime=
   shift 2
 
   REPAIR_SUPERVISOR_STARTING=true
@@ -1028,7 +1043,7 @@ import time
 
 MAX_RAW_LOG_BYTES = 1024 * 1024
 TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
-SUPERVISOR_ERROR_MARKER = b"\n[build process supervision failed]\n"
+SUPERVISOR_ERROR_MARKER = b"\n[tool process supervision failed]\n"
 PR_SET_CHILD_SUBREAPER = 36
 TERM_GRACE_SECONDS = 0.25
 KILL_AFTER_SECONDS = 2.0
@@ -1253,6 +1268,7 @@ def stop_and_reap_descendants(cleanup_deadline):
 
     empty_scans = 0
     while time.monotonic() < cleanup_deadline:
+        reap_children()
         current = descendants()
         include_live_main(current)
         if current:
@@ -1357,6 +1373,18 @@ finally:
 raise SystemExit(result)
 PY
   REPAIR_SUPERVISOR_PID=$!
+  supervisor_starttime="$(task3_python -B - "$REPAIR_SUPERVISOR_PID" <<'PY'
+import sys
+
+
+try:
+    contents = open(f"/proc/{int(sys.argv[1])}/stat", "rb").read(64 * 1024)
+    fields = contents[contents.rfind(b")") + 2:].split()
+    print(int(fields[19]))
+except (OSError, ValueError, IndexError):
+    pass
+PY
+)" || true
   REPAIR_SUPERVISOR_STARTING=false
   if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
     kill -s "${REPAIR_CANCELLATION_SIGNAL_NAME:-TERM}" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
@@ -1367,6 +1395,30 @@ PY
     supervisor_status=$?
   fi
   if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    trap '' HUP INT TERM
+    if [[ "$supervisor_starttime" =~ ^[1-9][0-9]*$ ]]; then
+      task3_python -B - "$REPAIR_SUPERVISOR_PID" "$supervisor_starttime" <<'PY' || true
+import os
+import sys
+import time
+
+
+pid = int(sys.argv[1])
+expected_starttime = int(sys.argv[2])
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline:
+    try:
+        contents = open(f"/proc/{pid}/stat", "rb").read(64 * 1024)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    closing_parenthesis = contents.rfind(b")")
+    fields = contents[closing_parenthesis + 2:].split()
+    if len(fields) <= 19 or int(fields[19]) != expected_starttime or fields[0] == b"Z":
+        raise SystemExit(0)
+    time.sleep(0.01)
+raise SystemExit(1)
+PY
+    fi
     wait "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
   fi
   REPAIR_SUPERVISOR_STATE=reaped
@@ -1376,6 +1428,40 @@ PY
     exit "${REPAIR_CANCELLATION_EXIT_STATUS:-143}"
   fi
   return "$supervisor_status"
+}
+
+cancel_runtime_supervised_tool() {
+  local signal_name=$1
+  local exit_status=$2
+
+  REPAIR_CANCELLATION_ACTIVE=true
+  REPAIR_CANCELLATION_SIGNAL_NAME=$signal_name
+  REPAIR_CANCELLATION_EXIT_STATUS=$exit_status
+  if [[ "${REPAIR_SUPERVISOR_STARTING:-false}" == true ]]; then
+    return 0
+  fi
+  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -s "$signal_name" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    return 0
+  fi
+  exit "$exit_status"
+}
+
+run_runtime_supervised_command_log() {
+  REPAIR_SUPERVISOR_PID=
+  REPAIR_SUPERVISOR_STARTING=false
+  REPAIR_SUPERVISOR_STATE=idle
+  REPAIR_CANCELLATION_ACTIVE=false
+  REPAIR_CANCELLATION_EXIT_STATUS=
+  REPAIR_CANCELLATION_SIGNAL_NAME=
+  trap 'cancel_runtime_supervised_tool HUP 129' HUP
+  trap 'cancel_runtime_supervised_tool INT 130' INT
+  trap 'cancel_runtime_supervised_tool TERM 143' TERM
+  if [[ -n "${RUNTIME_PENDING_SIGNAL:-}" ]]; then
+    cancel_runtime_supervised_tool \
+      "$RUNTIME_PENDING_SIGNAL" "${RUNTIME_PENDING_STATUS:-143}"
+  fi
+  run_supervised_command_log "$@"
 }
 
 build_sanitized_environment_args() {
@@ -1403,6 +1489,7 @@ run_selected_pip_attempt() {
   local use_legacy_certs=$5
   local clean_env_args_name=$6
   local bounded_capture=$7
+  local pip_timeout=${DIFY_PIP_TIMEOUT_SECONDS:-600}
   local -n selected_pip_command=$pip_command_name
   local -n selected_download_args=$download_args_name
   local -a command=(env)
@@ -1422,11 +1509,11 @@ run_selected_pip_attempt() {
     fi
   fi
   command+=("${selected_pip_command[@]}" "${selected_download_args[@]}")
-  if [[ "$bounded_capture" == true ]]; then
-    run_bounded_command_log "$pip_output_log" "${command[@]}"
-  else
-    "${command[@]}" >"$pip_output_log" 2>&1
-  fi
+  [[ "$pip_timeout" =~ ^[1-9][0-9]*$ ]] && ((10#$pip_timeout <= 3600)) || {
+    printf 'DIFY_PIP_TIMEOUT_SECONDS must be between 1 and 3600\n' >&2
+    return 1
+  }
+  run_supervised_command_log "$pip_output_log" "$pip_timeout" "${command[@]}"
 }
 
 run_pip_with_socks_retry() {
@@ -2144,11 +2231,11 @@ cancel_sdist_repair() {
   REPAIR_CANCELLATION_ACTIVE=true
   REPAIR_CANCELLATION_EXIT_STATUS=$exit_status
   REPAIR_CANCELLATION_SIGNAL_NAME=$signal_name
-  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
-    kill -s "$signal_name" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+  if [[ "${REPAIR_SUPERVISOR_STARTING:-false}" == true ]]; then
     return 0
   fi
-  if [[ "${REPAIR_SUPERVISOR_STARTING:-false}" == true ]]; then
+  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -s "$signal_name" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
     return 0
   fi
   exit "$exit_status"
@@ -2177,7 +2264,7 @@ repair_one_pure_sdist_locked() {
   local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir
   local download_log= build_log= sdist_error= wheel_error=
   local sdist_output wheel_output sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version
-  local snapshot_dir= before_signature after_signature build_timeout build_status
+  local snapshot_dir= before_signature after_signature build_timeout build_status download_status
   local -a clean_env_args=()
   local -a uv_build_command=()
 
@@ -2210,11 +2297,19 @@ repair_one_pure_sdist_locked() {
     remove_private_stage_log "$candidate_dir" "$download_log" || true
     return 1
   fi
-  if ! download_sdist \
+  if download_sdist \
     "$pip_command_name" "$requirement" "$python_version" "$source_dir" "$socks_site_dir" "$download_log"; then
+    download_status=0
+  else
+    download_status=$?
     remove_private_stage_log "$candidate_dir" "$download_log" || true
     printf 'Pure Python sdist repair failed during download: %s (index: %s)\n' \
       "$requirement" "$safe_index" >&2
+    case "$download_status" in
+      124 | 125 | 129 | 130 | 143)
+        return "$download_status"
+        ;;
+    esac
     return 1
   fi
   remove_private_stage_log "$candidate_dir" "$download_log" || return
@@ -2270,6 +2365,11 @@ repair_one_pure_sdist_locked() {
     redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
     remove_private_stage_log "$candidate_dir" "$build_log" || true
     printf 'Pure Python sdist repair failed during build: %s\n' "$requirement" >&2
+    case "$build_status" in
+      124 | 125 | 129 | 130 | 143)
+        return "$build_status"
+        ;;
+    esac
     return 1
   fi
   remove_private_stage_log "$candidate_dir" "$build_log" || return
@@ -2497,32 +2597,106 @@ create_tracked_temp_dir() {
   local parent=$1
   local prefix=$2
   local tracking_variable=$3
-  local token candidate
+  local token candidate identity
   local attempt
+  local owned_variable identity_variable
+  local -n tracked_path=$tracking_variable
 
   case "$tracking_variable:$parent:$prefix" in
     "ACTIVE_STAGING:$SCRIPT_DIR:.dify-repackaging." | \
       "ACTIVE_OUTPUT_TEMP_DIR:$SCRIPT_DIR:.dify-output." | \
-      "ACTIVE_COORDINATOR_WORKSPACE:/tmp:dify-plugin-coordinator.")
+      "ACTIVE_COORDINATOR_WORKSPACE:/tmp:dify-plugin-coordinator." | \
+      "ACTIVE_PACKAGER_WORKSPACE:/tmp:dify-plugin-packager.")
       ;;
     *)
       printf 'invalid tracked temporary-directory request\n' >&2
       return 1
       ;;
   esac
+  case "$tracking_variable" in
+    ACTIVE_STAGING)
+      owned_variable=ACTIVE_STAGING_OWNED
+      identity_variable=ACTIVE_STAGING_IDENTITY
+      ;;
+    ACTIVE_OUTPUT_TEMP_DIR)
+      owned_variable=ACTIVE_OUTPUT_TEMP_DIR_OWNED
+      identity_variable=ACTIVE_OUTPUT_TEMP_DIR_IDENTITY
+      ;;
+    ACTIVE_COORDINATOR_WORKSPACE)
+      owned_variable=ACTIVE_COORDINATOR_WORKSPACE_OWNED
+      identity_variable=ACTIVE_COORDINATOR_WORKSPACE_IDENTITY
+      ;;
+    ACTIVE_PACKAGER_WORKSPACE)
+      owned_variable=ACTIVE_PACKAGER_WORKSPACE_OWNED
+      identity_variable=ACTIVE_PACKAGER_WORKSPACE_IDENTITY
+      ;;
+  esac
+  local -n tracked_owned=$owned_variable
+  local -n tracked_identity=$identity_variable
+  tracked_path=
+  tracked_owned=false
+  tracked_identity=
   for attempt in {1..32}; do
     token="$(task3_python -B -c 'import secrets; print(secrets.token_hex(16))')" || return
     [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
     candidate="$parent/$prefix$token"
-    printf -v "$tracking_variable" '%s' "$candidate"
+    tracked_path=$candidate
+    TRACKED_TEMP_CREATION_STATE=creating
     if mkdir -m 700 -- "$candidate"; then
+      identity="$(task3_python -B - "$candidate" <<'PY'
+import os
+import stat
+import sys
+
+
+record = os.lstat(sys.argv[1])
+if stat.S_ISLNK(record.st_mode) or not stat.S_ISDIR(record.st_mode) or record.st_uid != os.geteuid():
+    raise SystemExit(1)
+print(f"{record.st_dev}:{record.st_ino}:{record.st_uid}")
+PY
+)" || {
+        TRACKED_TEMP_CREATION_STATE=idle
+        return 1
+      }
+      [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || {
+        TRACKED_TEMP_CREATION_STATE=idle
+        return 1
+      }
+      tracked_identity=$identity
+      tracked_owned=true
+      TRACKED_TEMP_CREATION_STATE=idle
+      honor_tracked_temp_pending_signal
       return 0
     fi
-    printf -v "$tracking_variable" '%s' ''
+    tracked_path=
+    tracked_identity=
+    tracked_owned=false
+    TRACKED_TEMP_CREATION_STATE=idle
+    honor_tracked_temp_pending_signal
     [[ -e "$candidate" || -L "$candidate" ]] || return 1
   done
   printf 'unable to allocate a unique tracked temporary directory\n' >&2
   return 1
+}
+
+honor_tracked_temp_pending_signal() {
+  local signal_name=${TRACKED_TEMP_PENDING_SIGNAL:-}
+  local exit_status=${TRACKED_TEMP_PENDING_STATUS:-}
+
+  [[ -n "$signal_name" ]] || return 0
+  TRACKED_TEMP_PENDING_SIGNAL=
+  TRACKED_TEMP_PENDING_STATUS=
+  case "${TRACKED_TEMP_SIGNAL_DOMAIN:-runtime}" in
+    runtime)
+      request_runtime_cancellation "$signal_name" "$exit_status"
+      ;;
+    coordinator)
+      request_repair_cancellation "$signal_name" "$exit_status"
+      ;;
+    *)
+      return 125
+      ;;
+  esac
 }
 
 tracked_temp_creation_barrier() {
@@ -2531,16 +2705,19 @@ tracked_temp_creation_barrier() {
 
 cleanup_coordinator_workspace() {
   local workspace=${1:-}
+  local expected_identity=${2:-}
+  local owned=${3:-true}
 
+  [[ "$owned" == true ]] || return 0
   [[ -n "$workspace" ]] || return 0
-  task3_python -B - "$workspace" <<'PY'
+  task3_python -B - "$workspace" "$expected_identity" <<'PY'
 import os
 import re
 import stat
 import sys
 
 
-workspace = sys.argv[1]
+workspace, expected_identity = sys.argv[1:]
 trusted_root = "/tmp"
 basename = os.path.basename(workspace)
 root_descriptor = None
@@ -2634,6 +2811,10 @@ try:
     except FileNotFoundError:
         raise SystemExit(0)
     # COORDINATOR_WORKSPACE_CLEANUP_IDENTITY_CAPTURED
+    if expected_identity:
+        expected = f"{linked.st_dev}:{linked.st_ino}:{linked.st_uid}"
+        if expected != expected_identity:
+            raise ValueError("coordinator workspace ownership identity changed")
     workspace_path_descriptor = os.open(
         basename,
         os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2683,6 +2864,11 @@ PY
   if (($? != 0)); then
     printf 'refusing to remove unsafe coordinator workspace: %s\n' "$workspace" >&2
     return 1
+  fi
+  if [[ "$workspace" == "${ACTIVE_COORDINATOR_WORKSPACE:-}" ]]; then
+    ACTIVE_COORDINATOR_WORKSPACE=
+    ACTIVE_COORDINATOR_WORKSPACE_IDENTITY=
+    ACTIVE_COORDINATOR_WORKSPACE_OWNED=false
   fi
 }
 
@@ -2960,6 +3146,11 @@ request_runtime_cancellation() {
       exit 125
       ;;
   esac
+  if [[ "${TRACKED_TEMP_CREATION_STATE:-idle}" == creating ]]; then
+    TRACKED_TEMP_PENDING_SIGNAL=$signal_name
+    TRACKED_TEMP_PENDING_STATUS=$exit_status
+    return 0
+  fi
   case "${OUTPUT_PUBLICATION_STATE:-idle}" in
     committing | committed)
       OUTPUT_PUBLICATION_PENDING_SIGNAL=$signal_name
@@ -3046,8 +3237,27 @@ request_repair_cancellation() {
       exit 125
       ;;
   esac
+  if [[ "${TRACKED_TEMP_CREATION_STATE:-idle}" == creating ]]; then
+    TRACKED_TEMP_PENDING_SIGNAL=$signal_name
+    TRACKED_TEMP_PENDING_STATUS=$exit_status
+    return 0
+  fi
   repair_pending_signal=$signal_name
   repair_pending_status=$exit_status
+  if [[ "${REPAIR_SUPERVISOR_STARTING:-false}" == true ]]; then
+    REPAIR_CANCELLATION_ACTIVE=true
+    REPAIR_CANCELLATION_SIGNAL_NAME=$signal_name
+    REPAIR_CANCELLATION_EXIT_STATUS=$exit_status
+    return 0
+  fi
+  if [[ "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    REPAIR_CANCELLATION_ACTIVE=true
+    REPAIR_CANCELLATION_SIGNAL_NAME=$signal_name
+    REPAIR_CANCELLATION_EXIT_STATUS=$exit_status
+    trap '' HUP INT TERM
+    kill -s "$signal_name" "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
+    return 0
+  fi
   if [[ "${repair_child_state:-idle}" == starting ]]; then
     return 0
   fi
@@ -3087,13 +3297,20 @@ download_wheels_impl() {
   local coordinator_workspace= initial_log= current_log=
   local abi platform
   local attempt_log missing_record requirement canonical_name uv_command
-  local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status
+  local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status strict_status
   local active_repair_pid=
   local repair_child_state=idle repair_pending_signal= repair_pending_status=
   local repair_count=0
   local -a platform_names=()
   local -a pip_command=()
   local -A repaired_candidates=()
+
+  REPAIR_SUPERVISOR_PID=
+  REPAIR_SUPERVISOR_STARTING=false
+  REPAIR_SUPERVISOR_STATE=idle
+  REPAIR_CANCELLATION_ACTIVE=false
+  REPAIR_CANCELLATION_EXIT_STATUS=
+  REPAIR_CANCELLATION_SIGNAL_NAME=
 
   reset_wheels_dir "$wheels_dir" || return
   if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
@@ -3108,8 +3325,9 @@ download_wheels_impl() {
   trap 'request_repair_cancellation INT 130' INT
   trap 'request_repair_cancellation TERM 143' TERM
   trap 'request_repair_cancellation HUP 129' HUP
-  trap 'cleanup_coordinator_workspace "${ACTIVE_COORDINATOR_WORKSPACE:-}" || true' EXIT
+  trap 'cleanup_coordinator_workspace "${ACTIVE_COORDINATOR_WORKSPACE:-}" "${ACTIVE_COORDINATOR_WORKSPACE_IDENTITY:-}" "${ACTIVE_COORDINATOR_WORKSPACE_OWNED:-false}" || true' EXIT
   tracked_temp_creation_barrier coordinator-traps-installed
+  TRACKED_TEMP_SIGNAL_DOMAIN=coordinator
   create_tracked_temp_dir /tmp dify-plugin-coordinator. ACTIVE_COORDINATOR_WORKSPACE || return
   coordinator_workspace=$ACTIVE_COORDINATOR_WORKSPACE
   chmod 700 -- "$coordinator_workspace" || return
@@ -3139,11 +3357,18 @@ download_wheels_impl() {
         return 1
       fi
     fi
-    if download_wheels_once \
+    if DIFY_INTERNAL_COORDINATOR_WORKSPACE="$coordinator_workspace" download_wheels_once \
       "$requirements" "$wheels_dir" "$target_arch" "$python_version" "$attempt_log" \
       "$bootstrap_dir" "$local_wheels_dir" true false; then
       return 0
+    else
+      strict_status=$?
     fi
+    case "$strict_status" in
+      124 | 125 | 129 | 130 | 143)
+        return "$strict_status"
+        ;;
+    esac
     validate_coordinator_log_file "$attempt_log" "$coordinator_workspace" || {
       printf 'strict wheel-resolution diagnostics are unsafe\n' >&2
       return 1
@@ -3291,12 +3516,168 @@ verify_pyproject_offline() {
   return "$verify_status"
 }
 
+output_archive_signature() {
+  local output=$1
+
+  python3 -B - "$output" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+
+path = sys.argv[1]
+descriptor = None
+try:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    before = os.fstat(descriptor)
+    linked = os.lstat(path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise OSError
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    linked_after = os.lstat(path)
+    if (
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        or (linked_after.st_dev, linked_after.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise OSError
+    print(f"{before.st_dev}:{before.st_ino}:{before.st_size}:{before.st_mtime_ns}:{digest.hexdigest()}")
+except OSError:
+    raise SystemExit(1)
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+PY
+}
+
+isolate_output_archive() {
+  local temp_output=$1
+  local binding bound_path bound_signature
+
+  if ! binding="$(python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" \
+    "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" "$temp_output" <<'PY'
+import hashlib
+import os
+import secrets
+import stat
+import sys
+
+
+parent, temp_dir, temp_dir_identity, source = sys.argv[1:]
+directory_descriptor = None
+source_descriptor = None
+bound_name = f".verified-{secrets.token_hex(16)}.difypkg"
+bound = os.path.join(temp_dir, bound_name)
+try:
+    directory_record = os.lstat(temp_dir)
+    if (
+        os.path.dirname(temp_dir) != parent
+        or not os.path.basename(temp_dir).startswith(".dify-output.")
+        or f"{directory_record.st_dev}:{directory_record.st_ino}:{directory_record.st_uid}" != temp_dir_identity
+        or stat.S_ISLNK(directory_record.st_mode)
+        or not stat.S_ISDIR(directory_record.st_mode)
+        or source != os.path.join(temp_dir, "package.difypkg")
+    ):
+        raise OSError
+    directory_descriptor = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    source_descriptor = os.open(
+        "package.difypkg",
+        os.O_RDONLY | os.O_NOFOLLOW,
+        dir_fd=directory_descriptor,
+    )
+    source_record = os.fstat(source_descriptor)
+    linked_source = os.stat(
+        "package.difypkg", dir_fd=directory_descriptor, follow_symlinks=False
+    )
+    if (
+        not stat.S_ISREG(source_record.st_mode)
+        or source_record.st_uid != os.geteuid()
+        or source_record.st_nlink != 1
+        or (source_record.st_dev, source_record.st_ino)
+        != (linked_source.st_dev, linked_source.st_ino)
+    ):
+        raise OSError
+    os.link(
+        "package.difypkg",
+        bound_name,
+        src_dir_fd=directory_descriptor,
+        dst_dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    linked_bound = os.stat(bound_name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if (linked_bound.st_dev, linked_bound.st_ino) != (source_record.st_dev, source_record.st_ino):
+        raise OSError
+    os.unlink("package.difypkg", dir_fd=directory_descriptor)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(source_descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    after = os.fstat(source_descriptor)
+    linked_after = os.stat(bound_name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if (
+        after.st_nlink != 1
+        or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (
+            source_record.st_dev,
+            source_record.st_ino,
+            source_record.st_size,
+            source_record.st_mtime_ns,
+        )
+        or (linked_after.st_dev, linked_after.st_ino) != (after.st_dev, after.st_ino)
+    ):
+        raise OSError
+    signature = f"{after.st_dev}:{after.st_ino}:{after.st_size}:{after.st_mtime_ns}:{digest.hexdigest()}"
+    print(f"{bound}\t{signature}")
+except OSError:
+    try:
+        if directory_descriptor is not None:
+            os.unlink(bound_name, dir_fd=directory_descriptor)
+    except OSError:
+        pass
+    raise SystemExit(1)
+finally:
+    if source_descriptor is not None:
+        os.close(source_descriptor)
+    if directory_descriptor is not None:
+        os.close(directory_descriptor)
+PY
+)"; then
+    printf '%s\n' 'unable to bind packager output to a verified inode; same-filesystem hard links are required' >&2
+    return 1
+  fi
+  IFS=$'\t' read -r bound_path bound_signature <<<"$binding"
+  [[ "$bound_path" == "$ACTIVE_OUTPUT_TEMP_DIR"/.verified-*.difypkg && \
+    "$bound_signature" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || return 1
+  ACTIVE_OUTPUT_BOUND_FILE=$bound_path
+  ACTIVE_OUTPUT_BOUND_SIGNATURE=$bound_signature
+}
+
 verify_output_archive() {
   local output=$1
   local requires_wheel=$2
   local requires_pyproject=$3
   local target_arch=$4
-  local entries
+  local expected_signature=$5
+  local entries before_signature after_signature
+
+  before_signature="$(output_archive_signature "$output")" || return
+  [[ "$before_signature" == "$expected_signature" ]] || return 1
 
   unzip -tq "$output" >/dev/null || return 1
   entries="$(unzip -Z1 "$output")" || return 1
@@ -3310,15 +3691,60 @@ verify_output_archive() {
   if [[ "$target_arch" == aarch64 ]]; then
     ! grep -E '^wheels/.+x86_64.+\.whl$' <<<"$entries" || return 1
   fi
+  after_signature="$(output_archive_signature "$output")" || return
+  [[ "$after_signature" == "$expected_signature" ]]
+}
+
+remove_owned_temp_tree() {
+  local path=$1
+  local parent=$2
+  local prefix=$3
+  local expected_identity=$4
+
+  python3 -B - "$path" "$parent" "$prefix" "$expected_identity" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+
+path, parent, prefix, expected_identity = sys.argv[1:]
+try:
+    if (
+        not expected_identity
+        or os.path.dirname(path) != parent
+        or not os.path.basename(path).startswith(prefix)
+    ):
+        raise ValueError
+    try:
+        record = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    identity = f"{record.st_dev}:{record.st_ino}:{record.st_uid}"
+    if (
+        identity != expected_identity
+        or stat.S_ISLNK(record.st_mode)
+        or not stat.S_ISDIR(record.st_mode)
+        or record.st_uid != os.geteuid()
+    ):
+        raise ValueError
+    shutil.rmtree(path)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
 }
 
 cleanup_active_staging() {
-  [[ -n "$ACTIVE_STAGING" ]] || return 0
+  [[ "${ACTIVE_STAGING_OWNED:-false}" == true ]] || return 0
+  [[ -n "$ACTIVE_STAGING" && -n "${ACTIVE_STAGING_IDENTITY:-}" ]] || return 1
 
   case "$ACTIVE_STAGING" in
     "$SCRIPT_DIR"/.dify-repackaging.*)
-      [[ -d "$ACTIVE_STAGING" ]] && rm -rf -- "$ACTIVE_STAGING"
+      remove_owned_temp_tree \
+        "$ACTIVE_STAGING" "$SCRIPT_DIR" .dify-repackaging. "$ACTIVE_STAGING_IDENTITY" || return
       ACTIVE_STAGING=
+      ACTIVE_STAGING_IDENTITY=
+      ACTIVE_STAGING_OWNED=false
       ;;
     *)
       printf 'refusing to clean unsafe staging path: %s\n' "$ACTIVE_STAGING" >&2
@@ -3413,62 +3839,101 @@ PY
 cleanup_active_output_temp() {
   local temp_dir=${ACTIVE_OUTPUT_TEMP_DIR:-}
 
-  [[ -n "$temp_dir" ]] || return 0
-  if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
-import os
-import shutil
-import stat
-import sys
-
-
-parent, temp_dir = sys.argv[1:]
-try:
-    if (
-        os.path.dirname(temp_dir) != parent
-        or not os.path.basename(temp_dir).startswith(".dify-output.")
-    ):
-        raise ValueError
-    if os.path.lexists(temp_dir):
-        record = os.lstat(temp_dir)
-        if (
-            stat.S_ISLNK(record.st_mode)
-            or not stat.S_ISDIR(record.st_mode)
-            or record.st_uid != os.geteuid()
-        ):
-            raise ValueError
-        shutil.rmtree(temp_dir)
-except (OSError, ValueError):
-    raise SystemExit(1)
-PY
-  then
+  [[ "${ACTIVE_OUTPUT_TEMP_DIR_OWNED:-false}" == true ]] || return 0
+  [[ -n "$temp_dir" && -n "${ACTIVE_OUTPUT_TEMP_DIR_IDENTITY:-}" ]] || return 1
+  if ! remove_owned_temp_tree \
+    "$temp_dir" "$SCRIPT_DIR" .dify-output. "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY"; then
     printf 'refusing to clean unsafe atomic output staging: %s\n' "$temp_dir" >&2
     return 1
   fi
   ACTIVE_OUTPUT_TEMP_DIR=
+  ACTIVE_OUTPUT_TEMP_DIR_IDENTITY=
+  ACTIVE_OUTPUT_TEMP_DIR_OWNED=false
   ACTIVE_OUTPUT_TEMP_FILE=
+  ACTIVE_OUTPUT_BOUND_FILE=
+  ACTIVE_OUTPUT_BOUND_SIGNATURE=
+}
+
+cleanup_active_packager_workspace() {
+  [[ "${ACTIVE_PACKAGER_WORKSPACE_OWNED:-false}" == true ]] || return 0
+  [[ -n "$ACTIVE_PACKAGER_WORKSPACE" && -n "${ACTIVE_PACKAGER_WORKSPACE_IDENTITY:-}" ]] || return 1
+  if ! remove_owned_temp_tree \
+    "$ACTIVE_PACKAGER_WORKSPACE" /tmp dify-plugin-packager. \
+    "$ACTIVE_PACKAGER_WORKSPACE_IDENTITY"; then
+    printf 'refusing to clean unsafe packager workspace: %s\n' "$ACTIVE_PACKAGER_WORKSPACE" >&2
+    return 1
+  fi
+  ACTIVE_PACKAGER_WORKSPACE=
+  ACTIVE_PACKAGER_WORKSPACE_IDENTITY=
+  ACTIVE_PACKAGER_WORKSPACE_OWNED=false
 }
 
 publish_output_archive() {
-  local temp_output=$1
+  local bound_output=$1
   local output=$2
+  local expected_signature=$3
 
-  python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" "$temp_output" "$output" <<'PY'
+  python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" \
+    "$bound_output" "$output" "$expected_signature" <<'PY'
+import hashlib
 import os
+import secrets
 import stat
 import sys
 
 
-parent, temp_dir, temp_output, output = sys.argv[1:]
+parent, temp_dir, temp_dir_identity, bound_output, output, expected_signature = sys.argv[1:]
+backup = os.path.join(temp_dir, f".previous-{secrets.token_hex(16)}.difypkg")
+backup_created = False
+replaced = False
+
+
+def signature(path, require_one_link):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        linked = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or (require_one_link and before.st_nlink != 1)
+            or stat.S_ISLNK(linked.st_mode)
+            or (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise OSError
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        linked_after = os.lstat(path)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or (linked_after.st_dev, linked_after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise OSError
+        return f"{before.st_dev}:{before.st_ino}:{before.st_size}:{before.st_mtime_ns}:{digest.hexdigest()}"
+    finally:
+        os.close(descriptor)
+
+
 try:
+    temp_record = os.lstat(temp_dir)
     if (
         os.path.dirname(temp_dir) != parent
         or not os.path.basename(temp_dir).startswith(".dify-output.")
-        or temp_output != os.path.join(temp_dir, "package.difypkg")
+        or f"{temp_record.st_dev}:{temp_record.st_ino}:{temp_record.st_uid}" != temp_dir_identity
+        or os.path.dirname(bound_output) != temp_dir
+        or not os.path.basename(bound_output).startswith(".verified-")
+        or not os.path.basename(bound_output).endswith(".difypkg")
         or os.path.dirname(output) != parent
         or not os.path.basename(output).endswith("-offline.difypkg")
     ):
         raise ValueError
-    for path, expected_type in ((parent, "directory"), (temp_dir, "directory"), (temp_output, "file")):
+    for path, expected_type in ((parent, "directory"), (temp_dir, "directory"), (bound_output, "file")):
         record = os.lstat(path)
         if stat.S_ISLNK(record.st_mode) or record.st_uid != os.geteuid():
             raise ValueError
@@ -3484,8 +3949,32 @@ try:
             or output_record.st_uid != os.geteuid()
         ):
             raise ValueError
-    os.replace(temp_output, output)
+        os.link(output, backup, follow_symlinks=False)
+        backup_created = True
+    if signature(bound_output, True) != expected_signature:
+        raise ValueError
+    os.replace(bound_output, output)
+    replaced = True
+    if signature(output, True) != expected_signature:
+        raise ValueError
+    if backup_created:
+        os.unlink(backup)
+        backup_created = False
 except (OSError, ValueError):
+    if replaced:
+        try:
+            if backup_created:
+                os.replace(backup, output)
+                backup_created = False
+            else:
+                os.unlink(output)
+        except OSError:
+            pass
+    if backup_created:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
     raise SystemExit(1)
 PY
 }
@@ -3498,10 +3987,12 @@ cleanup_runtime() {
   local status=$?
 
   if [[ "${OUTPUT_PUBLICATION_STATE:-idle}" == committed ]]; then
+    cleanup_active_packager_workspace || true
     cleanup_active_output_temp || true
     cleanup_active_staging || true
     return 0
   fi
+  cleanup_active_packager_workspace || status=$?
   cleanup_active_output_temp || status=$?
   cleanup_active_staging || status=$?
   return "$status"
@@ -3550,7 +4041,7 @@ initialize_runtime() {
 repackage() {
   local package_path=$1
   local package_filename staging plugin_dir output python_version download_status packager_status
-  local publish_status publication_pending_status temp_output
+  local publish_status publication_pending_status temp_output packager_log packager_timeout
   local requires_wheel=false
   local requires_pyproject=false
 
@@ -3618,13 +4109,23 @@ repackage() {
 
   prepare_atomic_output "$output" || return 1
   temp_output=$ACTIVE_OUTPUT_TEMP_FILE
+  create_tracked_temp_dir /tmp dify-plugin-packager. ACTIVE_PACKAGER_WORKSPACE || return 1
+  packager_log="$ACTIVE_PACKAGER_WORKSPACE/packager.log"
+  reset_private_command_log "$packager_log" || return 1
+  packager_timeout=${DIFY_PACKAGER_TIMEOUT_SECONDS:-600}
+  [[ "$packager_timeout" =~ ^[1-9][0-9]*$ ]] && ((10#$packager_timeout <= 3600)) || {
+    printf 'DIFY_PACKAGER_TIMEOUT_SECONDS must be between 1 and 3600\n' >&2
+    return 1
+  }
   output_non_publication_barrier before-packager
   RUNTIME_CHILD_KIND=
   RUNTIME_PENDING_SIGNAL=
   RUNTIME_PENDING_STATUS=
   RUNTIME_CHILD_KIND=packager
   RUNTIME_CHILD_STATE=starting
-  "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output" &
+  DIFY_INTERNAL_PACKAGER_WORKSPACE="$ACTIVE_PACKAGER_WORKSPACE" \
+    run_runtime_supervised_command_log "$packager_log" "$packager_timeout" \
+    "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output" &
   ACTIVE_PACKAGER_PID=$!
   activate_runtime_child packager "$ACTIVE_PACKAGER_PID" || return 1
   if wait "$ACTIVE_PACKAGER_PID"; then
@@ -3633,15 +4134,29 @@ repackage() {
     packager_status=$?
   fi
   mark_runtime_child_reaped packager || return 1
-  ((packager_status == 0)) || return 1
+  if ((packager_status != 0)); then
+    redact_pip_log <"$packager_log" >&2 || printf 'packager output could not be displayed safely\n' >&2
+    case "$packager_status" in
+      124 | 125 | 129 | 130 | 143)
+        return "$packager_status"
+        ;;
+    esac
+    return 1
+  fi
+  rm -f -- "$packager_log" || return 1
+  cleanup_active_packager_workspace || return 1
   output_non_publication_barrier after-packager
-  verify_output_archive "$temp_output" "$requires_wheel" "$requires_pyproject" "$TARGET_ARCH" || return 1
+  isolate_output_archive "$temp_output" || return 1
+  verify_output_archive "$ACTIVE_OUTPUT_BOUND_FILE" "$requires_wheel" \
+    "$requires_pyproject" "$TARGET_ARCH" "$ACTIVE_OUTPUT_BOUND_SIGNATURE" || return 1
+  output_non_publication_barrier after-verify
   OUTPUT_PUBLICATION_STATE=ready
   output_non_publication_barrier before-publish
   OUTPUT_PUBLICATION_PENDING_SIGNAL=
   OUTPUT_PUBLICATION_PENDING_STATUS=
   OUTPUT_PUBLICATION_STATE=committing
-  if publish_output_archive "$temp_output" "$output"; then
+  if publish_output_archive \
+    "$ACTIVE_OUTPUT_BOUND_FILE" "$output" "$ACTIVE_OUTPUT_BOUND_SIGNATURE"; then
     OUTPUT_PUBLICATION_STATE=committed
   else
     publish_status=$?
