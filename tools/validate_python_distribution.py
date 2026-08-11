@@ -119,8 +119,8 @@ def candidate(directory, suffixes, kind):
 
 def validate_sdist(directory, expected_name):
     artifact = candidate(directory, (".tar.gz", ".zip"), "sdist")
-    try:
-        if artifact.name.lower().endswith(".tar.gz"):
+    if artifact.name.lower().endswith(".tar.gz"):
+        try:
             with tarfile.open(artifact, "r:gz") as archive:
                 members = validate_tar_members(archive)
                 metadata = [member for member in members if re.fullmatch(r"[^/]+/PKG-INFO", member.name)]
@@ -130,7 +130,12 @@ def validate_sdist(directory, expected_name):
                 if stream is None:
                     raise ValidationError("cannot read PKG-INFO")
                 name, version, _ = parse_metadata(stream.read(), "PKG-INFO")
-        else:
+        except ValidationError:
+            raise
+        except (tarfile.TarError, OSError, EOFError) as error:
+            raise ValidationError("invalid tar.gz sdist") from error
+    else:
+        try:
             with zipfile.ZipFile(artifact) as archive:
                 members = validate_zip_members(archive)
                 contents = read_zip_members(archive, members)
@@ -138,12 +143,10 @@ def validate_sdist(directory, expected_name):
                 if len(metadata) != 1:
                     raise ValidationError("exactly one top-level PKG-INFO")
                 name, version, _ = parse_metadata(contents[metadata[0]], "PKG-INFO")
-    except ValidationError:
-        raise
-    except (tarfile.TarError, OSError, EOFError) as error:
-        raise ValidationError("invalid tar.gz sdist") from error
-    except zipfile.BadZipFile as error:
-        raise ValidationError("invalid zip sdist") from error
+        except ValidationError:
+            raise
+        except (zipfile.BadZipFile, OSError, EOFError, NotImplementedError, RuntimeError) as error:
+            raise ValidationError("invalid zip sdist") from error
     canonical = canonical_name(name)
     if canonical != canonical_name(expected_name):
         raise ValidationError("metadata name does not match expected name")
@@ -238,7 +241,7 @@ def validate_wheel(directory, expected_name, expected_version):
             reject_native_content(members, contents)
     except ValidationError:
         raise
-    except (zipfile.BadZipFile, OSError, EOFError) as error:
+    except (zipfile.BadZipFile, OSError, EOFError, NotImplementedError, RuntimeError) as error:
         raise ValidationError("invalid wheel archive") from error
     return artifact, canonical_name(name), version
 

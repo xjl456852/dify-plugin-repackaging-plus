@@ -39,6 +39,26 @@ def corrupt_stored_zip_member(path, member_name, offset):
         artifact.write(bytes([original[0] ^ 0xFF]))
 
 
+def patch_zip_member_compression(path, member_name, method=99):
+    target = member_name.encode()
+    data = bytearray(Path(path).read_bytes())
+    with zipfile.ZipFile(path) as archive:
+        local_offset = archive.getinfo(member_name).header_offset
+    data[local_offset + 8:local_offset + 10] = method.to_bytes(2, "little")
+    position = 0
+    while True:
+        position = data.find(b"PK\x01\x02", position)
+        if position < 0:
+            raise AssertionError(f"central directory entry not found: {member_name}")
+        name_length = int.from_bytes(data[position + 28:position + 30], "little")
+        name = bytes(data[position + 46:position + 46 + name_length])
+        if name == target:
+            data[position + 10:position + 12] = method.to_bytes(2, "little")
+            Path(path).write_bytes(data)
+            return
+        position += 46 + name_length
+
+
 class DistributionFixture:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -159,6 +179,16 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         corrupt_stored_zip_member(artifact, "docopt/data.txt", 5)
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "invalid zip sdist")
 
+    def test_sdist_unsupported_zip_compression_is_normalized(self):
+        artifact = self.fixture.zip("docopt.zip", [
+            ("docopt/PKG-INFO", pkg_info(), "file"),
+            ("docopt/data.txt", b"payload", "file"),
+        ])
+        patch_zip_member_compression(artifact, "docopt/data.txt")
+        result = self.run_validator("sdist", self.fixture.directory, "--name", "docopt")
+        self.assert_error(result, "invalid zip sdist")
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_pure_wheel_is_accepted(self):
         artifact = self.fixture.wheel()
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
@@ -202,6 +232,13 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         artifact = self.fixture.wheel(extra=[("payload.bin", b"0" * 8192, "file")])
         corrupt_stored_zip_member(artifact, "payload.bin", 5000)
         self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "invalid wheel archive")
+
+    def test_wheel_unsupported_zip_compression_is_normalized(self):
+        artifact = self.fixture.wheel()
+        patch_zip_member_compression(artifact, "docopt.py")
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
+        self.assert_error(result, "invalid wheel archive")
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_wheel_metadata_identity_mismatch_is_rejected(self):
         self.fixture.wheel(name="other")
