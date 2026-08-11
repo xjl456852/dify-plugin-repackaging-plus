@@ -304,12 +304,26 @@ cat >"$fake_bin/pip-fail" <<'EOF'
 exit 23
 EOF
 chmod +x "$fake_bin/pip-fail"
-if DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
-  without_proxy_environment download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12; then
+pip_download_failure_log="$FIXTURE_DIR/pip-download-failure.log"
+if PIP_MIRROR_URL='https://mirror.example/simple' \
+  DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
+  without_proxy_environment download_wheels \
+    "$metadata_dir/download.txt" \
+    "$wheel_dir" \
+    aarch64 \
+    3.12 \
+    >"$pip_download_failure_log" 2>&1; then
   fail 'pip failure stops wheel download'
 else
   pass 'pip failure stops wheel download'
 fi
+assert_file_contains "$pip_download_failure_log" 'Target Python: 3.12' 'download failure reports target Python'
+assert_file_contains "$pip_download_failure_log" 'Target ABI: cp312' 'download failure reports target ABI'
+assert_file_contains "$pip_download_failure_log" 'Target architecture: aarch64' 'download failure reports target architecture'
+assert_file_contains "$pip_download_failure_log" 'Target platforms: manylinux_2_28_aarch64,manylinux2014_aarch64' 'download failure reports platform tags'
+assert_file_contains "$pip_download_failure_log" 'Package index: https://mirror.example/simple' 'download failure reports package index'
+assert_file_contains "$pip_download_failure_log" 'no compatible binary wheel' 'download failure explains binary wheel boundary'
+assert_file_contains "$pip_download_failure_log" 'additional package index' 'download failure mentions private or specialized indexes'
 
 empty_requirements="$FIXTURE_DIR/empty-requirements.txt"
 : >"$empty_requirements"

@@ -610,6 +610,25 @@ prepare_pip_socks_support() {
   result=$site_dir
 }
 
+report_wheel_download_failure() {
+  local target_arch=$1
+  local python_version=$2
+  local abi=$3
+  shift 3
+  local platform_list
+
+  platform_list="$(IFS=,; printf '%s' "$*")"
+  printf '%s\n' \
+    'failed to download a complete binary wheel dependency set' \
+    "Target Python: $python_version" \
+    "Target ABI: $abi" \
+    "Target architecture: $target_arch" \
+    "Target platforms: $platform_list" \
+    "Package index: $PIP_MIRROR_URL" \
+    'Common causes: no compatible binary wheel for the target, conflicting version constraints, an additional package index is required, or the proxy/index is unreachable.' \
+    'The packager will not compile source distributions or fall back to the build host architecture.' >&2
+}
+
 reset_wheels_dir() {
   local wheels_dir=$1
   local parent
@@ -633,6 +652,8 @@ download_wheels() {
   local abi platform socks_site_dir=
   local -a pip_command=()
   local -a platform_args=()
+  local -a platform_names=()
+  local -a download_args=()
 
   reset_wheels_dir "$wheels_dir" || return
   if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
@@ -643,31 +664,35 @@ download_wheels() {
   prepare_pip_socks_support pip_command "$bootstrap_dir" socks_site_dir || return
   abi="$(python_abi "$python_version")" || return
   while IFS= read -r platform; do
-    [[ -n "$platform" ]] && platform_args+=(--platform "$platform")
+    if [[ -n "$platform" ]]; then
+      platform_names+=("$platform")
+      platform_args+=(--platform "$platform")
+    fi
   done < <(default_platforms "$target_arch")
 
+  download_args=(
+    download
+    --index-url "$PIP_MIRROR_URL"
+    --python-version "$python_version"
+    --implementation cp
+    --abi "$abi"
+    "${platform_args[@]}"
+    --only-binary=:all:
+    --requirement "$requirements"
+    --dest "$wheels_dir"
+  )
   if [[ -n "$socks_site_dir" ]]; then
     PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-      "${pip_command[@]}" download \
-        --index-url "$PIP_MIRROR_URL" \
-        --python-version "$python_version" \
-        --implementation cp \
-        --abi "$abi" \
-        "${platform_args[@]}" \
-        --only-binary=:all: \
-        --requirement "$requirements" \
-        --dest "$wheels_dir"
+      "${pip_command[@]}" "${download_args[@]}" && return 0
   else
-    "${pip_command[@]}" download \
-      --index-url "$PIP_MIRROR_URL" \
-      --python-version "$python_version" \
-      --implementation cp \
-      --abi "$abi" \
-      "${platform_args[@]}" \
-      --only-binary=:all: \
-      --requirement "$requirements" \
-      --dest "$wheels_dir"
+    "${pip_command[@]}" "${download_args[@]}" && return 0
   fi
+  report_wheel_download_failure \
+    "$target_arch" \
+    "$python_version" \
+    "$abi" \
+    "${platform_names[@]}"
+  return 1
 }
 
 target_triple() {
