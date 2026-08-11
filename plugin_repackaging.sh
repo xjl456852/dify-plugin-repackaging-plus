@@ -34,6 +34,11 @@ ACTIVE_OUTPUT_LOCK_FD=
 ACTIVE_OUTPUT_LOCK_PATH=
 ACTIVE_OUTPUT_LOCK_IDENTITY=
 ACTIVE_OUTPUT_LOCK_HELD=false
+ACTIVE_OUTPUT_LOCK_WAIT_FD=
+ACTIVE_OUTPUT_LOCK_WAIT_PID=
+ACTIVE_OUTPUT_LOCK_WAIT_STATE=idle
+ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
 TRACKED_TEMP_CREATION_STATE=idle
 TRACKED_TEMP_PENDING_SIGNAL=
 TRACKED_TEMP_PENDING_STATUS=
@@ -2752,7 +2757,12 @@ parent_descriptor = None
 directory_descriptor = None
 marker_descriptor = None
 created = False
+claimed = False
+published = False
+collision = False
+cleanup_allowed = False
 marker_name = None
+preparation_name = f"{prefix}preparation-{secrets.token_hex(16)}"
 try:
     basename = os.path.basename(path)
     if os.path.dirname(path) != parent or not basename.startswith(prefix):
@@ -2761,25 +2771,31 @@ try:
         parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     )
     try:
-        os.mkdir(basename, 0o700, dir_fd=parent_descriptor)
+        os.mkdir(preparation_name, 0o700, dir_fd=parent_descriptor)
     except FileExistsError:
         raise SystemExit(17)
     created = True
+    # TRACKED_TEMP_PREPARATION_DIRECTORY_CREATED
     directory_descriptor = os.open(
-        basename,
+        preparation_name,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
         dir_fd=parent_descriptor,
     )
     opened = os.fstat(directory_descriptor)
-    linked = os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
+    linked = os.stat(
+        preparation_name, dir_fd=parent_descriptor, follow_symlinks=False
+    )
     if (
         not stat.S_ISDIR(opened.st_mode)
         or opened.st_uid != os.geteuid()
         or not stat.S_ISDIR(linked.st_mode)
         or stat.S_ISLNK(linked.st_mode)
         or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(linked.st_mode)
+        or os.listdir(directory_descriptor)
     ):
         raise OSError
+    claimed = True
     marker_nonce = secrets.token_hex(16)
     marker_name = f".dify-owner-{marker_nonce}"
     marker_descriptor = os.open(
@@ -2793,11 +2809,73 @@ try:
     os.close(marker_descriptor)
     marker_descriptor = None
     os.fsync(directory_descriptor)
+    linked_after = os.stat(preparation_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (linked_after.st_dev, linked_after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise OSError
+    cleanup_allowed = True
+    try:
+        os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        collision = True
+        raise OSError
+    try:
+        os.rename(
+            preparation_name,
+            basename,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        if error.errno in (17, 39):
+            collision = True
+        raise
+    published = True
+    cleanup_allowed = False
+    os.close(directory_descriptor)
+    directory_descriptor = None
+    os.close(parent_descriptor)
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
     linked_after = os.stat(
         basename, dir_fd=parent_descriptor, follow_symlinks=False
     )
-    if (linked_after.st_dev, linked_after.st_ino) != (opened.st_dev, opened.st_ino):
+    directory_descriptor = os.open(
+        basename,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    reopened = os.fstat(directory_descriptor)
+    if (
+        (linked_after.st_dev, linked_after.st_ino) != (opened.st_dev, opened.st_ino)
+        or (reopened.st_dev, reopened.st_ino) != (opened.st_dev, opened.st_ino)
+        or reopened.st_uid != os.geteuid()
+        or not stat.S_ISDIR(reopened.st_mode)
+    ):
         raise OSError
+    marker_link = os.stat(
+        marker_name, dir_fd=directory_descriptor, follow_symlinks=False
+    )
+    marker_descriptor = os.open(
+        marker_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+    )
+    marker_opened = os.fstat(marker_descriptor)
+    if (
+        not stat.S_ISREG(marker_link.st_mode)
+        or stat.S_ISLNK(marker_link.st_mode)
+        or not stat.S_ISREG(marker_opened.st_mode)
+        or marker_opened.st_uid != os.geteuid()
+        or marker_opened.st_nlink != 1
+        or (marker_link.st_dev, marker_link.st_ino)
+        != (marker_opened.st_dev, marker_opened.st_ino)
+        or os.read(marker_descriptor, 128) != f"{marker_nonce}\n".encode()
+    ):
+        raise OSError
+    os.close(marker_descriptor)
+    marker_descriptor = None
+    cleanup_allowed = True
     print(
         f"{opened.st_dev}:{opened.st_ino}:{opened.st_uid}\t{marker_nonce}",
         flush=True,
@@ -2808,21 +2886,25 @@ except (OSError, ValueError):
     if marker_descriptor is not None:
         os.close(marker_descriptor)
         marker_descriptor = None
-    if created and directory_descriptor is not None and parent_descriptor is not None:
+    if cleanup_allowed and claimed and directory_descriptor is not None and parent_descriptor is not None:
         try:
             if marker_name is not None:
                 os.unlink(marker_name, dir_fd=directory_descriptor)
-            linked = os.stat(
-                os.path.basename(path),
+            cleanup_name = basename if published else preparation_name
+            linked_cleanup = os.stat(
+                cleanup_name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
             opened = os.fstat(directory_descriptor)
-            if (linked.st_dev, linked.st_ino) == (opened.st_dev, opened.st_ino):
-                os.rmdir(os.path.basename(path), dir_fd=parent_descriptor)
+            if (linked_cleanup.st_dev, linked_cleanup.st_ino) == (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                os.rmdir(cleanup_name, dir_fd=parent_descriptor)
         except OSError:
             pass
-    raise SystemExit(1)
+    raise SystemExit(17 if collision else 1)
 finally:
     if marker_descriptor is not None:
         os.close(marker_descriptor)
@@ -3352,6 +3434,27 @@ request_runtime_cancellation() {
     TRACKED_TEMP_PENDING_STATUS=$exit_status
     return 0
   fi
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=$signal_name
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=$exit_status
+  if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_STATE:-idle}" == starting ]]; then
+    return 0
+  fi
+  if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_STATE:-idle}" == active ]]; then
+    trap '' HUP INT TERM
+    if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+      kill -TERM "$ACTIVE_OUTPUT_LOCK_WAIT_PID" 2>/dev/null || true
+      wait "$ACTIVE_OUTPUT_LOCK_WAIT_PID" 2>/dev/null || true
+    fi
+    ACTIVE_OUTPUT_LOCK_WAIT_PID=
+    ACTIVE_OUTPUT_LOCK_WAIT_STATE=reaped
+    if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_FD:-}" =~ ^[0-9]+$ ]]; then
+      exec {ACTIVE_OUTPUT_LOCK_WAIT_FD}>&-
+    fi
+    ACTIVE_OUTPUT_LOCK_WAIT_FD=
+    exit "$exit_status"
+  fi
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
   case "${OUTPUT_PUBLICATION_STATE:-idle}" in
     committing | committed)
       OUTPUT_PUBLICATION_PENDING_SIGNAL=$signal_name
@@ -3392,6 +3495,22 @@ request_runtime_cancellation() {
   fi
   trap '' HUP INT TERM
   exit "$exit_status"
+}
+
+cleanup_output_lock_waiter() {
+  if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_STATE:-idle}" == active && \
+    "${ACTIVE_OUTPUT_LOCK_WAIT_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$ACTIVE_OUTPUT_LOCK_WAIT_PID" 2>/dev/null || true
+    wait "$ACTIVE_OUTPUT_LOCK_WAIT_PID" 2>/dev/null || true
+  fi
+  ACTIVE_OUTPUT_LOCK_WAIT_PID=
+  ACTIVE_OUTPUT_LOCK_WAIT_STATE=reaped
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
+  if [[ "${ACTIVE_OUTPUT_LOCK_WAIT_FD:-}" =~ ^[0-9]+$ ]]; then
+    exec {ACTIVE_OUTPUT_LOCK_WAIT_FD}>&-
+  fi
+  ACTIVE_OUTPUT_LOCK_WAIT_FD=
 }
 
 activate_runtime_child() {
@@ -4254,7 +4373,7 @@ PY
 
 acquire_output_lock() {
   local output=$1
-  local lock_record lock_path lock_identity lock_fd
+  local lock_record lock_path lock_identity lock_fd lock_wait_pid lock_wait_status
 
   [[ "${ACTIVE_OUTPUT_LOCK_HELD:-false}" == false && -z "${ACTIVE_OUTPUT_LOCK_FD:-}" ]] || {
     printf 'output publication lock is already active\n' >&2
@@ -4321,7 +4440,12 @@ PY
     printf 'unable to open the output publication lock\n' >&2
     return 1
   fi
-  if ! python3 -B - "$lock_fd" "$lock_path" "$lock_identity" <<'PY'
+  ACTIVE_OUTPUT_LOCK_WAIT_FD=$lock_fd
+  ACTIVE_OUTPUT_LOCK_WAIT_PID=
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
+  ACTIVE_OUTPUT_LOCK_WAIT_STATE=starting
+  python3 -B - "$lock_fd" "$lock_path" "$lock_identity" <<'PY' &
 import fcntl
 import os
 import stat
@@ -4355,12 +4479,31 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 PY
-  then
+  lock_wait_pid=$!
+  ACTIVE_OUTPUT_LOCK_WAIT_PID=$lock_wait_pid
+  ACTIVE_OUTPUT_LOCK_WAIT_STATE=active
+  if [[ -n "${ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL:-}" ]]; then
+    request_runtime_cancellation \
+      "$ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL" \
+      "$ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS"
+  fi
+  if wait "$lock_wait_pid"; then
+    lock_wait_status=0
+  else
+    lock_wait_status=$?
+  fi
+  ACTIVE_OUTPUT_LOCK_WAIT_PID=
+  ACTIVE_OUTPUT_LOCK_WAIT_STATE=reaped
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+  ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
+  if ((lock_wait_status != 0)); then
     exec {lock_fd}>&-
+    ACTIVE_OUTPUT_LOCK_WAIT_FD=
     printf 'unable to acquire a safe output publication lock\n' >&2
     return 1
   fi
   ACTIVE_OUTPUT_LOCK_FD=$lock_fd
+  ACTIVE_OUTPUT_LOCK_WAIT_FD=
   ACTIVE_OUTPUT_LOCK_PATH=$lock_path
   ACTIVE_OUTPUT_LOCK_IDENTITY=$lock_identity
   ACTIVE_OUTPUT_LOCK_HELD=true
@@ -4602,6 +4745,7 @@ output_non_publication_barrier() {
 cleanup_runtime() {
   local status=$?
 
+  cleanup_output_lock_waiter || status=$?
   if [[ "${OUTPUT_PUBLICATION_STATE:-idle}" == committed ]]; then
     release_output_lock || true
     cleanup_active_packager_workspace || true

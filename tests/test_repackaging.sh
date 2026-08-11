@@ -459,6 +459,147 @@ else
 fi
 rm -rf -- "$tracked_creation_path" "$tracked_creation_held" "$tracked_creation_parent"
 
+tracked_preparation_python="$FIXTURE_DIR/tracked-preparation-race.py"
+awk '
+  /^create_tracked_temp_dir\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /^[[:space:]]*created = True$/) {
+      print "    open(os.environ[\"DIFY_TEST_PREP_PATH\"], \"w\").write(os.path.join(parent, preparation_name))"
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$tracked_preparation_python"
+tracked_preparation_parent="$(mktemp -d -- /tmp/dify-tracked-preparation-parent.XXXXXXXX)"
+tracked_preparation_path="$tracked_preparation_parent/.dify-output.abcdef0123456789abcdef0123456789"
+tracked_preparation_held="$tracked_preparation_path.held"
+tracked_preparation_actual_path=$tracked_preparation_path
+tracked_preparation_ready="$FIXTURE_DIR/tracked-preparation-race.ready"
+tracked_preparation_go="$FIXTURE_DIR/tracked-preparation-race.go"
+tracked_preparation_path_record="$FIXTURE_DIR/tracked-preparation-race.path"
+tracked_preparation_status="$FIXTURE_DIR/tracked-preparation-race.status"
+tracked_preparation_stderr="$FIXTURE_DIR/tracked-preparation-race.stderr"
+(
+  if DIFY_TEST_PREP_PATH="$tracked_preparation_path_record" \
+    DIFY_TEST_RACE_READY="$tracked_preparation_ready" \
+    DIFY_TEST_RACE_GO="$tracked_preparation_go" \
+    python3 -B "$tracked_preparation_python" "$tracked_preparation_path" \
+      "$tracked_preparation_parent" .dify-output. 2>"$tracked_preparation_stderr"; then
+    tracked_preparation_exit=0
+  else
+    tracked_preparation_exit=$?
+  fi
+  printf '%s\n' "$tracked_preparation_exit" >"$tracked_preparation_status"
+) &
+tracked_preparation_pid=$!
+for _ in $(seq 1 200); do
+  [[ -e "$tracked_preparation_ready" && -s "$tracked_preparation_path_record" ]] && break
+  sleep 0.01
+done
+if [[ -e "$tracked_preparation_ready" && -s "$tracked_preparation_path_record" ]]; then
+  pass 'tracked temp preparation reaches the deterministic mkdir-to-open race barrier'
+  tracked_preparation_actual_path="$(<"$tracked_preparation_path_record")"
+  tracked_preparation_held="$tracked_preparation_actual_path.held"
+  mv -- "$tracked_preparation_actual_path" "$tracked_preparation_held"
+  mkdir -m 700 -- "$tracked_preparation_actual_path"
+  printf 'attacker preparation sentinel\n' >"$tracked_preparation_actual_path/sentinel"
+  : >"$tracked_preparation_go"
+else
+  fail 'tracked temp preparation reaches the deterministic mkdir-to-open race barrier'
+  kill "$tracked_preparation_pid" 2>/dev/null || true
+fi
+wait "$tracked_preparation_pid"
+assert_eq 1 "$(<"$tracked_preparation_status")" 'tracked temp preparation rejects a mkdir-to-open replacement'
+assert_eq 'attacker preparation sentinel' \
+  "$(<"$tracked_preparation_actual_path/sentinel")" \
+  'tracked temp preparation preserves replacement contents'
+assert_eq 0 "$(find "$tracked_preparation_actual_path" -maxdepth 1 -type f -name '.dify-owner-*' | wc -l)" \
+  'tracked temp preparation writes no marker into a replacement'
+assert_eq 0 "$(find "$tracked_preparation_held" -maxdepth 1 -type f -name '.dify-owner-*' | wc -l)" \
+  'rejected tracked temp preparation leaves no ownership marker behind'
+assert_file_not_contains "$tracked_preparation_stderr" 'Traceback' 'tracked temp preparation race has no helper traceback'
+rm -rf -- "$tracked_preparation_path" "$tracked_preparation_actual_path" \
+  "$tracked_preparation_held" "$tracked_preparation_parent"
+
+owned_cleanup_final_python="$FIXTURE_DIR/owned-temp-cleanup-final-race.py"
+awk '
+  /^remove_owned_temp_tree\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    if ($0 ~ /^[[:space:]]*os\.unlink\(marker_name, dir_fd=directory_descriptor\)$/) {
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+    print
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$owned_cleanup_final_python"
+owned_cleanup_final_parent="$(mktemp -d -- /tmp/dify-owned-cleanup-final-parent.XXXXXXXX)"
+owned_cleanup_final_workspace="$owned_cleanup_final_parent/.dify-output.abcdef0123456789abcdef0123456789"
+owned_cleanup_final_held="$owned_cleanup_final_workspace.held"
+owned_cleanup_final_ready="$FIXTURE_DIR/owned-cleanup-final-race.ready"
+owned_cleanup_final_go="$FIXTURE_DIR/owned-cleanup-final-race.go"
+owned_cleanup_final_status="$FIXTURE_DIR/owned-cleanup-final-race.status"
+owned_cleanup_final_stderr="$FIXTURE_DIR/owned-cleanup-final-race.stderr"
+owned_cleanup_final_nonce=abcdef0123456789abcdef0123456789
+owned_cleanup_final_replacement_identity='<missing>'
+mkdir -m 700 -- "$owned_cleanup_final_workspace"
+printf '%s\n' "$owned_cleanup_final_nonce" \
+  >"$owned_cleanup_final_workspace/.dify-owner-$owned_cleanup_final_nonce"
+owned_cleanup_final_identity="$(stat -c '%d:%i:%u' "$owned_cleanup_final_workspace")"
+(
+  if DIFY_TEST_RACE_READY="$owned_cleanup_final_ready" \
+    DIFY_TEST_RACE_GO="$owned_cleanup_final_go" \
+    python3 -B "$owned_cleanup_final_python" "$owned_cleanup_final_workspace" \
+      "$owned_cleanup_final_parent" .dify-output. "$owned_cleanup_final_identity" \
+      "$owned_cleanup_final_nonce" 2>"$owned_cleanup_final_stderr"; then
+    owned_cleanup_final_exit=0
+  else
+    owned_cleanup_final_exit=$?
+  fi
+  printf '%s\n' "$owned_cleanup_final_exit" >"$owned_cleanup_final_status"
+) &
+owned_cleanup_final_pid=$!
+for _ in $(seq 1 200); do
+  [[ -e "$owned_cleanup_final_ready" ]] && break
+  sleep 0.01
+done
+if [[ -e "$owned_cleanup_final_ready" ]]; then
+  pass 'tracked temp cleanup reaches the deterministic final-removal race barrier'
+  mv -- "$owned_cleanup_final_workspace" "$owned_cleanup_final_held"
+  mkdir -m 700 -- "$owned_cleanup_final_workspace"
+  printf '%s\n' "$owned_cleanup_final_nonce" \
+    >"$owned_cleanup_final_workspace/.dify-owner-$owned_cleanup_final_nonce"
+  printf 'attacker cleanup sentinel\n' >"$owned_cleanup_final_workspace/sentinel"
+  owned_cleanup_final_replacement_identity="$(stat -c '%d:%i' "$owned_cleanup_final_workspace")"
+  : >"$owned_cleanup_final_go"
+else
+  fail 'tracked temp cleanup reaches the deterministic final-removal race barrier'
+  kill "$owned_cleanup_final_pid" 2>/dev/null || true
+fi
+wait "$owned_cleanup_final_pid"
+assert_eq 1 "$(<"$owned_cleanup_final_status")" 'tracked temp cleanup rejects a final-removal replacement'
+if [[ -d "$owned_cleanup_final_workspace" && \
+  "$(stat -c '%d:%i' "$owned_cleanup_final_workspace")" == "$owned_cleanup_final_replacement_identity" ]]; then
+  pass 'tracked temp cleanup preserves a replacement directory at final removal'
+else
+  fail 'tracked temp cleanup preserves a replacement directory at final removal'
+fi
+assert_eq 'attacker cleanup sentinel' "$(<"$owned_cleanup_final_workspace/sentinel")" \
+  'tracked temp cleanup preserves a replacement sentinel at final removal'
+if [[ -f "$owned_cleanup_final_workspace/.dify-owner-$owned_cleanup_final_nonce" ]]; then
+  assert_eq "$owned_cleanup_final_nonce" \
+    "$(<"$owned_cleanup_final_workspace/.dify-owner-$owned_cleanup_final_nonce")" \
+    'tracked temp cleanup does not unlink a replacement marker at final removal'
+else
+  fail 'tracked temp cleanup does not unlink a replacement marker at final removal'
+fi
+assert_file_not_contains "$owned_cleanup_final_stderr" 'Traceback' 'tracked temp final-rmdir race has no helper traceback'
+rm -rf -- "$owned_cleanup_final_workspace" "$owned_cleanup_final_held" "$owned_cleanup_final_parent"
+
 publish_rollback_python="$FIXTURE_DIR/publish-rollback-race.py"
 awk '
   /^publish_output_archive\(\) \{/ { in_function = 1 }
@@ -574,6 +715,178 @@ if (
 else
   fail 'a later tool instance acquires the released output lock'
 fi
+
+lock_wait_output="$ROOT_DIR/publication-lock-wait-test-offline.difypkg"
+lock_wait_path="$(publication_lock_path "$lock_wait_output")"
+GENERATED_OUTPUT_LOCKS+=("$lock_wait_path")
+printf 'prior formal package\n' >"$lock_wait_output"
+lock_wait_output_sha="$(sha256sum "$lock_wait_output" | awk '{print $1}')"
+for lock_wait_case in HUP:129 INT:130 TERM:143; do
+  IFS=: read -r lock_wait_signal lock_wait_expected_status <<<"$lock_wait_case"
+  lock_wait_ready="$FIXTURE_DIR/publication-lock-wait-$lock_wait_signal.ready"
+  lock_wait_release="$FIXTURE_DIR/publication-lock-wait-$lock_wait_signal.release"
+  (
+    ACTIVE_OUTPUT_LOCK_FD=
+    ACTIVE_OUTPUT_LOCK_PATH=
+    ACTIVE_OUTPUT_LOCK_IDENTITY=
+    ACTIVE_OUTPUT_LOCK_HELD=false
+    acquire_output_lock "$lock_wait_output" || exit
+    : >"$lock_wait_ready"
+    while [[ ! -e "$lock_wait_release" ]]; do sleep 0.01; done
+    release_output_lock
+  ) &
+  lock_wait_holder=$!
+  for _ in $(seq 1 200); do
+    [[ -e "$lock_wait_ready" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$lock_wait_ready" ]]; then
+    fail "$lock_wait_signal output-lock holder reaches ready state"
+    kill "$lock_wait_holder" 2>/dev/null || true
+    wait "$lock_wait_holder" 2>/dev/null || true
+    continue
+  fi
+
+  python3 -B -c '
+import os
+import signal
+import sys
+
+for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signal_number, signal.SIG_DFL)
+os.execv("/bin/bash", ["bash", "-c", sys.argv[1], "_", *sys.argv[2:]])
+' '
+source "$1"
+ACTIVE_OUTPUT_LOCK_FD=
+ACTIVE_OUTPUT_LOCK_PATH=
+ACTIVE_OUTPUT_LOCK_IDENTITY=
+ACTIVE_OUTPUT_LOCK_HELD=false
+ACTIVE_OUTPUT_LOCK_WAIT_FD=
+ACTIVE_OUTPUT_LOCK_WAIT_PID=
+ACTIVE_OUTPUT_LOCK_WAIT_STATE=idle
+ACTIVE_OUTPUT_LOCK_WAIT_PENDING_SIGNAL=
+ACTIVE_OUTPUT_LOCK_WAIT_PENDING_STATUS=
+ACTIVE_STAGING_OWNED=false
+ACTIVE_OUTPUT_TEMP_DIR_OWNED=false
+ACTIVE_PACKAGER_WORKSPACE_OWNED=false
+OUTPUT_PUBLICATION_STATE=idle
+RUNTIME_CHILD_STATE=idle
+TRACKED_TEMP_CREATION_STATE=idle
+trap cleanup_runtime EXIT
+trap "request_runtime_cancellation HUP 129" HUP
+trap "request_runtime_cancellation INT 130" INT
+trap "request_runtime_cancellation TERM 143" TERM
+acquire_output_lock "$2"
+' "$ROOT_DIR/plugin_repackaging.sh" "$lock_wait_output" &
+  lock_wait_top=$!
+  lock_wait_child=
+  lock_wait_child_starttime=
+  for _ in $(seq 1 200); do
+    if [[ -r "/proc/$lock_wait_top/task/$lock_wait_top/children" ]]; then
+      for lock_wait_candidate in $(<"/proc/$lock_wait_top/task/$lock_wait_top/children"); do
+        lock_wait_candidate_args="$({ tr '\0' ' ' <"/proc/$lock_wait_candidate/cmdline"; } 2>/dev/null || true)"
+        if [[ "$lock_wait_candidate_args" == *"$lock_wait_path"* ]]; then
+          lock_wait_child=$lock_wait_candidate
+          lock_wait_child_starttime="$(awk '{print $22}' "/proc/$lock_wait_child/stat" 2>/dev/null || true)"
+          break 2
+        fi
+      done
+    fi
+    sleep 0.01
+  done
+  if [[ -n "$lock_wait_child" ]]; then
+    pass "$lock_wait_signal output-lock waiter is blocked in its supervised lock helper"
+  else
+    fail "$lock_wait_signal output-lock waiter is blocked in its supervised lock helper"
+  fi
+
+  kill -s "$lock_wait_signal" "$lock_wait_top" 2>/dev/null || true
+  lock_wait_prompt=false
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$lock_wait_top" 2>/dev/null; then
+      lock_wait_prompt=true
+      break
+    fi
+    sleep 0.01
+  done
+  if [[ "$lock_wait_prompt" == true ]]; then
+    pass "$lock_wait_signal promptly cancels a top-level tool waiting for the output lock"
+  else
+    fail "$lock_wait_signal promptly cancels a top-level tool waiting for the output lock"
+  fi
+  if kill -0 "$lock_wait_holder" 2>/dev/null; then
+    pass "$lock_wait_signal cancellation does not terminate the output-lock holder"
+  else
+    fail "$lock_wait_signal cancellation does not terminate the output-lock holder"
+  fi
+  if python3 -B - "$lock_wait_path" <<'PY'
+import fcntl
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(42)
+finally:
+    os.close(descriptor)
+PY
+  then
+    lock_wait_probe_status=0
+  else
+    lock_wait_probe_status=$?
+  fi
+  assert_eq 42 "$lock_wait_probe_status" \
+    "$lock_wait_signal cancellation leaves the original lock holder active"
+  assert_eq "$lock_wait_output_sha" "$(sha256sum "$lock_wait_output" | awk '{print $1}')" \
+    "$lock_wait_signal cancellation preserves the formal output while waiting"
+
+  : >"$lock_wait_release"
+  if wait "$lock_wait_top"; then
+    lock_wait_status=0
+  else
+    lock_wait_status=$?
+  fi
+  assert_eq "$lock_wait_expected_status" "$lock_wait_status" \
+    "$lock_wait_signal cancellation preserves the exact top-level status while waiting"
+  if wait "$lock_wait_holder"; then
+    pass "$lock_wait_signal output-lock holder releases normally after waiter cancellation"
+  else
+    fail "$lock_wait_signal output-lock holder releases normally after waiter cancellation"
+  fi
+  lock_wait_child_current_starttime=
+  if [[ -n "$lock_wait_child" && -r "/proc/$lock_wait_child/stat" ]]; then
+    lock_wait_child_current_starttime="$(awk '{print $22}' "/proc/$lock_wait_child/stat" 2>/dev/null || true)"
+  fi
+  if [[ -z "$lock_wait_child" || -z "$lock_wait_child_current_starttime" || \
+    "$lock_wait_child_current_starttime" != "$lock_wait_child_starttime" ]]; then
+    pass "$lock_wait_signal output-lock cancellation leaves no lock-helper descendant"
+  else
+    fail "$lock_wait_signal output-lock cancellation leaves no lock-helper descendant"
+  fi
+  if (
+    ACTIVE_OUTPUT_LOCK_FD=
+    ACTIVE_OUTPUT_LOCK_PATH=
+    ACTIVE_OUTPUT_LOCK_IDENTITY=
+    ACTIVE_OUTPUT_LOCK_HELD=false
+    acquire_output_lock "$lock_wait_output" && release_output_lock
+  ); then
+    pass "$lock_wait_signal output-lock cancellation leaks no inherited lock descriptor"
+  else
+    fail "$lock_wait_signal output-lock cancellation leaks no inherited lock descriptor"
+  fi
+  if ! find "$ROOT_DIR" -maxdepth 1 \
+      \( -name '.dify-output.*' -o -name '.dify-repackaging.*' \) -print -quit | grep -q .; then
+    pass "$lock_wait_signal output-lock cancellation leaves no repository temporary directory"
+  else
+    fail "$lock_wait_signal output-lock cancellation leaves no repository temporary directory"
+  fi
+done
+assert_eq "$lock_wait_output_sha" "$(sha256sum "$lock_wait_output" | awk '{print $1}')" \
+  'all output-lock wait cancellations preserve the prior formal package'
+rm -f -- "$lock_wait_output"
 
 foreign_repair_parent="$FIXTURE_DIR/foreign-owned-repair"
 foreign_repair_dir="$foreign_repair_parent/sdist-repair"
@@ -5547,6 +5860,9 @@ assert_file_contains "$ROOT_DIR/README.md" 'Bash 4.3+' 'README documents the nam
 assert_file_contains "$ROOT_DIR/README.md" 'double-fork' 'README documents full tool-process-tree supervision'
 assert_file_contains "$ROOT_DIR/README.md" '同文件系统硬链接' 'README documents the verified-inode publication requirement'
 assert_file_contains "$ROOT_DIR/README.md" '设备号、inode、大小' 'README documents the bound archive signature'
+assert_file_contains "$ROOT_DIR/README.md" '等待另一个实例释放该锁' 'README documents cancellable publication-lock waiting'
+assert_file_contains "$ROOT_DIR/README.md" 'mkdir` 不会原子返回' 'README documents the POSIX temporary-directory creation boundary'
+assert_file_contains "$ROOT_DIR/README.md" '同一 UID' 'README limits temporary-path guarantees against same-UID attackers'
 
 printf '%s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))
