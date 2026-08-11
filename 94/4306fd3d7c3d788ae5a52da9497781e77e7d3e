@@ -1,0 +1,35 @@
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_61ee32d960f354 165-170
+  s_c1a60985b94e3d::t_a4e7cf59a522d1 192-193
+  s_c1a60985b94e3d::t_a43a6dc7a01882 214-220
+  s_c1a60985b94e3d::t_efd08d0b1aad65 31-41,151-157,191,194
+  s_c33dcd76011975::t_9cb97d40d9e6e2 158,195
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_714f1890cd809f 97-100,132,136,194,199,214,221-222,234
+  s_c1a60985b94e3d::t_082d32cfde9d6d 13,43-44,46-49
+  s_c1a60985b94e3d::t_55a5a438481f72 160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "944306fd3d7c3d788ae5a52da9497781e77e7d3e",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    },
+    "s_c33dcd76011975": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbf99-11e9-7430-9d8e-ed7006a077ac",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
