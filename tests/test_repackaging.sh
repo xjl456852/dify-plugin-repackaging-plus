@@ -209,6 +209,27 @@ for safe_marker_requirement in network==1.0 proxy 'ssl>=1.0,<2' traceback; do
     "benign pip progress does not turn a package name into a failure marker: $safe_marker_requirement"
 done
 
+cat >"$missing_log" <<'EOF'
+Looking in indexes: https://mirrors.aliyun.com/pypi/simple
+Looking in links: /tmp/dify built wheels
+Collecting records~=0.6.0 (from -r /tmp/download-requirements.txt (line 2))
+  Using cached https://files.example/records-0.6.0-py2.py3-none-any.whl.metadata (7.0 kB)
+Collecting network==1.0 (from records~=0.6.0)
+  Downloading https://files.example/network-1.0-py3-none-any.whl.metadata (2.1 kB)
+Collecting proxy (from records~=0.6.0)
+  Downloading proxy-1.0-py3-none-any.whl (10 kB)
+Collecting ssl>=1.0,<2 (from records~=0.6.0)
+  Using cached ssl-1.5-py3-none-any.whl (12 kB)
+Collecting traceback (from records~=0.6.0)
+  Downloading traceback-1.0-py3-none-any.whl (25 kB)
+INFO: pip is looking at multiple versions of records to determine which version is compatible with other requirements. This could take a while.
+  Downloading yarl-1.24.5-cp312-cp312-manylinux2014_aarch64.whl (107 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 107.6/107.6 kB 2.8 MB/s eta 0:00:00
+ERROR: Could not find a version that satisfies the requirement docopt (from records) (from versions: none)
+ERROR: No matching distribution found for docopt
+EOF
+assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'realistic benign resolver progress still classifies docopt'
+
 for unsafe_failure_marker in \
   'ProxyError' \
   'NameResolutionError' \
@@ -217,6 +238,13 @@ for unsafe_failure_marker in \
   'No route to host' \
   'HTTP Error 407.' \
   'Access denied.' \
+  'Temporary failure in name resolution.' \
+  'Cannot connect to proxy.' \
+  'TLS handshake error.' \
+  'certificate has expired.' \
+  'Dependency resolution failed.' \
+  'version conflict detected.' \
+  'UNEXPECTED-DIAGNOSTIC-SENTINEL' \
   'ConnectTimeoutError' \
   'ReadTimeoutError' \
   'connection refused' \
@@ -239,6 +267,14 @@ for unsafe_failure_marker in \
     pass "missing-wheel classification rejects $unsafe_failure_marker"
   fi
 done
+
+write_missing_wheel_log "$missing_log" docopt
+printf '\v\n' >>"$missing_log"
+if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+  fail 'control-only unknown diagnostics fail closed'
+else
+  pass 'control-only unknown diagnostics fail closed'
+fi
 
 write_missing_wheel_log "$missing_log" docopt click
 if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
@@ -464,6 +500,7 @@ else
   fail 'one-shot wheel download accepts a local built-wheel directory'
 fi
 assert_file_contains "$PIP_ARGS_LOG" '--only-binary=:all:' 'one-shot wheel download keeps binary-only policy'
+assert_file_contains "$PIP_ARGS_LOG" '--disable-pip-version-check' 'one-shot wheel download suppresses unrelated pip update warnings'
 assert_eq 1 "$(grep -Fxc -- '--index-url' "$PIP_ARGS_LOG")" 'one-shot wheel download passes one index option'
 assert_eq 1 "$(grep -Fxc -- 'https://target-index.example/simple' "$PIP_ARGS_LOG")" 'one-shot wheel download passes the exact configured index'
 assert_file_contains "$PIP_ARGS_LOG" '--python-version' 'one-shot wheel download keeps target Python'

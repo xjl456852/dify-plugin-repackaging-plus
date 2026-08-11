@@ -241,37 +241,29 @@ for match in sorted(
 diagnostic_parts.append(log[cursor:])
 diagnostics = "".join(diagnostic_parts)
 
-unsafe_failure_patterns = (
-    r"\bproxyerror\b",
-    r"\bproxy[\s_-]+(?:authentication|connection|error|failure|failed)\b",
-    r"\bnetwork(?:error|[\s_-]+(?:error|failure|failed|unreachable))\b",
-    r"\b(?:connecterror|(?:new)?connectionerror)\b",
-    r"\bconnection[\s_-]+(?:aborted|failed|refused|reset|unreachable)\b",
-    r"\b(?:(?:connect|read)?timeouterror|timeout|timed\s+out)\b",
-    r"\b(?:ssl|tls)error\b",
-    r"\b(?:ssl|tls)[\s_-]+(?:connection|handshake).{0,80}\bfailed\b",
-    r"certificate(?:_|[\s-])+verify(?:_|[\s-])+failed",
-    r"name[\s._-]*resolution[\s._-]*error",
-    r"name\s+or\s+service\s+not\s+known",
-    r"could\s+not\s+resolve(?:\s+the)?\s+host",
-    r"no\s+route\s+to\s+host",
-    r"http\s*(?:error|status)?\s*[:#-]?\s*(?:401|403|407)\b",
-    r"access[\s_-]+denied",
-    r"\b(?:authentication|authorization|unauthorized|forbidden|credentials?)\b",
-    r"(?m)^\s*traceback\s*\(",
-    r"\bresolutionimpossible\b",
-    r"\bdependency[\s_-]+conflict\b",
-    r"\bconflicting[\s_-]+dependencies\b",
-    r"cannot install .+ because these package versions have conflicting dependencies",
-    r"packages do not match the hashes",
-    r"hash(?:es)? (?:are required|mismatch|do not match|failed)",
-    r"\bhashmismatch\b",
-    r"error sending request",
-    r"could not fetch url",
-    r"max retries exceeded",
-)
-if any(re.search(pattern, diagnostics, re.IGNORECASE) for pattern in unsafe_failure_patterns):
+benign_progress_patterns = tuple(re.compile(pattern) for pattern in (
+    r"Looking in indexes: \S+(?:,[ \t]+\S+)*",
+    r"Looking in links: .+",
+    r"Collecting .+",
+    r"(?:Using cached|Downloading|Processing) .+",
+    r"INFO: pip (?:is|is still) looking at multiple versions of .+",
+    r"INFO: This is taking longer than usual\..+",
+    r"(?:[━█▉▊▋▌▍▎▏#=><.\-]+[ \t]+)?"
+    r"\d+(?:\.\d+)?/\d+(?:\.\d+)?[ \t]+(?:bytes|kB|MB|GB)"
+    r"(?:[ \t]+\d+(?:\.\d+)?[ \t]+(?:kB|MB|GB)/s)?"
+    r"(?:[ \t]+(?:eta[ \t]+)?(?:\d+:\d+(?::\d+)?|-:--:--))?",
+))
+if any(
+    ord(character) < 32 and character not in "\n\t\r"
+    for character in diagnostics
+) or "\x7f" in diagnostics:
     raise SystemExit(1)
+for diagnostic_line in diagnostics.splitlines():
+    if not diagnostic_line.strip(" \t\r"):
+        continue
+    diagnostic_line = diagnostic_line.strip(" \t\r")
+    if not any(pattern.fullmatch(diagnostic_line) for pattern in benign_progress_patterns):
+        raise SystemExit(1)
 
 dependency_context = re.compile(r"\s+\(from [^()\r\n]+\)\s*$", re.IGNORECASE)
 requirement_pattern = re.compile(
@@ -942,6 +934,7 @@ download_wheels_once() {
 
   download_args=(
     download
+    --disable-pip-version-check
     --index-url "$PIP_MIRROR_URL"
     "${local_wheel_args[@]}"
     --python-version "$python_version"
