@@ -125,6 +125,8 @@ manifest、`.python-version` 或覆盖变量可以写 `3.12` 或 `3.12.7`；脚�
 
 这个过程不会修改系统 Python、虚拟环境或 Conda 环境。没有 SOCKS 代理，或者 pip 已经支持 SOCKS 时，继续原来的下载路径，不创建 bootstrap 目录。
 
+部分新版 pip 的 truststore 适配器会错误地把 `proxy_ssl_context` 传给 SOCKS 连接池，表现为 `PoolKey ... key_proxy_ssl_context`。脚本仅在首次下载精确命中该错误时，自动使用 pip 的 `legacy-certs` 兼容模式重试一次；普通下载和其他失败不会触发该回退。
+
 如需禁止自动补齐并在缺少 PySocks 时直接失败：
 
 ```bash

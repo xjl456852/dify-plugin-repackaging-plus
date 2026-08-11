@@ -649,7 +649,7 @@ download_wheels() {
   local target_arch=$3
   local python_version=$4
   local bootstrap_dir=${5:-"$(dirname "$wheels_dir")/.pip-bootstrap"}
-  local abi platform socks_site_dir=
+  local abi platform socks_site_dir= pip_error_log=
   local -a pip_command=()
   local -a platform_args=()
   local -a platform_names=()
@@ -682,8 +682,25 @@ download_wheels() {
     --dest "$wheels_dir"
   )
   if [[ -n "$socks_site_dir" ]]; then
-    PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-      "${pip_command[@]}" "${download_args[@]}" && return 0
+    pip_error_log="$bootstrap_dir/pip-download.stderr"
+    if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+      "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
+      cat "$pip_error_log" >&2
+      rm -f -- "$pip_error_log"
+      return 0
+    fi
+    cat "$pip_error_log" >&2
+    if grep -Fq 'key_proxy_ssl_context' "$pip_error_log"; then
+      printf '%s\n' \
+        'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
+      if PIP_USE_DEPRECATED=legacy-certs \
+        PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+        "${pip_command[@]}" "${download_args[@]}"; then
+        rm -f -- "$pip_error_log"
+        return 0
+      fi
+    fi
+    rm -f -- "$pip_error_log"
   else
     "${pip_command[@]}" "${download_args[@]}" && return 0
   fi

@@ -179,6 +179,7 @@ Extend fake pip so it distinguishes `show PySocks`, local `install`, and `downlo
 - no SOCKS proxy: no `show`, curl, or bootstrap install;
 - SOCKS plus successful `show PySocks`: no curl or bootstrap install;
 - SOCKS plus missing PySocks: fetch simple page, select `PySocks-1.7.1-py3-none-any.whl`, install with `--no-index --no-deps --target`, and run download with the target directory in `PYTHONPATH`;
+- a first download failure containing `key_proxy_ssl_context`: preserve the original stderr and retry exactly once with `PIP_USE_DEPRECATED=legacy-certs`;
 - `DIFY_AUTO_FIX_SOCKS=0`: fail before curl with a precise PySocks message;
 - missing wheel link, curl failure, checksum mismatch, and local install failure: return nonzero without invoking the final dependency download.
 

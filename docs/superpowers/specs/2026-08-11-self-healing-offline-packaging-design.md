@@ -30,7 +30,8 @@
 3. 将 wheel 下载到 staging 下独立的 bootstrap 目录；若索引提供 SHA-256 fragment，则下载后校验摘要。
 4. 使用已解析的 pip 命令执行本地、无索引、无依赖的 `--target` 安装。该命令临时移除六个代理环境变量，确保安装过程不会尝试联网。
 5. 仅在随后执行 `pip download` 时把 bootstrap 目录加入 `PYTHONPATH`，使 pip 的 SOCKS 适配器可以导入 `socks`。
-6. 构建成功或失败后均由既有 staging 清理机制删除 bootstrap 文件。
+6. 如果 pip truststore 与 SOCKS 连接池组合精确报出 `key_proxy_ssl_context`，保留首次错误并使用 `PIP_USE_DEPRECATED=legacy-certs` 重试一次。其他错误不触发该兼容回退。
+7. 构建成功或失败后均由既有 staging 清理机制删除 bootstrap 文件。
 
 如果 simple 索引中没有兼容 wheel、curl 下载失败、摘要不匹配或本地安装失败，脚本停止并输出一条聚焦的错误信息，说明自动补齐 PySocks 失败以及使用的镜像地址。不会回退直连，也不会修改用户环境。
 
@@ -79,6 +80,7 @@ Python 版本按下列优先级确定：
 - 无 SOCKS 代理时不执行 PySocks 检查、curl 或 bootstrap。
 - SOCKS 代理存在且 PySocks 已可用时直接下载。
 - SOCKS 代理存在且 PySocks 缺失时，从假 simple 索引下载 wheel、执行本地 target 安装，并通过临时 `PYTHONPATH` 完成下载。
+- pip 首次报 `key_proxy_ssl_context` 时只重试一次 legacy-certs，其他错误不重试。
 - 自动修复关闭、索引缺少 wheel、下载失败和本地安装失败时明确返回非零状态。
 - 大小写代理变量和四种 SOCKS scheme 均可识别，普通 HTTP 代理不触发自愈。
 - manifest runner 版本优先于 `.python-version` 与 pyproject，显式覆盖仍具有最高优先级。

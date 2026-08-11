@@ -367,6 +367,11 @@ case "${1:-}" in
     printf '# temporary test module\n' >"$target/socks.py"
     ;;
   download)
+    if [[ "${FAKE_PIP_SOCKS_TLS_BUG:-0}" == 1 && "${PIP_USE_DEPRECATED:-}" != legacy-certs ]]; then
+      printf '%s\n' \
+        "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" >&2
+      exit 86
+    fi
     printf '%s\n' "${PYTHONPATH:-}" >"$SOCKS_PYTHONPATH_LOG"
     while (($#)); do
       if [[ "$1" == --dest ]]; then
@@ -460,6 +465,31 @@ if [[ -f "$SOCKS_PYTHONPATH_LOG" ]]; then
 else
   fail 'dependency download receives temporary PySocks PYTHONPATH'
 fi
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+tls_bug_case_dir="$FIXTURE_DIR/socks-tls-context-case"
+mkdir -p "$tls_bug_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_PIP_SOCKS_TLS_BUG=1 \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$FIXTURE_DIR/pysocks-simple.html" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$tls_bug_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$tls_bug_case_dir/pip-bootstrap" \
+    >"$tls_bug_case_dir/output.log" 2>&1; then
+  pass 'pip SOCKS proxy SSL context bug is retried automatically'
+else
+  fail 'pip SOCKS proxy SSL context bug is retried automatically'
+fi
+assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'SOCKS proxy SSL context workaround retries exactly once'
+assert_file_contains "$tls_bug_case_dir/output.log" 'legacy-certs' 'SOCKS proxy SSL context retry is explained'
 
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
