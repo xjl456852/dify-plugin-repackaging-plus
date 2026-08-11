@@ -147,6 +147,7 @@ fi
 FIXTURE_DIR="$(mktemp -d /tmp/dify-repackaging-tests.XXXXXX)"
 GENERATED_TEST_OUTPUT=
 GENERATED_REMOTE_FILES=()
+GENERATED_ROOT_TEST_DIRS=()
 
 cleanup_test_files() {
   rm -rf -- "$FIXTURE_DIR"
@@ -158,6 +159,17 @@ cleanup_test_files() {
     case "$generated_remote_file" in
       "$ROOT_DIR"/repackaging-test-*)
         rm -f -- "$generated_remote_file"
+        ;;
+    esac
+  done
+  local generated_root_test_dir
+  for generated_root_test_dir in "${GENERATED_ROOT_TEST_DIRS[@]}"; do
+    case "$generated_root_test_dir" in
+      "$ROOT_DIR"/.coordinator-drvfs-test.*)
+        if [[ -d "$generated_root_test_dir" && ! -L "$generated_root_test_dir" && \
+          "$(realpath -e -- "$generated_root_test_dir")" == "$generated_root_test_dir" ]]; then
+          rm -rf -- "$generated_root_test_dir"
+        fi
         ;;
     esac
   done
@@ -710,6 +722,51 @@ if extract_missing_requirement "$download_once_log" >/dev/null 2>&1; then
 else
   pass 'pre-pip failure cannot leave stale classifiable output'
 fi
+
+bounded_log_victim="$download_once_case_dir/bounded-log-victim.txt"
+bounded_log_symlink="$download_once_case_dir/bounded-log-symlink.log"
+printf 'victim-must-remain-unchanged\n' >"$bounded_log_victim"
+ln -s -- "$bounded_log_victim" "$bounded_log_symlink"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$bounded_log_symlink" \
+    '' \
+    '' \
+    true \
+    false \
+    >/dev/null 2>&1; then
+  fail 'bounded one-shot capture rejects a swapped symlink log path'
+else
+  pass 'bounded one-shot capture rejects a swapped symlink log path'
+fi
+assert_eq 'victim-must-remain-unchanged' "$(<"$bounded_log_victim")" 'bounded capture never truncates a symlink victim'
+
+bounded_hardlink_victim="$download_once_case_dir/bounded-hardlink-victim.txt"
+bounded_hardlink_log="$download_once_case_dir/bounded-hardlink.log"
+printf 'hardlink-victim-must-remain-unchanged\n' >"$bounded_hardlink_victim"
+chmod 600 -- "$bounded_hardlink_victim"
+ln -- "$bounded_hardlink_victim" "$bounded_hardlink_log"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$bounded_hardlink_log" \
+    '' \
+    '' \
+    true \
+    false \
+    >/dev/null 2>&1; then
+  fail 'bounded one-shot capture rejects a hard-linked log path'
+else
+  pass 'bounded one-shot capture rejects a hard-linked log path'
+fi
+assert_eq 'hardlink-victim-must-remain-unchanged' "$(<"$bounded_hardlink_victim")" 'bounded capture never truncates a hardlink victim'
 
 set +e
 sdist_repair_fixture_dir="$FIXTURE_DIR/sdist-repair-fixtures"
@@ -2065,10 +2122,11 @@ if [[ "$is_strict" == true ]]; then
         printf 'BUILT:%s\n' "$(basename -- "$wheel")"
       done < <(find "$find_links" -maxdepth 1 -type f -name '*.whl' -print | sort)
     fi
-    log_dir="$(find "$(dirname -- "$dest")" -maxdepth 1 -type d -name '.pip-coordinator.*' -print -quit)"
-    if [[ -n "$log_dir" ]]; then
-      printf 'LOGPARENTMODE:%s\n' "$(stat -c '%a' "$log_dir")"
-      log_file="$(find "$log_dir" -maxdepth 1 -type f -name '*.log' -print -quit)"
+    coordinator_workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" -name 'dify-plugin-coordinator.*' -print -quit)"
+    if [[ -n "$coordinator_workspace" ]]; then
+      printf 'WORKSPACE:%s\n' "$coordinator_workspace"
+      printf 'LOGPARENTMODE:%s\n' "$(stat -c '%a' "$coordinator_workspace")"
+      log_file="$(find "$coordinator_workspace" -maxdepth 1 -type f -name '*.log' -print -quit)"
       [[ -n "$log_file" ]] && printf 'LOGMODE:%s\n' "$(stat -c '%a' "$log_file")"
     fi
   } >>"$COORDINATOR_STRICT_ARGS_LOG"
@@ -2241,6 +2299,35 @@ run_dynamic_coordinator() {
       "$DYNAMIC_REQUIREMENTS" "$DYNAMIC_WHEELS" aarch64 3.12 '' "$DYNAMIC_REPAIR_DIR"
 }
 
+run_dynamic_coordinator_default() {
+  PIP_MIRROR_URL="${COORDINATOR_INDEX_URL:-https://target-index.example/simple}" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator-dynamic" \
+    DIFY_UV_COMMAND="$fake_bin/uv-repair-coordinator-dynamic" \
+    without_proxy_environment download_wheels \
+      "$DYNAMIC_REQUIREMENTS" "$DYNAMIC_WHEELS" aarch64 3.12 ''
+}
+
+assert_recorded_coordinator_workspaces_removed() {
+  local record_file=$1
+  local name=$2
+  local workspace found=false
+
+  while IFS= read -r workspace; do
+    [[ -n "$workspace" ]] || continue
+    found=true
+    if [[ "$workspace" == /tmp/dify-plugin-coordinator.* && ! -e "$workspace" ]]; then
+      continue
+    fi
+    fail "$name"
+    return
+  done < <(sed -n 's/^WORKSPACE://p' "$record_file" | sort -u)
+  if [[ "$found" == true ]]; then
+    pass "$name"
+  else
+    fail "$name (no secure workspace was observed)"
+  fi
+}
+
 prepare_dynamic_coordinator_case two-candidates alpha beta SUCCESS
 if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
   pass 'coordinator repairs two distinct pure Python candidates'
@@ -2273,7 +2360,7 @@ for candidate_number in $(seq -w 1 17); do
   limit_candidates+=("pkg$candidate_number")
 done
 prepare_dynamic_coordinator_case repair-limit "${limit_candidates[@]}"
-if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+if run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
   fail 'seventeenth candidate reaches the bounded repair limit'
 else
   pass 'seventeenth candidate reaches the bounded repair limit'
@@ -2283,10 +2370,14 @@ assert_eq 16 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'repair limit 
 assert_eq 16 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'repair limit permits only sixteen builds'
 assert_file_contains "$DYNAMIC_OUTPUT" 'pure Python sdist repair limit reached: 16' 'repair limit diagnostic is explicit'
 assert_file_not_contains "$COORDINATOR_SOURCE_ARGS_LOG" 'REQUIREMENT:pkg17' 'seventeenth candidate is never downloaded as source'
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'default repair staging is removed after the sixteen-candidate limit'
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'sixteen-candidate default repair removes its secure workspace'
 
 for disabled_value in 0 false FALSE no NO; do
   prepare_dynamic_coordinator_case "disabled-$disabled_value" docopt
-  if DIFY_AUTO_BUILD_PURE_SDIST="$disabled_value" run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+  if DIFY_AUTO_BUILD_PURE_SDIST="$disabled_value" run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
     fail "automatic pure repair disabled value fails safely: $disabled_value"
   else
     pass "automatic pure repair disabled value fails safely: $disabled_value"
@@ -2296,10 +2387,13 @@ for disabled_value in 0 false FALSE no NO; do
   assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "disabled value invokes no uv: $disabled_value"
   assert_file_missing "$DYNAMIC_REPAIR_DIR" "disabled value creates no repair staging: $disabled_value"
   assert_file_contains "$DYNAMIC_OUTPUT" 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.' "disabled value reports its switch: $disabled_value"
+  assert_recorded_coordinator_workspaces_removed \
+    "$COORDINATOR_STRICT_ARGS_LOG" \
+    "disabled default repair removes its secure workspace: $disabled_value"
 done
 
 prepare_dynamic_coordinator_case normal-success SUCCESS
-if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+if run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
   pass 'normal binary-only success preserves the one-pass path'
 else
   fail 'normal binary-only success preserves the one-pass path'
@@ -2308,14 +2402,21 @@ assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'normal success
 assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'normal success downloads no source'
 assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'normal success invokes no uv'
 assert_file_missing "$DYNAMIC_REPAIR_DIR" 'normal success creates no repair directory'
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'normal success removes its secure coordinator workspace'
 
 prepare_dynamic_coordinator_case default-repair-dir docopt SUCCESS
 uv_space_dir="$FIXTURE_DIR/coordinator tools with spaces"
 uv_space_command="$uv_space_dir/uv dynamic"
+untrusted_tmpdir="$DYNAMIC_CASE_DIR/untrusted-tmp"
 mkdir -p -- "$uv_space_dir"
+mkdir -p -- "$untrusted_tmpdir"
+chmod 777 -- "$untrusted_tmpdir"
 cp -- "$fake_bin/uv-repair-coordinator-dynamic" "$uv_space_command"
 chmod +x "$uv_space_command"
-if PIP_MIRROR_URL='https://target-index.example/simple' \
+if TMPDIR="$untrusted_tmpdir" \
+  PIP_MIRROR_URL='https://target-index.example/simple' \
   DIFY_PIP_COMMAND="$fake_bin/pip-repair-coordinator-dynamic" \
   DIFY_UV_COMMAND="$uv_space_command" \
   without_proxy_environment download_wheels \
@@ -2327,17 +2428,74 @@ else
 fi
 assert_eq 2 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'default repair directory performs a complete retry'
 assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'exact configured uv command is invoked once'
-if [[ -f "$DYNAMIC_REPAIR_DIR/built-wheels/docopt-1.0-py3-none-any.whl" ]]; then
-  pass 'omitted sixth argument defaults to sibling sdist-repair staging'
+if grep -Eq '^ARG:/tmp/dify-plugin-coordinator\.[^/]+/sdist-repair/candidate-1/source$' "$COORDINATOR_SOURCE_ARGS_LOG"; then
+  pass 'omitted sixth argument stages repair below the secure coordinator workspace'
 else
-  fail 'omitted sixth argument defaults to sibling sdist-repair staging'
+  fail 'omitted sixth argument stages repair below the secure coordinator workspace'
+fi
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'default repair directory is not created beside the wheelhouse'
+default_workspace="$(sed -n 's/^WORKSPACE://p' "$COORDINATOR_STRICT_ARGS_LOG" | head -n1)"
+if [[ "$default_workspace" == /tmp/dify-plugin-coordinator.* && ! -e "$default_workspace" ]]; then
+  pass 'successful default repair removes its secure coordinator workspace'
+else
+  fail 'successful default repair removes its secure coordinator workspace'
+fi
+if [[ "$default_workspace" != "$untrusted_tmpdir"/* ]]; then
+  pass 'coordinator workspace ignores untrusted TMPDIR'
+else
+  fail 'coordinator workspace ignores untrusted TMPDIR'
 fi
 
+prepare_dynamic_coordinator_case production-filesystem docopt SUCCESS
+drvfs_case_dir="$ROOT_DIR/.coordinator-drvfs-test.$BASHPID"
+GENERATED_ROOT_TEST_DIRS+=("$drvfs_case_dir")
+mkdir -p -- "$drvfs_case_dir/wheels"
+printf 'runtime-dependency\n' >"$drvfs_case_dir/requirements.txt"
+touch -- "$drvfs_case_dir/mode-probe"
+chmod 600 -- "$drvfs_case_dir/mode-probe"
+drvfs_probe_mode="$(stat -c '%a' "$drvfs_case_dir/mode-probe")"
+if [[ "$drvfs_probe_mode" != 600 ]]; then
+  pass "production filesystem reproduces non-POSIX chmod semantics: mode $drvfs_probe_mode"
+else
+  chmod 777 -- "$drvfs_case_dir" "$drvfs_case_dir/wheels" "$drvfs_case_dir/requirements.txt" "$drvfs_case_dir/mode-probe"
+  pass 'production-filesystem fallback seam forces permissive wheelhouse permissions'
+fi
+DYNAMIC_WHEELS="$drvfs_case_dir/wheels"
+DYNAMIC_REQUIREMENTS="$drvfs_case_dir/requirements.txt"
+DYNAMIC_REPAIR_DIR="$drvfs_case_dir/sdist-repair"
+if run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'default coordinator repair succeeds with requirements and wheels on the production filesystem'
+else
+  fail 'default coordinator repair succeeds with requirements and wheels on the production filesystem'
+  sed 's/^/# production filesystem: /' "$DYNAMIC_OUTPUT"
+fi
+if [[ -f "$DYNAMIC_WHEELS/docopt-1.0-py3-none-any.whl" && \
+  -f "$DYNAMIC_WHEELS/runtime-1.0-py3-none-any.whl" ]]; then
+  pass 'final repaired wheelhouse lands on the production filesystem'
+else
+  fail 'final repaired wheelhouse lands on the production filesystem'
+fi
+assert_file_missing "$DYNAMIC_REPAIR_DIR" 'default repair staging never uses the permissive production filesystem'
+assert_eq 0 "$(find "$drvfs_case_dir" -maxdepth 1 -type d -name '.pip-coordinator.*' | wc -l)" 'raw coordinator logs never use the permissive production filesystem'
+assert_eq 0 "$(grep '^LOGPARENTMODE:' "$COORDINATOR_STRICT_ARGS_LOG" | grep -vc '^LOGPARENTMODE:700$' || true)" 'production-filesystem coordinator workspace is mode 0700 while pip runs'
+assert_eq 0 "$(grep '^LOGMODE:' "$COORDINATOR_STRICT_ARGS_LOG" | grep -vc '^LOGMODE:600$' || true)" 'production-filesystem coordinator logs are mode 0600 while pip runs'
+if grep -Eq '^ARG:/tmp/dify-plugin-coordinator\.[^/]+/sdist-repair/candidate-1/source$' "$COORDINATOR_SOURCE_ARGS_LOG"; then
+  pass 'production-filesystem default repair source staging remains below /tmp'
+else
+  fail 'production-filesystem default repair source staging remains below /tmp'
+fi
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'production-filesystem repair removes its secure coordinator workspace'
+
 prepare_dynamic_coordinator_case log-setup-failure SUCCESS
+export COORDINATOR_SETUP_WORKSPACE_MARKER="$DYNAMIC_CASE_DIR/setup-workspace.path"
 if (
   mktemp() {
     if [[ "${1:-}" == -d ]]; then
-      command mktemp "$@"
+      coordinator_setup_workspace="$(command mktemp "$@")" || return
+      printf '%s\n' "$coordinator_setup_workspace" >"$COORDINATOR_SETUP_WORKSPACE_MARKER"
+      printf '%s\n' "$coordinator_setup_workspace"
     else
       return 70
     fi
@@ -2348,7 +2506,12 @@ if (
 else
   pass 'coordinator log-file setup failure stops safely'
 fi
-assert_eq 0 "$(find "$DYNAMIC_CASE_DIR" -maxdepth 1 -type d -name '.pip-coordinator.*' | wc -l)" 'coordinator cleans its private directory when log-file setup fails'
+setup_failure_workspace="$(<"$COORDINATOR_SETUP_WORKSPACE_MARKER")"
+if [[ "$setup_failure_workspace" == /tmp/dify-plugin-coordinator.* && ! -e "$setup_failure_workspace" ]]; then
+  pass 'coordinator cleans its secure workspace when log-file setup fails'
+else
+  fail 'coordinator cleans its secure workspace when log-file setup fails'
+fi
 
 prepare_dynamic_coordinator_case empty-requirements docopt
 : >"$DYNAMIC_REQUIREMENTS"
@@ -2484,11 +2647,11 @@ assert_eq 1 "$(grep -c '^Strict wheel-resolution diagnostics:$' "$DYNAMIC_OUTPUT
 assert_eq 1 "$(grep -c 'Could not find a version that satisfies the requirement docopt' "$DYNAMIC_OUTPUT")" 'identical raw resolver diagnostics are displayed only once'
 assert_eq 1 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'identical repeated candidate is built only once'
 
-for cancellation_status in 124 125 130 143; do
+for cancellation_status in 124 125 129 130 143; do
   prepare_dynamic_coordinator_case "cancel-$cancellation_status" docopt
   if (
     repair_one_pure_sdist() { return "$cancellation_status"; }
-    run_dynamic_coordinator
+    run_dynamic_coordinator_default
   ) >"$DYNAMIC_OUTPUT" 2>&1; then
     observed_cancellation_status=0
   else
@@ -2499,7 +2662,32 @@ for cancellation_status in 124 125 130 143; do
   assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" "Task3 cancellation fixture downloads no source: $cancellation_status"
   assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" "Task3 cancellation fixture invokes no uv: $cancellation_status"
   assert_file_missing "$DYNAMIC_REPAIR_DIR/.repair-lock" "Task3 cancellation leaves no repair lock: $cancellation_status"
+  assert_recorded_coordinator_workspaces_removed \
+    "$COORDINATOR_STRICT_ARGS_LOG" \
+    "Task3 cancellation removes the default secure workspace: $cancellation_status"
 done
+
+prepare_dynamic_coordinator_case cancel-mutated-workspace docopt
+if (
+  repair_one_pure_sdist() {
+    mutated_workspace="$(dirname -- "$6")"
+    mkdir -p -- "$mutated_workspace/unreadable/nested"
+    printf 'cleanup sentinel\n' >"$mutated_workspace/unreadable/nested/file"
+    chmod 000 -- "$mutated_workspace/unreadable"
+    chmod 755 -- "$mutated_workspace"
+    return 129
+  }
+  run_dynamic_coordinator_default
+) >"$DYNAMIC_OUTPUT" 2>&1; then
+  mutated_workspace_status=0
+else
+  mutated_workspace_status=$?
+fi
+assert_eq 129 "$mutated_workspace_status" 'HUP status survives a Task3 workspace-mode mutation'
+assert_file_not_contains "$DYNAMIC_OUTPUT" 'failed to download a complete binary wheel dependency set' 'HUP cancellation emits no ordinary resolver failure report'
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'coordinator removes its owned workspace after Task3 changes the workspace mode'
 
 if grep '^LOGPARENTMODE:' "$COORDINATOR_STRICT_ARGS_LOG" | grep -qv '^LOGPARENTMODE:700$'; then
   fail 'coordinator raw-log parent remains private while pip runs'

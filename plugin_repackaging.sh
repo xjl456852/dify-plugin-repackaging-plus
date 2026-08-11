@@ -913,9 +913,21 @@ import sys
 MAX_RAW_LOG_BYTES = 1024 * 1024
 TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
 path = sys.argv[1]
+try:
+    existing = os.lstat(path)
+except FileNotFoundError:
+    existing = None
+if existing is not None and (
+    stat.S_ISLNK(existing.st_mode)
+    or not stat.S_ISREG(existing.st_mode)
+    or existing.st_uid != os.geteuid()
+    or existing.st_nlink != 1
+    or stat.S_IMODE(existing.st_mode) != 0o600
+):
+    raise SystemExit(1)
 descriptor = os.open(
     path,
-    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
     0o600,
 )
 written = 0
@@ -929,9 +941,21 @@ def write_all(contents):
 
 
 try:
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    opened = os.fstat(descriptor)
+    linked = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        or stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_nlink != 1
+    ):
         raise OSError("diagnostic log is not a regular file")
     os.fchmod(descriptor, 0o600)
+    if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+        raise OSError("diagnostic log is not private")
     while True:
         chunk = sys.stdin.buffer.read(64 * 1024)
         if not chunk:
@@ -2297,7 +2321,9 @@ download_wheels_once() {
   local -a platform_args=()
   local -a download_args=()
 
-  : >"$pip_output_log" || return
+  if [[ "$bounded_capture" != true ]]; then
+    : >"$pip_output_log" || return
+  fi
   if [[ -n "$local_wheels_dir" ]]; then
     if [[ ! -d "$local_wheels_dir" ]]; then
       printf 'local built-wheel directory not found: %s\n' "$local_wheels_dir" >&2
@@ -2347,11 +2373,141 @@ download_wheels_once() {
     "$display_output"
 }
 
+validate_coordinator_workspace() {
+  local workspace=$1
+
+  task3_python -B - "$workspace" <<'PY'
+import os
+import re
+import stat
+import sys
+
+
+workspace = sys.argv[1]
+trusted_root = "/tmp"
+try:
+    root_mode = os.lstat(trusted_root).st_mode
+    workspace_mode = os.lstat(workspace).st_mode
+    if (
+        os.path.realpath(trusted_root) != trusted_root
+        or stat.S_ISLNK(root_mode)
+        or not stat.S_ISDIR(root_mode)
+        or not os.path.isabs(workspace)
+        or os.path.realpath(workspace) != workspace
+        or os.path.dirname(workspace) != trusted_root
+        or re.fullmatch(r"dify-plugin-coordinator\.[A-Za-z0-9]+", os.path.basename(workspace)) is None
+        or stat.S_ISLNK(workspace_mode)
+        or not stat.S_ISDIR(workspace_mode)
+        or os.lstat(workspace).st_uid != os.geteuid()
+        or stat.S_IMODE(workspace_mode) != 0o700
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+cleanup_coordinator_workspace() {
+  local workspace=${1:-}
+
+  [[ -n "$workspace" ]] || return 0
+  task3_python -B - "$workspace" <<'PY'
+import os
+import re
+import stat
+import sys
+
+
+workspace = sys.argv[1]
+trusted_root = "/tmp"
+basename = os.path.basename(workspace)
+root_descriptor = None
+workspace_descriptor = None
+
+
+def clear_directory(descriptor):
+    for name in os.listdir(descriptor):
+        entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+            os.chmod(name, 0o700, dir_fd=descriptor, follow_symlinks=False)
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+                ):
+                    raise OSError("unsafe coordinator subdirectory")
+                clear_directory(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+
+
+try:
+    root_mode = os.lstat(trusted_root).st_mode
+    if (
+        os.path.realpath(trusted_root) != trusted_root
+        or stat.S_ISLNK(root_mode)
+        or not stat.S_ISDIR(root_mode)
+        or not os.path.isabs(workspace)
+        or os.path.realpath(workspace) != workspace
+        or os.path.dirname(workspace) != trusted_root
+        or re.fullmatch(r"dify-plugin-coordinator\.[A-Za-z0-9]+", basename) is None
+    ):
+        raise ValueError("unsafe coordinator workspace path")
+    root_descriptor = os.open(
+        trusted_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    linked = os.stat(basename, dir_fd=root_descriptor, follow_symlinks=False)
+    workspace_descriptor = os.open(
+        basename,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=root_descriptor,
+    )
+    opened = os.fstat(workspace_descriptor)
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISDIR(linked.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError("unsafe coordinator workspace identity")
+    os.fchmod(workspace_descriptor, 0o700)
+    clear_directory(workspace_descriptor)
+    os.close(workspace_descriptor)
+    workspace_descriptor = None
+    os.rmdir(basename, dir_fd=root_descriptor)
+except (OSError, ValueError):
+    raise SystemExit(1)
+finally:
+    if workspace_descriptor is not None:
+        os.close(workspace_descriptor)
+    if root_descriptor is not None:
+        os.close(root_descriptor)
+PY
+  if (($? != 0)); then
+    printf 'refusing to remove unsafe coordinator workspace: %s\n' "$workspace" >&2
+    return 1
+  fi
+}
+
 validate_coordinator_log_file() {
   local log_file=$1
-  local log_dir=$2
+  local workspace=$2
 
-  task3_python -B - "$log_file" "$log_dir" <<'PY'
+  validate_coordinator_workspace "$workspace" || return
+
+  task3_python -B - "$log_file" "$workspace" <<'PY'
 import os
 import stat
 import sys
@@ -2368,6 +2524,8 @@ try:
         or stat.S_IMODE(parent_mode) != 0o700
         or stat.S_ISLNK(mode)
         or not stat.S_ISREG(mode)
+        or os.lstat(path).st_uid != os.geteuid()
+        or os.lstat(path).st_nlink != 1
         or stat.S_IMODE(mode) != 0o600
     ):
         raise ValueError
@@ -2376,29 +2534,12 @@ except (OSError, ValueError):
 PY
 }
 
-cleanup_download_coordinator_logs() {
-  local log_dir=${1:-}
-  local initial_log=${2:-}
-  local current_log=${3:-}
-  local log_file
-
-  [[ -n "$log_dir" && -d "$log_dir" && ! -L "$log_dir" && \
-    "$(basename -- "$log_dir")" == .pip-coordinator.* ]] || return 0
-  for log_file in "$initial_log" "$current_log"; do
-    if [[ -n "$log_file" && "$(dirname -- "$log_file")" == "$log_dir" && \
-      "$(basename -- "$log_file")" == *.log ]]; then
-      rm -f -- "$log_file"
-    fi
-  done
-  rmdir -- "$log_dir" 2>/dev/null || true
-}
-
 display_distinct_coordinator_logs() {
   local initial_log=$1
   local current_log=$2
-  local log_dir=$3
+  local workspace=$3
 
-  if ! validate_coordinator_log_file "$initial_log" "$log_dir"; then
+  if ! validate_coordinator_log_file "$initial_log" "$workspace"; then
     printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
     return 1
   fi
@@ -2407,7 +2548,7 @@ display_distinct_coordinator_logs() {
     redact_pip_log <"$initial_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
     return 0
   fi
-  if ! validate_coordinator_log_file "$current_log" "$log_dir"; then
+  if ! validate_coordinator_log_file "$current_log" "$workspace"; then
     printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
     return 1
   fi
@@ -2451,7 +2592,8 @@ download_wheels() (
   local python_version=$4
   local bootstrap_dir=${5:-}
   local repair_dir=${6:-}
-  local abi platform wheels_parent coordinator_log_dir= initial_log= current_log=
+  local coordinator_workspace= initial_log= current_log=
+  local abi platform
   local attempt_log missing_record requirement canonical_name uv_command
   local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status
   local repair_count=0
@@ -2469,19 +2611,24 @@ download_wheels() (
       platform_names+=("$platform")
     fi
   done < <(default_platforms "$target_arch")
-  wheels_parent="$(realpath -m -- "$(dirname -- "$wheels_dir")")" || return
-  if [[ -z "$repair_dir" ]]; then
-    repair_dir="$wheels_parent/sdist-repair"
-  fi
-  coordinator_log_dir="$(mktemp -d "$wheels_parent/.pip-coordinator.XXXXXXXX")" || return
-  trap 'cleanup_download_coordinator_logs "$coordinator_log_dir" "$initial_log" "$current_log"' EXIT
+  coordinator_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)" || return
+  trap 'cleanup_coordinator_workspace "$coordinator_workspace" || true' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
-  chmod 700 -- "$coordinator_log_dir" || return
-  initial_log="$(mktemp "$coordinator_log_dir/initial.XXXXXXXX.log")" || return
-  current_log="$(mktemp "$coordinator_log_dir/current.XXXXXXXX.log")" || return
+  chmod 700 -- "$coordinator_workspace" || return
+  validate_coordinator_workspace "$coordinator_workspace" || {
+    printf 'failed to create a private coordinator workspace under /tmp\n' >&2
+    return 1
+  }
+  if [[ -z "$repair_dir" ]]; then
+    repair_dir="$coordinator_workspace/sdist-repair"
+  fi
+  initial_log="$(mktemp "$coordinator_workspace/initial.XXXXXXXX.log")" || return
+  current_log="$(mktemp "$coordinator_workspace/current.XXXXXXXX.log")" || return
   chmod 600 -- "$initial_log" "$current_log" || return
+  validate_coordinator_log_file "$initial_log" "$coordinator_workspace" || return
+  validate_coordinator_log_file "$current_log" "$coordinator_workspace" || return
 
   while :; do
     reset_wheels_dir "$wheels_dir" || return
@@ -2501,12 +2648,12 @@ download_wheels() (
       "$bootstrap_dir" "$local_wheels_dir" true false; then
       return 0
     fi
-    validate_coordinator_log_file "$attempt_log" "$coordinator_log_dir" || {
+    validate_coordinator_log_file "$attempt_log" "$coordinator_workspace" || {
       printf 'strict wheel-resolution diagnostics are unsafe\n' >&2
       return 1
     }
     if ! missing_record="$(extract_missing_requirement "$attempt_log")"; then
-      display_distinct_coordinator_logs "$initial_log" "$([[ "$attempt_log" == "$initial_log" ]] && printf '' || printf '%s' "$attempt_log")" "$coordinator_log_dir" || true
+      display_distinct_coordinator_logs "$initial_log" "$([[ "$attempt_log" == "$initial_log" ]] && printf '' || printf '%s' "$attempt_log")" "$coordinator_workspace" || true
       if ((repair_count > 0)); then
         printf 'Pure Python sdist repair failed during resolution after %s admitted wheel(s).\n' "$repair_count" >&2
       fi
@@ -2521,7 +2668,7 @@ download_wheels() (
     canonical_name=${missing_record#*$'\t'}
     case "${DIFY_AUTO_BUILD_PURE_SDIST:-1}" in
       0 | false | FALSE | no | NO)
-        display_distinct_coordinator_logs "$initial_log" '' "$coordinator_log_dir" || true
+        display_distinct_coordinator_logs "$initial_log" '' "$coordinator_workspace" || true
         printf 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.\n' >&2
         report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
         return 1
@@ -2533,13 +2680,13 @@ download_wheels() (
       pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" "$((repair_count + 1))" || return
     validate_sdist_repair_dir "$repair_dir" || return
     if [[ -n "${repaired_candidates[$canonical_name]+present}" ]]; then
-      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_workspace" || true
       printf 'repeated pure Python sdist repair candidate: %s\n' "$requirement" >&2
       report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
       return 1
     fi
     if ((repair_count >= 16)); then
-      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_workspace" || true
       printf 'pure Python sdist repair limit reached: 16\n' >&2
       report_wheel_download_failure "$target_arch" "$python_version" "$abi" "${platform_names[@]}"
       return 1
@@ -2562,10 +2709,10 @@ download_wheels() (
       repair_status=$?
     fi
     if ((repair_status != 0)); then
-      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_log_dir" || true
+      display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_workspace" || true
       printf 'Set DIFY_AUTO_BUILD_PURE_SDIST=0 to disable third-party source builds.\n' >&2
       case "$repair_status" in
-        124 | 125 | 130 | 143)
+        124 | 125 | 129 | 130 | 143)
           return "$repair_status"
           ;;
       esac
