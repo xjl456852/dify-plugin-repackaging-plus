@@ -1,0 +1,25 @@
+docs/superpowers/plans/2026-08-11-self-healing-offline-packaging.md
+  s_c1a60985b94e3d::t_fcba3c44f84938 37
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_f71d95e76b5cff 351-352
+  s_c1a60985b94e3d::t_7b18aa6cdb6a94 320,333-344,365-403
+  s_c1a60985b94e3d::t_4fb21f51e474c1 318,321-332,345-350,353-364,404-405,417
+  s_c1a60985b94e3d::t_aa2d0bfa724236 406-416
+  s_c1a60985b94e3d::t_fcba3c44f84938 273-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "fb0cb5ca750df8fa6b234a43fa673563a3c5f387",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
