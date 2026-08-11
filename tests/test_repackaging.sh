@@ -739,7 +739,7 @@ def write_sdist(path, name="docopt", version="0.6.2"):
             archive.addfile(info, io.BytesIO(contents))
 
 
-def write_wheel(path, name="docopt", version="0.6.2", pure=True, native=False):
+def write_wheel(path, name="docopt", version="0.6.2", pure=True, native=False, payload_size=0):
     distribution = name.replace("-", "_")
     dist_info = f"{distribution}-{version}.dist-info"
     wheel = (
@@ -754,6 +754,8 @@ def write_wheel(path, name="docopt", version="0.6.2", pure=True, native=False):
         archive.writestr(f"{dist_info}/METADATA", metadata)
         archive.writestr(f"{dist_info}/WHEEL", wheel)
         archive.writestr(f"{distribution}.py", b"__version__ = '0.6.2'\n")
+        if payload_size:
+            archive.writestr(f"{distribution}/large_payload", b"\0" * payload_size)
         if native:
             archive.writestr(f"{distribution}/native_payload", b"\x7fELF" + b"\0" * 32)
 
@@ -764,6 +766,7 @@ write_wheel(root / "docopt-0.6.2-py2.py3-none-any.whl")
 write_wheel(root / "other-1.0-py3-none-any.whl", "other", "1.0")
 write_wheel(root / "docopt-0.6.2-py3-none-any.whl", pure=False)
 write_wheel(root / "docopt-0.6.2-py2.py3-none-any-native.whl", native=True)
+write_wheel(root / "docopt-0.6.2-py2.py3-none-any-large.whl", payload_size=32 * 1024 * 1024)
 PY
 
 cat >"$fake_bin/pip-sdist-repair" <<'EOF'
@@ -773,6 +776,29 @@ set -uo pipefail
   printf 'CALL\n'
   printf 'ARG:%s\n' "$@"
 } >>"$REPAIR_PIP_ARGS_LOG"
+{
+  printf 'CALL\n'
+  printf 'HOME=%s\n' "${HOME:-}"
+  printf 'NETRC_FILE=%s\n' "$([[ -f "${HOME:-}/.netrc" ]] && printf present || printf absent)"
+  printf 'NETRC_MODE=%s\n' "$([[ -f "${HOME:-}/.netrc" ]] && stat -c '%a' "${HOME:-}/.netrc" || printf absent)"
+  if [[ -f "${HOME:-}/.netrc" ]] && python3 -c 'import netrc, sys; assert netrc.netrc(sys.argv[1]).authenticators("target-index.example")' "${HOME:-}/.netrc"; then
+    printf 'NETRC_PARSE=valid\n'
+  else
+    printf 'NETRC_PARSE=absent-or-invalid\n'
+  fi
+  printf 'PIP_EXTRA_INDEX_URL=%s\n' "${PIP_EXTRA_INDEX_URL:-}"
+  printf 'PIP_CONFIG_FILE=%s\n' "${PIP_CONFIG_FILE:-}"
+  printf 'PIP_MIRROR_URL=%s\n' "${PIP_MIRROR_URL:-}"
+  printf 'NETRC=%s\n' "${NETRC:-}"
+  printf 'PYTHONPATH=%s\n' "${PYTHONPATH:-}"
+  printf 'PYTHONHOME=%s\n' "${PYTHONHOME:-}"
+  printf 'VIRTUAL_ENV=%s\n' "${VIRTUAL_ENV:-}"
+  printf 'CONDA_PREFIX=%s\n' "${CONDA_PREFIX:-}"
+  printf 'HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-${https_proxy:-}}"
+  printf 'SSL_CERT_FILE=%s\n' "${SSL_CERT_FILE:-}"
+} >>"$REPAIR_PIP_ENV_LOG"
+tr '\0' ' ' <"/proc/$PPID/cmdline" >>"$REPAIR_TOOL_PROC_LOG"
+printf '\n' >>"$REPAIR_TOOL_PROC_LOG"
 dest=
 while (($#)); do
   if [[ "$1" == --dest ]]; then
@@ -796,6 +822,9 @@ case "${REPAIR_PIP_MODE:-success}" in
       exit 42
     fi
     [[ "${PIP_USE_DEPRECATED:-}" == legacy-certs ]] || exit 43
+    ;;
+  slow)
+    sleep 0.3
     ;;
 esac
 [[ -n "$dest" ]]
@@ -827,9 +856,41 @@ set -uo pipefail
   printf 'ENV:CONDA_PREFIX=%s\n' "${CONDA_PREFIX:-}"
   printf 'ARG:%s\n' "$@"
 } >>"$REPAIR_UV_ARGS_LOG"
+{
+  printf 'CALL\n'
+  printf 'HOME=%s\n' "${HOME:-}"
+  printf 'NETRC_FILE=%s\n' "$([[ -f "${HOME:-}/.netrc" ]] && printf present || printf absent)"
+  printf 'NETRC_MODE=%s\n' "$([[ -f "${HOME:-}/.netrc" ]] && stat -c '%a' "${HOME:-}/.netrc" || printf absent)"
+  if [[ -f "${HOME:-}/.netrc" ]] && python3 -c 'import netrc, sys; assert netrc.netrc(sys.argv[1]).authenticators("target-index.example")' "${HOME:-}/.netrc"; then
+    printf 'NETRC_PARSE=valid\n'
+  else
+    printf 'NETRC_PARSE=absent-or-invalid\n'
+  fi
+  printf 'UV_NO_BUILD_ISOLATION=%s\n' "${UV_NO_BUILD_ISOLATION:-}"
+  printf 'UV_EXTRA_INDEX_URL=%s\n' "${UV_EXTRA_INDEX_URL:-}"
+  printf 'PIP_EXTRA_INDEX_URL=%s\n' "${PIP_EXTRA_INDEX_URL:-}"
+  printf 'PIP_MIRROR_URL=%s\n' "${PIP_MIRROR_URL:-}"
+  printf 'NETRC=%s\n' "${NETRC:-}"
+  printf 'PYTHONPATH=%s\n' "${PYTHONPATH:-}"
+  printf 'PYTHONHOME=%s\n' "${PYTHONHOME:-}"
+  printf 'VIRTUAL_ENV=%s\n' "${VIRTUAL_ENV:-}"
+  printf 'CONDA_PREFIX=%s\n' "${CONDA_PREFIX:-}"
+  printf 'HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-${https_proxy:-}}"
+  printf 'SSL_CERT_FILE=%s\n' "${SSL_CERT_FILE:-}"
+} >>"$REPAIR_UV_ENV_LOG"
+tr '\0' ' ' <"/proc/$PPID/cmdline" >>"$REPAIR_TOOL_PROC_LOG"
+printf '\n' >>"$REPAIR_TOOL_PROC_LOG"
 if [[ "${REPAIR_UV_MODE:-success}" == failure ]]; then
   printf 'build failed via socks5h://build-user:build-password@10.10.10.10:28802/path?token=build-query#build-fragment diagnostic\033[31m\n' >&2
   exit 51
+fi
+if [[ "${REPAIR_UV_MODE:-success}" == flood-failure ]]; then
+  head -c $((2 * 1024 * 1024)) /dev/zero | tr '\0' X >&2
+  exit 52
+fi
+if [[ "${REPAIR_UV_MODE:-success}" == timeout ]]; then
+  sleep 5
+  exit 53
 fi
 out_dir=
 while (($#)); do
@@ -842,6 +903,42 @@ done
 [[ -n "$out_dir" ]]
 mkdir -p "$out_dir"
 case "${REPAIR_UV_MODE:-success}" in
+  slow)
+    sleep 1
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    ;;
+  replace-original)
+    cp "$REPAIR_LARGE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
+    (
+      candidate_dir="$(dirname -- "$out_dir")"
+      for _ in $(seq 1 3000); do
+        if pgrep -af 'validate_python_distribution.py' | grep -Fq -- "$candidate_dir"; then
+          cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
+          printf 'seen\n' >"$REPAIR_REPLACER_SEEN"
+          exit
+        fi
+        sleep 0.001
+      done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" >"$REPAIR_REPLACER_PID_FILE"
+    ;;
+  mutate-snapshot)
+    cp "$REPAIR_LARGE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
+    (
+      candidate_dir="$(dirname -- "$out_dir")"
+      for _ in $(seq 1 10000); do
+        target="$(find "$candidate_dir" -maxdepth 2 -type f -path '*/.admission.*/*.whl' -print -quit 2>/dev/null)"
+        if [[ -n "$target" ]]; then
+          chmod u+w "$target" 2>/dev/null || true
+          printf 'snapshot mutation\n' >>"$target" 2>/dev/null || true
+          printf 'seen\n' >"$REPAIR_MUTATION_SEEN"
+          exit
+        fi
+        sleep 0.001
+      done
+    ) </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" >"$REPAIR_MUTATION_PID_FILE"
+    ;;
   native)
     cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
     ;;
@@ -864,14 +961,24 @@ chmod +x "$fake_bin/pip-sdist-repair" "$fake_bin/uv-sdist-repair"
 
 export REPAIR_PIP_ARGS_LOG="$FIXTURE_DIR/sdist-repair-pip.args"
 export REPAIR_UV_ARGS_LOG="$FIXTURE_DIR/sdist-repair-uv.args"
+export REPAIR_PIP_ENV_LOG="$FIXTURE_DIR/sdist-repair-pip.env"
+export REPAIR_UV_ENV_LOG="$FIXTURE_DIR/sdist-repair-uv.env"
+export REPAIR_TOOL_PROC_LOG="$FIXTURE_DIR/sdist-repair-tool-proc.log"
 export REPAIR_SDIST_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2.tar.gz"
 export REPAIR_OTHER_SDIST_FIXTURE="$sdist_repair_fixture_dir/other-1.0.tar.gz"
 export REPAIR_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py3-none-any.whl"
 export REPAIR_OTHER_WHEEL_FIXTURE="$sdist_repair_fixture_dir/other-1.0-py3-none-any.whl"
 export REPAIR_NONPURE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py3-none-any.whl"
 export REPAIR_NATIVE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py3-none-any-native.whl"
+export REPAIR_LARGE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py3-none-any-large.whl"
+export REPAIR_REPLACER_PID_FILE="$FIXTURE_DIR/sdist-repair-replacer.pid"
+export REPAIR_MUTATION_PID_FILE="$FIXTURE_DIR/sdist-repair-mutation.pid"
+export REPAIR_REPLACER_SEEN="$FIXTURE_DIR/sdist-repair-replacer.seen"
 : >"$REPAIR_PIP_ARGS_LOG"
 : >"$REPAIR_UV_ARGS_LOG"
+: >"$REPAIR_PIP_ENV_LOG"
+: >"$REPAIR_UV_ENV_LOG"
+: >"$REPAIR_TOOL_PROC_LOG"
 
 repair_parent="$FIXTURE_DIR/repair parent with spaces"
 mkdir -p "$repair_parent"
@@ -882,9 +989,21 @@ printf 'unchanged\n' >"$fake_conda_prefix/marker"
 repair_requirement='docopt>=0.6,<1'
 repair_pip_command=("$fake_bin/pip-sdist-repair")
 repair_success_log="$FIXTURE_DIR/sdist-repair-success.log"
-if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+if PIP_MIRROR_URL='https://argv-user-secret:argv-password-secret@target-index.example/simple' \
+  UV_NO_BUILD_ISOLATION='uv-isolation-sentinel' \
+  UV_EXTRA_INDEX_URL='https://uv-extra-sentinel.example/simple' \
+  PIP_EXTRA_INDEX_URL='https://pip-extra-sentinel.example/simple' \
+  PIP_CONFIG_FILE="$FIXTURE_DIR/pip-config-sentinel" \
+  NETRC="$FIXTURE_DIR/netrc-sentinel" \
+  PYTHONPATH="$FIXTURE_DIR/pythonpath-sentinel" \
+  PYTHONHOME=/usr \
+  VIRTUAL_ENV="$FIXTURE_DIR/venv-sentinel" \
+  HOME="$FIXTURE_DIR/home-sentinel" \
   CONDA_PREFIX="$fake_conda_prefix" \
-  without_proxy_environment repair_one_pure_sdist \
+  https_proxy='http://required-proxy.example:8080' HTTPS_PROXY= \
+  http_proxy= HTTP_PROXY= all_proxy= ALL_PROXY= \
+  SSL_CERT_FILE="$FIXTURE_DIR/ca-sentinel.pem" \
+  repair_one_pure_sdist \
     repair_pip_command \
     "$fake_bin/uv-sdist-repair" \
     "$repair_requirement" \
@@ -896,6 +1015,7 @@ if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple
   pass 'one pure source distribution is repaired in isolated staging'
 else
   fail 'one pure source distribution is repaired in isolated staging'
+  sed 's/^/# sdist repair: /' "$repair_success_log"
 fi
 assert_file_contains "$repair_success_log" 'Pure Python wheel admitted: docopt-0.6.2-py2.py3-none-any.whl' 'successful repair reports admitted wheel only after validation'
 if [[ -f "$repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl" ]]; then
@@ -907,9 +1027,10 @@ expected_repair_pip_args="$FIXTURE_DIR/expected-repair-pip.args"
 printf '%s\n' \
   'CALL' \
   'ARG:download' \
+  'ARG:--isolated' \
   'ARG:--disable-pip-version-check' \
   'ARG:--index-url' \
-  'ARG:https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  'ARG:https://target-index.example/simple' \
   'ARG:--python-version' \
   'ARG:3.12' \
   'ARG:--implementation' \
@@ -931,7 +1052,7 @@ printf '%s\n' \
   'CALL' \
   "ENV:UV_CACHE_DIR=$repair_dir/uv-cache" \
   "ENV:UV_PYTHON_INSTALL_DIR=$repair_dir/uv-python" \
-  "ENV:CONDA_PREFIX=$fake_conda_prefix" \
+  'ENV:CONDA_PREFIX=' \
   'ARG:build' \
   'ARG:--wheel' \
   'ARG:--no-config' \
@@ -940,7 +1061,7 @@ printf '%s\n' \
   'ARG:--python' \
   'ARG:3.12' \
   'ARG:--index-url' \
-  'ARG:https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  'ARG:https://target-index.example/simple' \
   "ARG:$validated_sdist_path" >"$expected_repair_uv_args"
 if diff -u "$expected_repair_uv_args" "$REPAIR_UV_ARGS_LOG" >/dev/null; then
   pass 'uv build uses exact target Python, configured index, validated sdist, and controlled cache paths'
@@ -948,6 +1069,45 @@ else
   fail 'uv build uses exact target Python, configured index, validated sdist, and controlled cache paths'
 fi
 assert_eq unchanged "$(<"$fake_conda_prefix/marker")" 'repair leaves caller Conda prefix contents unchanged'
+for environment_log in "$REPAIR_PIP_ENV_LOG" "$REPAIR_UV_ENV_LOG"; do
+  assert_file_contains "$environment_log" "HOME=$repair_dir/candidate-1/auth-home" 'tool child receives only the controlled private HOME'
+  assert_file_contains "$environment_log" 'NETRC_FILE=present' 'tool child can discover private index authentication through netrc'
+  assert_file_contains "$environment_log" 'NETRC_MODE=600' 'private index credentials use mode 0600'
+  assert_file_contains "$environment_log" 'NETRC_PARSE=valid' 'private index credentials remain standards-parseable'
+  assert_file_contains "$environment_log" 'HTTPS_PROXY=http://required-proxy.example:8080' 'required HTTP proxy survives environment isolation'
+  assert_file_contains "$environment_log" "SSL_CERT_FILE=$FIXTURE_DIR/ca-sentinel.pem" 'required CA environment survives isolation'
+  for poisoned_value in uv-isolation-sentinel uv-extra-sentinel pip-extra-sentinel pip-config-sentinel \
+    pythonpath-sentinel /usr venv-sentinel home-sentinel fake-conda netrc-sentinel \
+    argv-user-secret argv-password-secret; do
+    assert_file_not_contains "$environment_log" "$poisoned_value" "tool child environment excludes caller poison $poisoned_value"
+  done
+done
+for tool_args_log in "$REPAIR_PIP_ARGS_LOG" "$REPAIR_UV_ARGS_LOG"; do
+  assert_file_not_contains "$tool_args_log" 'argv-user-secret' 'tool argv excludes private-index username'
+  assert_file_not_contains "$tool_args_log" 'argv-password-secret' 'tool argv excludes private-index password'
+done
+assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-user-secret' 'private-index username is absent from observed parent process argv'
+assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-password-secret' 'private-index password is absent from observed parent process argv'
+assert_eq 700 "$(stat -c '%a' "$repair_dir/candidate-1/auth-home")" 'private authentication HOME uses mode 0700'
+assert_eq 600 "$(stat -c '%a' "$repair_dir/candidate-1/auth-home/.netrc")" 'private netrc uses mode 0600'
+
+query_repair_parent="$FIXTURE_DIR/query repair parent"
+mkdir -p "$query_repair_parent"
+query_repair_dir="$query_repair_parent/sdist-repair"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if PIP_MIRROR_URL='https://query-user:query-password@target-index.example/simple?token=argv-query-sentinel#argv-fragment-sentinel' \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$query_repair_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-query-index.log" 2>&1; then
+  fail 'index query and fragment credentials fail closed before tool execution'
+else
+  pass 'index query and fragment credentials fail closed before tool execution'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'unsafe index query cannot reach pip argv'
+assert_file_missing "$query_repair_dir" 'unsafe index query creates no repair staging'
+for secret_value in query-user query-password argv-query-sentinel argv-fragment-sentinel; do
+  assert_file_not_contains "$FIXTURE_DIR/sdist-repair-query-index.log" "$secret_value" "unsafe index explanation hides $secret_value"
+done
 
 pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
 if without_proxy_environment repair_one_pure_sdist \
@@ -1064,7 +1224,7 @@ assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'cand
 
 uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
 download_failure_log="$FIXTURE_DIR/sdist-repair-download-failure.log"
-if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple' \
   REPAIR_PIP_MODE=failure \
   without_proxy_environment repair_one_pure_sdist \
     repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 2 \
@@ -1073,8 +1233,8 @@ if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple
 else
   pass 'sdist download failure stops repair'
 fi
-assert_file_contains "$download_failure_log" 'Pure Python sdist repair failed during download: docopt (index: https://***@target-index.example/simple)' 'download failure reports a stable sanitized stage error'
-for secret_value in download-user download-password download-query download-fragment index-user index-password index-query $'\033'; do
+assert_file_contains "$download_failure_log" 'Pure Python sdist repair failed during download: docopt (index: https://target-index.example/simple)' 'download failure reports a stable sanitized stage error'
+for secret_value in download-user download-password download-query download-fragment index-user index-password $'\033'; do
   assert_file_not_contains "$download_failure_log" "$secret_value" "download repair diagnostic hides $secret_value"
 done
 assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" 'download failure does not invoke uv'
@@ -1133,6 +1293,206 @@ for wheel_mode in native nonpure multiple mismatch; do
 done
 assert_eq 1 "$(find "$repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'rejected wheels never enter built-wheels'
 
+for private_dir in \
+  "$repair_dir" \
+  "$repair_dir/candidate-1" \
+  "$repair_dir/candidate-1/source" \
+  "$repair_dir/candidate-1/wheel" \
+  "$repair_dir/built-wheels" \
+  "$repair_dir/uv-cache" \
+  "$repair_dir/uv-python"; do
+  assert_eq 700 "$(stat -c '%a' "$private_dir")" "private repair directory uses mode 0700: $(basename -- "$private_dir")"
+done
+assert_eq 400 "$(stat -c '%a' "$repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl")" 'admitted wheel is nonwritable'
+assert_eq 0 "$(find "$repair_dir" -type f \( -name '*download*log*' -o -name '*build*log*' -o -name '*validation*log*' -o -name '*.record' \) | wc -l)" 'raw Task3 logs are removed after reporting'
+assert_eq 0 "$(find "$repair_dir" -type d -name '.admission.*' | wc -l)" 'successful admission removes its private snapshot directory'
+
+replace_repair_parent="$FIXTURE_DIR/replace repair parent"
+mkdir -p "$replace_repair_parent"
+replace_repair_dir="$replace_repair_parent/sdist-repair"
+rm -f -- "$REPAIR_REPLACER_PID_FILE"
+rm -f -- "$REPAIR_REPLACER_SEEN"
+if REPAIR_UV_MODE=replace-original \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$replace_repair_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-replace-original.log" 2>&1; then
+  pass 'backend replacement of the original output path cannot replace the admitted snapshot'
+else
+  fail 'backend replacement of the original output path cannot replace the admitted snapshot'
+  sed 's/^/# replacement repair: /' "$FIXTURE_DIR/sdist-repair-replace-original.log"
+fi
+for _ in $(seq 1 200); do
+  [[ -f "$REPAIR_REPLACER_SEEN" ]] && break
+  sleep 0.01
+done
+assert_file_contains "$REPAIR_REPLACER_SEEN" 'seen' 'adversarial backend actually replaced the abandoned original output path'
+if python3 -B "$ROOT_DIR/tools/validate_python_distribution.py" wheel \
+  "$replace_repair_dir/built-wheels" --name docopt --version 0.6.2 >/dev/null 2>&1; then
+  pass 'wheel admitted during original-path replacement independently revalidates'
+else
+  fail 'wheel admitted during original-path replacement independently revalidates'
+fi
+if [[ -f "$REPAIR_REPLACER_PID_FILE" ]]; then
+  kill "$(<"$REPAIR_REPLACER_PID_FILE")" 2>/dev/null || true
+fi
+
+mutation_repair_parent="$FIXTURE_DIR/mutation repair parent"
+mkdir -p "$mutation_repair_parent"
+mutation_repair_dir="$mutation_repair_parent/sdist-repair"
+export REPAIR_MUTATION_SEEN="$FIXTURE_DIR/sdist-repair-mutation.seen"
+rm -f -- "$REPAIR_MUTATION_SEEN" "$REPAIR_MUTATION_PID_FILE"
+if REPAIR_UV_MODE=mutate-snapshot \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$mutation_repair_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-mutate-snapshot.log" 2>&1; then
+  fail 'mutation of the private admission snapshot is detected'
+else
+  pass 'mutation of the private admission snapshot is detected'
+fi
+if [[ -f "$REPAIR_MUTATION_PID_FILE" && ! -f "$REPAIR_MUTATION_SEEN" ]]; then
+  kill "$(<"$REPAIR_MUTATION_PID_FILE")" 2>/dev/null || true
+fi
+assert_file_contains "$REPAIR_MUTATION_SEEN" 'seen' 'adversarial backend reached the snapshot mutation attempt'
+if [[ -d "$mutation_repair_dir/built-wheels" ]]; then
+  assert_eq 0 "$(find "$mutation_repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'mutated snapshot is never admitted'
+else
+  pass 'mutated snapshot is never admitted'
+fi
+
+concurrent_repair_parent="$FIXTURE_DIR/concurrent repair parent"
+mkdir -p "$concurrent_repair_parent"
+concurrent_repair_dir="$concurrent_repair_parent/sdist-repair"
+concurrent_pip_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+concurrent_uv_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
+(
+  REPAIR_PIP_MODE=slow REPAIR_UV_MODE=slow \
+    without_proxy_environment repair_one_pure_sdist \
+      repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$concurrent_repair_dir" '' 1 \
+      >"$FIXTURE_DIR/sdist-repair-concurrent-1.log" 2>&1
+  printf '%s\n' "$?" >"$FIXTURE_DIR/sdist-repair-concurrent-1.status"
+) &
+concurrent_pid_one=$!
+(
+  REPAIR_PIP_MODE=slow REPAIR_UV_MODE=slow \
+    without_proxy_environment repair_one_pure_sdist \
+      repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$concurrent_repair_dir" '' 1 \
+      >"$FIXTURE_DIR/sdist-repair-concurrent-2.log" 2>&1
+  printf '%s\n' "$?" >"$FIXTURE_DIR/sdist-repair-concurrent-2.status"
+) &
+concurrent_pid_two=$!
+wait "$concurrent_pid_one" "$concurrent_pid_two"
+concurrent_successes=0
+[[ "$(<"$FIXTURE_DIR/sdist-repair-concurrent-1.status")" == 0 ]] && concurrent_successes=$((concurrent_successes + 1))
+[[ "$(<"$FIXTURE_DIR/sdist-repair-concurrent-2.status")" == 0 ]] && concurrent_successes=$((concurrent_successes + 1))
+assert_eq 1 "$concurrent_successes" 'same candidate ordinal permits exactly one concurrent repair'
+assert_eq 1 "$(( $(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG") - concurrent_pip_before ))" 'repair-tree lock permits only one concurrent pip download'
+assert_eq 1 "$(( $(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG") - concurrent_uv_before ))" 'repair-tree lock permits only one concurrent uv build'
+assert_file_missing "$concurrent_repair_dir/.repair-lock" 'successful repair removes the exact repair-tree lock'
+assert_eq 1 "$(find "$concurrent_repair_dir" -maxdepth 1 -type d -name 'candidate-*' | wc -l)" 'concurrent repair creates only one candidate tree'
+assert_eq 0 "$(find "$concurrent_repair_dir" -type l | wc -l)" 'concurrent repair inserts no shared-tree symlink'
+
+stale_lock_parent="$FIXTURE_DIR/stale lock parent"
+stale_lock_dir="$stale_lock_parent/sdist-repair"
+mkdir -p "$stale_lock_dir/.repair-lock"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$stale_lock_dir" '' 1 \
+  >"$FIXTURE_DIR/sdist-repair-stale-lock.log" 2>&1; then
+  fail 'held or stale repair-tree lock fails closed'
+else
+  pass 'held or stale repair-tree lock fails closed'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'held repair-tree lock prevents pip execution'
+assert_file_missing "$stale_lock_dir/candidate-1" 'held repair-tree lock prevents candidate creation'
+
+bounded_permission_log="$FIXTURE_DIR/bounded-command-permission.log"
+if run_bounded_command_log "$bounded_permission_log" printf 'bounded log\n'; then
+  pass 'bounded command logger captures a successful command'
+else
+  fail 'bounded command logger captures a successful command'
+fi
+assert_eq 600 "$(stat -c '%a' "$bounded_permission_log")" 'bounded raw command log uses mode 0600'
+rm -f -- "$bounded_permission_log"
+
+invalid_timeout_parent="$FIXTURE_DIR/invalid timeout parent"
+mkdir -p "$invalid_timeout_parent"
+invalid_timeout_dir="$invalid_timeout_parent/sdist-repair"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if DIFY_SDIST_BUILD_TIMEOUT_SECONDS='1; touch unsafe' \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$invalid_timeout_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-invalid-timeout.log" 2>&1; then
+  fail 'invalid sdist build timeout is rejected before side effects'
+else
+  pass 'invalid sdist build timeout is rejected before side effects'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'invalid build timeout cannot invoke pip'
+assert_file_missing "$invalid_timeout_dir" 'invalid build timeout creates no repair staging'
+
+flood_repair_parent="$FIXTURE_DIR/flood repair parent"
+mkdir -p "$flood_repair_parent"
+flood_repair_dir="$flood_repair_parent/sdist-repair"
+flood_repair_log="$FIXTURE_DIR/sdist-repair-flood.log"
+if REPAIR_UV_MODE=flood-failure \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$flood_repair_dir" '' 1 \
+    >"$flood_repair_log" 2>&1; then
+  fail 'bounded build-output flood remains a build failure'
+else
+  pass 'bounded build-output flood remains a build failure'
+fi
+if (( $(stat -c '%s' "$flood_repair_log") <= 1100000 )); then
+  pass 'displayed build-output flood remains bounded'
+else
+  fail 'displayed build-output flood remains bounded'
+fi
+assert_file_contains "$flood_repair_log" 'diagnostic output truncated' 'bounded build-output flood reports truncation'
+assert_eq 0 "$(find "$flood_repair_dir" -type f -name '*build*log*' | wc -l)" 'raw flooded build log is removed after reporting'
+
+timeout_repair_parent="$FIXTURE_DIR/timeout repair parent"
+mkdir -p "$timeout_repair_parent"
+timeout_repair_dir="$timeout_repair_parent/sdist-repair"
+timeout_start=$SECONDS
+if DIFY_SDIST_BUILD_TIMEOUT_SECONDS=1 REPAIR_UV_MODE=timeout \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$timeout_repair_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-timeout.log" 2>&1; then
+  fail 'sdist wheel build timeout stops repair'
+else
+  pass 'sdist wheel build timeout stops repair'
+fi
+timeout_elapsed=$((SECONDS - timeout_start))
+if ((timeout_elapsed <= 4)); then
+  pass 'sdist wheel build timeout is enforced within its kill-after bound'
+else
+  fail 'sdist wheel build timeout is enforced within its kill-after bound'
+fi
+assert_file_contains "$FIXTURE_DIR/sdist-repair-timeout.log" 'Pure Python sdist repair failed during build: docopt' 'timeout reports the stable build stage'
+if [[ -d "$timeout_repair_dir/built-wheels" ]]; then
+  assert_eq 0 "$(find "$timeout_repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'timed-out build admits no wheel'
+else
+  pass 'timed-out build admits no wheel'
+fi
+
+task3_function_source="$(sed -n '/^validate_sdist_repair_dir() {/,/^download_wheels_once() {/p' "$ROOT_DIR/plugin_repackaging.sh")"
+if grep -Fq '${#' <<<"$task3_function_source"; then
+  fail 'Task3 empty-array checks remain safe under Bash 4.3 nounset'
+else
+  pass 'Task3 empty-array checks remain safe under Bash 4.3 nounset'
+fi
+if bash43_command="$(command -v bash4.3 2>/dev/null)" && [[ -n "$bash43_command" ]]; then
+  if ROOT_DIR="$ROOT_DIR" "$bash43_command" -uc \
+    'source "$ROOT_DIR/plugin_repackaging.sh"; empty_pip=(); validate_sdist_repair_identifiers empty_pip /bin/true docopt docopt 3.12 1' \
+    >"$FIXTURE_DIR/sdist-repair-bash43.log" 2>&1; then
+    fail 'Bash 4.3 safely rejects an empty pip array under nounset'
+  else
+    pass 'Bash 4.3 safely rejects an empty pip array under nounset'
+  fi
+  assert_file_not_contains "$FIXTURE_DIR/sdist-repair-bash43.log" 'unbound variable' 'Bash 4.3 empty pip array emits no nounset diagnostic'
+else
+  pass 'Bash 4.3 runtime unavailable; static Task3 array regression remains active'
+fi
+
 conflict_repair_parent="$FIXTURE_DIR/conflict repair parent"
 conflict_repair_dir="$conflict_repair_parent/sdist-repair"
 mkdir -p "$conflict_repair_dir/built-wheels"
@@ -1165,10 +1525,11 @@ if https_proxy='socks5h://10.10.10.10:28802' HTTPS_PROXY= HTTP_PROXY= http_proxy
   pass 'sdist download preserves the exact SOCKS truststore compatibility retry'
 else
   fail 'sdist download preserves the exact SOCKS truststore compatibility retry'
+  sed 's/^/# socks sdist repair: /' "$socks_repair_log"
 fi
 assert_eq 2 "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'sdist SOCKS truststore workaround retries exactly once'
 assert_file_contains "$socks_repair_log" 'retrying once with PIP_USE_DEPRECATED=legacy-certs' 'sdist SOCKS retry is explained'
-assert_file_not_contains "$socks_repair_dir/candidate-1/download.log" 'key_proxy_ssl_context' 'successful retry truncates stale first-attempt diagnostics'
+assert_eq 0 "$(find "$socks_repair_dir" -type f -name '*download*log*' | wc -l)" 'successful SOCKS retry removes all raw attempt diagnostics'
 set -e
 
 cat >"$fake_bin/pip-fail" <<'EOF'

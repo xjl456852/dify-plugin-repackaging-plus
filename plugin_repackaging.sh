@@ -893,33 +893,126 @@ validate_pip_bootstrap_dir() {
   fi
 }
 
+task3_python() {
+  env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV python3 "$@"
+}
+
+run_bounded_command_log() {
+  local output_log=$1
+  shift
+  local -a pipeline_status=()
+
+  "$@" 2>&1 | task3_python -B /dev/fd/3 "$output_log" 3<<'PY'
+import os
+import sys
+
+
+MAX_RAW_LOG_BYTES = 1024 * 1024
+TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
+path = sys.argv[1]
+descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+written = 0
+truncated = False
+
+
+def write_all(contents):
+    position = 0
+    while position < len(contents):
+        position += os.write(descriptor, contents[position:])
+
+
+try:
+    os.fchmod(descriptor, 0o600)
+    while True:
+        chunk = sys.stdin.buffer.read(64 * 1024)
+        if not chunk:
+            break
+        remaining = MAX_RAW_LOG_BYTES - written
+        if remaining > 0:
+            retained = chunk[:remaining]
+            write_all(retained)
+            written += len(retained)
+        if len(chunk) > max(remaining, 0):
+            truncated = True
+    if truncated:
+        write_all(TRUNCATION_MARKER)
+finally:
+    os.close(descriptor)
+PY
+  pipeline_status=("${PIPESTATUS[@]}")
+  ((${pipeline_status[1]:-1} == 0)) || return "${pipeline_status[1]:-1}"
+  return "${pipeline_status[0]:-1}"
+}
+
+build_sanitized_environment_args() {
+  local result_name=$1
+  local controlled_home=$2
+  local -n result=$result_name
+  local variable_name
+
+  result=()
+  while IFS= read -r variable_name; do
+    case "$variable_name" in
+      PIP_* | UV_* | PYTHON* | VIRTUAL_ENV | CONDA_* | NETRC)
+        result+=(-u "$variable_name")
+        ;;
+    esac
+  done < <(compgen -e)
+  result+=("HOME=$controlled_home")
+}
+
+run_selected_pip_attempt() {
+  local pip_command_name=$1
+  local download_args_name=$2
+  local socks_site_dir=$3
+  local pip_output_log=$4
+  local use_legacy_certs=$5
+  local clean_env_args_name=$6
+  local bounded_capture=$7
+  local -n selected_pip_command=$pip_command_name
+  local -n selected_download_args=$download_args_name
+  local -a command=(env)
+
+  if [[ -n "$clean_env_args_name" ]]; then
+    local -n selected_clean_env_args=$clean_env_args_name
+    command+=("${selected_clean_env_args[@]}")
+  fi
+  if [[ "$use_legacy_certs" == true ]]; then
+    command+=(PIP_USE_DEPRECATED=legacy-certs)
+  fi
+  if [[ -n "$socks_site_dir" ]]; then
+    if [[ -n "$clean_env_args_name" ]]; then
+      command+=("PYTHONPATH=$socks_site_dir")
+    else
+      command+=("PYTHONPATH=$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}")
+    fi
+  fi
+  command+=("${selected_pip_command[@]}" "${selected_download_args[@]}")
+  if [[ "$bounded_capture" == true ]]; then
+    run_bounded_command_log "$pip_output_log" "${command[@]}"
+  else
+    "${command[@]}" >"$pip_output_log" 2>&1
+  fi
+}
+
 run_pip_with_socks_retry() {
   local pip_command_name=$1
   local download_args_name=$2
   local socks_site_dir=$3
   local pip_output_log=$4
   local allow_legacy_retry=${5:-false}
-  local -n selected_pip_command=$pip_command_name
-  local -n selected_download_args=$download_args_name
+  local clean_env_args_name=${6:-}
+  local bounded_capture=${7:-false}
   local pip_status retry_status
   local truststore_error="TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'"
 
   : >"$pip_output_log"
-  if [[ -n "$socks_site_dir" ]]; then
-    if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
-      >"$pip_output_log" 2>&1; then
-      pip_status=0
-    else
-      pip_status=$?
-    fi
+  if run_selected_pip_attempt \
+    "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
+    false "$clean_env_args_name" "$bounded_capture"; then
+    pip_status=0
   else
-    if "${selected_pip_command[@]}" "${selected_download_args[@]}" \
-      >"$pip_output_log" 2>&1; then
-      pip_status=0
-    else
-      pip_status=$?
-    fi
+    pip_status=$?
   fi
   redact_pip_log <"$pip_output_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
   if ((pip_status == 0)); then
@@ -932,23 +1025,12 @@ run_pip_with_socks_retry() {
   printf '%s\n' \
     'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
   : >"$pip_output_log"
-  if [[ -n "$socks_site_dir" ]]; then
-    if PIP_USE_DEPRECATED=legacy-certs \
-      PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
-      >"$pip_output_log" 2>&1; then
-      retry_status=0
-    else
-      retry_status=$?
-    fi
+  if run_selected_pip_attempt \
+    "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
+    true "$clean_env_args_name" "$bounded_capture"; then
+    retry_status=0
   else
-    if PIP_USE_DEPRECATED=legacy-certs \
-      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
-      >"$pip_output_log" 2>&1; then
-      retry_status=0
-    else
-      retry_status=$?
-    fi
+    retry_status=$?
   fi
   redact_pip_log <"$pip_output_log" >&2 || printf 'pip retry output could not be displayed safely\n' >&2
   return "$retry_status"
@@ -957,7 +1039,7 @@ run_pip_with_socks_retry() {
 validate_sdist_repair_dir() {
   local repair_dir=${1:-}
 
-  python3 -B - "$repair_dir" <<'PY'
+  task3_python -B - "$repair_dir" <<'PY'
 import os
 import stat
 import sys
@@ -997,6 +1079,77 @@ PY
   fi
 }
 
+sanitize_index_url_for_tools() {
+  task3_python -B /dev/fd/3 3<<'PY'
+import re
+import sys
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+
+raw_url = sys.stdin.read()
+try:
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw_url):
+        raise ValueError
+    parsed = urlsplit(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError
+    if parsed.query or parsed.fragment:
+        raise ValueError
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    if parsed.username is not None or parsed.password is not None:
+        if parsed.username is None or parsed.password is None:
+            raise ValueError
+        encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
+        if re.search(r"%(?![0-9A-Fa-f]{2})", encoded_userinfo):
+            raise ValueError
+        username = unquote(parsed.username, errors="strict")
+        password = unquote(parsed.password, errors="strict")
+        safe_token = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:%@/-]+$")
+        if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
+            raise ValueError
+    print(urlunsplit((parsed.scheme.lower(), host, parsed.path, "", "")))
+except (TypeError, UnicodeError, ValueError):
+    print("unsafe package index URL; query, fragment, or unsupported credentials are not allowed", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+write_private_index_auth() {
+  local auth_home=$1
+
+  task3_python -B /dev/fd/3 "$auth_home" 3<<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+raw_url = sys.stdin.read()
+auth_home = Path(sys.argv[1])
+parsed = urlsplit(raw_url)
+if parsed.username is None and parsed.password is None:
+    raise SystemExit(0)
+username = unquote(parsed.username, errors="strict")
+password = unquote(parsed.password, errors="strict")
+safe_token = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:%@/-]+$")
+if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
+    raise SystemExit(1)
+netrc_path = auth_home / ".netrc"
+descriptor = os.open(netrc_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    contents = f"machine {parsed.hostname} login {username} password {password}\n".encode("utf-8")
+    os.write(descriptor, contents)
+    os.fchmod(descriptor, 0o600)
+finally:
+    os.close(descriptor)
+PY
+}
+
 validate_sdist_repair_identifiers() {
   local pip_command_name=$1
   local uv_command=$2
@@ -1004,7 +1157,7 @@ validate_sdist_repair_identifiers() {
   local canonical_name=$4
   local python_version=$5
   local ordinal=$6
-  local normalized_python declaration
+  local normalized_python declaration build_timeout
 
   [[ "$pip_command_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
     printf 'invalid pip command array name for pure Python sdist repair\n' >&2
@@ -1015,7 +1168,7 @@ validate_sdist_repair_identifiers() {
     return 1
   }
   local -n selected_pip_command=$pip_command_name
-  [[ "$declaration" == 'declare -a '* && ${#selected_pip_command[@]} -gt 0 && -n "${selected_pip_command[0]}" ]] || {
+  [[ "$declaration" == 'declare -a '* && -n "${selected_pip_command[0]-}" ]] || {
     printf 'pip command array is invalid for pure Python sdist repair\n' >&2
     return 1
   }
@@ -1027,6 +1180,15 @@ validate_sdist_repair_identifiers() {
     printf 'uv command not found for pure Python sdist repair\n' >&2
     return 1
   }
+  command -v timeout >/dev/null 2>&1 || {
+    printf 'coreutils timeout is required for pure Python sdist repair\n' >&2
+    return 1
+  }
+  build_timeout=${DIFY_SDIST_BUILD_TIMEOUT_SECONDS:-600}
+  [[ "$build_timeout" =~ ^[1-9][0-9]*$ ]] && ((10#$build_timeout <= 3600)) || {
+    printf 'DIFY_SDIST_BUILD_TIMEOUT_SECONDS must be between 1 and 3600\n' >&2
+    return 1
+  }
   [[ "$ordinal" =~ ^[1-9][0-9]*$ ]] || {
     printf 'pure Python sdist repair candidate ordinal must be a positive decimal\n' >&2
     return 1
@@ -1036,7 +1198,7 @@ validate_sdist_repair_identifiers() {
     printf 'pure Python sdist repair requires an exact MAJOR.MINOR target Python\n' >&2
     return 1
   }
-  python3 -B - "$requirement" "$canonical_name" <<'PY'
+  task3_python -B - "$requirement" "$canonical_name" <<'PY'
 import re
 import sys
 
@@ -1062,34 +1224,11 @@ PY
   fi
 }
 
-validate_sdist_repair_layout_before_create() {
-  local repair_dir=$1
-  local ordinal=$2
-
-  python3 -B - "$repair_dir" "$ordinal" <<'PY'
-import os
-import stat
-import sys
-
-
-repair_dir, ordinal = sys.argv[1:]
-candidate_dir = os.path.join(repair_dir, f"candidate-{ordinal}")
-if os.path.lexists(candidate_dir):
-    raise SystemExit(1)
-for leaf in ("built-wheels", "uv-cache", "uv-python"):
-    path = os.path.join(repair_dir, leaf)
-    if os.path.lexists(path):
-        mode = os.lstat(path).st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-            raise SystemExit(1)
-PY
-}
-
 validate_optional_socks_site_dir() {
   local socks_site_dir=$1
 
   [[ -z "$socks_site_dir" ]] && return 0
-  python3 -B - "$socks_site_dir" <<'PY'
+  task3_python -B - "$socks_site_dir" <<'PY'
 import os
 import stat
 import sys
@@ -1122,7 +1261,7 @@ validate_candidate_source_dir() {
   local source_dir=$1
   local error_log=$2
 
-  python3 -B - "$source_dir" "$error_log" <<'PY'
+  task3_python -B - "$source_dir" "$error_log" <<'PY'
 import os
 import re
 import stat
@@ -1139,7 +1278,8 @@ try:
         os.path.basename(source_dir) != "source"
         or re.fullmatch(r"candidate-[1-9][0-9]*", os.path.basename(candidate_dir)) is None
         or os.path.basename(repair_dir) != "sdist-repair"
-        or error_log != os.path.join(candidate_dir, "download.log")
+        or os.path.dirname(error_log) != candidate_dir
+        or re.fullmatch(r"\.download-log\.[A-Za-z0-9]+", os.path.basename(error_log)) is None
     ):
         raise ValueError
     for path in (repair_dir, candidate_dir, source_dir):
@@ -1164,16 +1304,17 @@ download_sdist() {
   local source_dir=$4
   local socks_site_dir=$5
   local error_log=$6
-  local proxy_url= normalized_python declaration repair_dir
+  local proxy_url= normalized_python declaration repair_dir safe_index auth_home
   local -a download_args=()
+  local -a clean_env_args=()
 
   [[ "$pip_command_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
   declaration="$(declare -p "$pip_command_name" 2>/dev/null)" || return
   local -n selected_pip_command=$pip_command_name
-  [[ "$declaration" == 'declare -a '* && ${#selected_pip_command[@]} -gt 0 ]] || return 1
+  [[ "$declaration" == 'declare -a '* && -n "${selected_pip_command[0]-}" ]] || return 1
   normalized_python="$(normalize_python_version "$python_version")" || return
   [[ "$normalized_python" == "$python_version" ]] || return 1
-  python3 -B - "$requirement" <<'PY'
+  task3_python -B - "$requirement" <<'PY'
 import re
 import sys
 
@@ -1194,11 +1335,18 @@ PY
     printf 'unsafe source staging for pure Python sdist download\n' >&2
     return 1
   }
+  if ! safe_index="$(printf '%s' "$PIP_MIRROR_URL" | sanitize_index_url_for_tools)"; then
+    return 1
+  fi
+  auth_home="$(dirname -- "$source_dir")/auth-home"
+  [[ -d "$auth_home" && ! -L "$auth_home" ]] || return 1
+  build_sanitized_environment_args clean_env_args "$auth_home"
   proxy_url="$(detect_socks_proxy)" || true
   download_args=(
     download
+    --isolated
     --disable-pip-version-check
-    --index-url "$PIP_MIRROR_URL"
+    --index-url "$safe_index"
     --python-version "$python_version"
     --implementation cp
     --no-deps
@@ -1211,11 +1359,13 @@ PY
     download_args \
     "$socks_site_dir" \
     "$error_log" \
-    "$([[ -n "$proxy_url" ]] && printf true || printf false)"
+    "$([[ -n "$proxy_url" ]] && printf true || printf false)" \
+    clean_env_args \
+    true
 }
 
 parse_distribution_validator_record() {
-  local record_file=$1
+  local line=$1
   local expected_dir=$2
   local path_result_name=$3
   local name_result_name=$4
@@ -1223,12 +1373,9 @@ parse_distribution_validator_record() {
   local -n path_result=$path_result_name
   local -n name_result=$name_result_name
   local -n version_result=$version_result_name
-  local line extra expected_real artifact_real
-  local -a lines=()
+  local extra expected_real artifact_real
 
-  mapfile -t lines <"$record_file" || return
-  [[ ${#lines[@]} -eq 1 ]] || return 1
-  line=${lines[0]}
+  [[ -n "$line" && "$line" != *$'\n'* && "$line" != *$'\r'* ]] || return 1
   [[ "$line" == *$'\t'*$'\t'* && "$line" != *$'\t'*$'\t'*$'\t'* ]] || return 1
   IFS=$'\t' read -r path_result name_result version_result extra <<<"$line"
   [[ -n "$path_result" && -n "$name_result" && -n "$version_result" && -z "$extra" ]] || return 1
@@ -1240,41 +1387,178 @@ parse_distribution_validator_record() {
   [[ "$path_result" == "$artifact_real" && "$(dirname -- "$artifact_real")" == "$expected_real" ]] || return 1
 }
 
-admit_pure_python_wheel() {
-  local wheel_path=$1
-  local built_wheels_dir=$2
-  local basename target temporary
+distribution_file_signature() {
+  task3_python -B - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
 
-  basename="$(basename -- "$wheel_path")"
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError("not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise OSError("file changed while hashing")
+    print(":".join(map(str, identity_after)) + ":" + digest.hexdigest())
+finally:
+    os.close(descriptor)
+PY
+}
+
+snapshot_built_wheel() {
+  local wheel_dir=$1
+  local candidate_dir=$2
+  local snapshot_dir_result_name=$3
+  local snapshot_path_result_name=$4
+  local -n snapshot_dir_result=$snapshot_dir_result_name
+  local -n snapshot_path_result=$snapshot_path_result_name
+  local wheel_basename original_path
+
+  wheel_basename="$(task3_python -B - "$wheel_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+directory = sys.argv[1]
+entries = []
+with os.scandir(directory) as iterator:
+    for entry in iterator:
+        entries.append(entry)
+        if len(entries) > 1024:
+            raise SystemExit(1)
+if len(entries) != 1:
+    raise SystemExit(1)
+entry = entries[0]
+if (
+    any(ord(character) < 32 or ord(character) == 127 for character in entry.name)
+    or not entry.name.lower().endswith(".whl")
+    or entry.is_symlink()
+):
+    raise SystemExit(1)
+mode = entry.stat(follow_symlinks=False).st_mode
+if not stat.S_ISREG(mode):
+    raise SystemExit(1)
+print(entry.name)
+PY
+)" || return
+  [[ -n "$wheel_basename" && "$wheel_basename" != */* ]] || return 1
+  snapshot_dir_result="$(mktemp -d "$candidate_dir/.admission.XXXXXXXX")" || return
+  chmod 700 -- "$snapshot_dir_result" || return
+  original_path="$wheel_dir/$wheel_basename"
+  snapshot_path_result="$snapshot_dir_result/$wheel_basename"
+  if ! mv -- "$original_path" "$snapshot_path_result"; then
+    rmdir -- "$snapshot_dir_result" 2>/dev/null || true
+    return 1
+  fi
+  if [[ ! -f "$snapshot_path_result" || -L "$snapshot_path_result" ]] || \
+    ! chmod 400 -- "$snapshot_path_result" || ! chmod 500 -- "$snapshot_dir_result"; then
+    cleanup_admission_snapshot "$snapshot_dir_result" "$snapshot_path_result" || true
+    return 1
+  fi
+}
+
+cleanup_admission_snapshot() {
+  local snapshot_dir=$1
+  local snapshot_path=$2
+
+  [[ -n "$snapshot_dir" && -n "$snapshot_path" && \
+    "$(dirname -- "$snapshot_path")" == "$snapshot_dir" && \
+    "$(basename -- "$snapshot_dir")" == .admission.* ]] || return 1
+  chmod 700 -- "$snapshot_dir" 2>/dev/null || true
+  if [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]]; then
+    chmod 600 -- "$snapshot_path" 2>/dev/null || true
+    rm -f -- "$snapshot_path"
+  fi
+  rmdir -- "$snapshot_dir" 2>/dev/null || true
+}
+
+remove_private_stage_log() {
+  local candidate_dir=$1
+  local log_path=$2
+
+  [[ -n "$log_path" && "$(dirname -- "$log_path")" == "$candidate_dir" ]] || return 1
+  if [[ -f "$log_path" && ! -L "$log_path" ]]; then
+    chmod 600 -- "$log_path" 2>/dev/null || true
+    rm -f -- "$log_path"
+  fi
+}
+
+admit_validated_snapshot() {
+  local snapshot_path=$1
+  local built_wheels_dir=$2
+  local expected_signature=$3
+  local basename target final_signature snapshot_dir
+
+  basename="$(basename -- "$snapshot_path")"
   [[ "$basename" == *.whl && "$basename" != */* ]] || return 1
   [[ -d "$built_wheels_dir" && ! -L "$built_wheels_dir" ]] || return 1
   target="$built_wheels_dir/$basename"
-  if [[ -e "$target" || -L "$target" ]]; then
-    [[ -f "$target" && ! -L "$target" ]] || return 1
-    cmp -s -- "$wheel_path" "$target"
-    return
-  fi
-  temporary="$(mktemp "$built_wheels_dir/.admit.XXXXXX")" || return
-  if ! cp -- "$wheel_path" "$temporary"; then
-    rm -f -- "$temporary"
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  [[ "$(distribution_file_signature "$snapshot_path")" == "$expected_signature" ]] || return 1
+  chmod 400 -- "$snapshot_path" || return
+  snapshot_dir="$(dirname -- "$snapshot_path")"
+  [[ "$(basename -- "$snapshot_dir")" == .admission.* ]] || return 1
+  chmod 700 -- "$snapshot_dir" || return
+  if ! mv -n -- "$snapshot_path" "$target"; then
     return 1
   fi
-  if ! mv -n -- "$temporary" "$target"; then
-    rm -f -- "$temporary"
+  [[ ! -e "$snapshot_path" && ! -L "$snapshot_path" ]] || return 1
+  final_signature="$(distribution_file_signature "$target")" || {
+    [[ -f "$target" && ! -L "$target" ]] && rm -f -- "$target"
+    return 1
+  }
+  if [[ "$final_signature" != "$expected_signature" ]]; then
+    [[ -f "$target" && ! -L "$target" ]] && rm -f -- "$target"
     return 1
   fi
-  if [[ -e "$temporary" ]]; then
-    if [[ -f "$target" && ! -L "$target" ]] && cmp -s -- "$temporary" "$target"; then
-      rm -f -- "$temporary"
-    else
-      rm -f -- "$temporary"
-      return 1
-    fi
-  fi
-  [[ -f "$target" && ! -L "$target" ]] || return 1
+  chmod 400 -- "$target" || return
 }
 
-repair_one_pure_sdist() {
+ensure_private_repair_directory() {
+  local directory=$1
+
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  else
+    mkdir -m 700 -- "$directory" || return
+  fi
+  chmod 700 -- "$directory" || return
+  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%a' "$directory")" == 700 ]]
+}
+
+validate_private_repair_layout() {
+  task3_python -B - "$@" <<'PY'
+import os
+import stat
+import sys
+
+
+for path in sys.argv[1:]:
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        raise SystemExit(1)
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+        raise SystemExit(1)
+PY
+}
+
+repair_one_pure_sdist_locked() {
   local pip_command_name=$1
   local uv_command=$2
   local requirement=$3
@@ -1283,9 +1567,167 @@ repair_one_pure_sdist() {
   local repair_dir=$6
   local socks_site_dir=$7
   local ordinal=$8
-  local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir
-  local download_log build_log sdist_record sdist_error wheel_record wheel_error
-  local sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version safe_index
+  local safe_index=$9
+  local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir auth_home
+  local download_log= build_log= sdist_error= wheel_error=
+  local sdist_output wheel_output sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version
+  local snapshot_dir= before_signature after_signature build_timeout
+  local -a clean_env_args=()
+  local -a uv_build_command=()
+
+  candidate_dir="$repair_dir/candidate-$ordinal"
+  source_dir="$candidate_dir/source"
+  wheel_dir="$candidate_dir/wheel"
+  built_wheels_dir="$repair_dir/built-wheels"
+  uv_cache_dir="$repair_dir/uv-cache"
+  uv_python_dir="$repair_dir/uv-python"
+  auth_home="$candidate_dir/auth-home"
+  if ! mkdir -m 700 -- "$candidate_dir"; then
+    printf 'pure Python sdist repair candidate staging is unsafe or already exists\n' >&2
+    return 1
+  fi
+  mkdir -m 700 -- "$source_dir" "$wheel_dir" "$auth_home" || return
+  ensure_private_repair_directory "$built_wheels_dir" || return
+  ensure_private_repair_directory "$uv_cache_dir" || return
+  ensure_private_repair_directory "$uv_python_dir" || return
+  validate_private_repair_layout \
+    "$repair_dir" "$repair_dir/.repair-lock" "$candidate_dir" "$source_dir" "$wheel_dir" \
+    "$auth_home" "$built_wheels_dir" "$uv_cache_dir" "$uv_python_dir" || return
+  printf '%s' "$PIP_MIRROR_URL" | write_private_index_auth "$auth_home" || return
+  build_sanitized_environment_args clean_env_args "$auth_home"
+
+  download_log="$(mktemp "$candidate_dir/.download-log.XXXXXXXX")" || return
+  if ! chmod 600 -- "$download_log"; then
+    remove_private_stage_log "$candidate_dir" "$download_log" || true
+    return 1
+  fi
+  if ! download_sdist \
+    "$pip_command_name" "$requirement" "$python_version" "$source_dir" "$socks_site_dir" "$download_log"; then
+    remove_private_stage_log "$candidate_dir" "$download_log" || true
+    printf 'Pure Python sdist repair failed during download: %s (index: %s)\n' \
+      "$requirement" "$safe_index" >&2
+    return 1
+  fi
+  remove_private_stage_log "$candidate_dir" "$download_log" || return
+
+  sdist_error="$(mktemp "$candidate_dir/.validation-log.XXXXXXXX")" || return
+  if ! chmod 600 -- "$sdist_error"; then
+    remove_private_stage_log "$candidate_dir" "$sdist_error" || true
+    return 1
+  fi
+  if ! sdist_output="$(env "${clean_env_args[@]}" python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
+    sdist "$source_dir" --name "$canonical_name" 2>"$sdist_error")"; then
+    redact_pip_log <"$sdist_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
+    remove_private_stage_log "$candidate_dir" "$sdist_error" || true
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  remove_private_stage_log "$candidate_dir" "$sdist_error" || return
+  if ! parse_distribution_validator_record \
+    "$sdist_output" "$source_dir" sdist_path metadata_name metadata_version || \
+    [[ "$metadata_name" != "$canonical_name" ]]; then
+    printf '%s\n' 'validation failed: invalid sdist validator result' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+
+  build_log="$(mktemp "$candidate_dir/.build-log.XXXXXXXX")" || return
+  if ! chmod 600 -- "$build_log"; then
+    remove_private_stage_log "$candidate_dir" "$build_log" || true
+    return 1
+  fi
+  build_timeout=${DIFY_SDIST_BUILD_TIMEOUT_SECONDS:-600}
+  uv_build_command=(
+    timeout --signal=TERM --kill-after=5s "${build_timeout}s"
+    env "${clean_env_args[@]}"
+    "UV_CACHE_DIR=$uv_cache_dir"
+    "UV_PYTHON_INSTALL_DIR=$uv_python_dir"
+    UV_PYTHON_PREFERENCE=only-managed
+    "$uv_command" build
+    --wheel
+    --no-config
+    --out-dir "$wheel_dir"
+    --python "$python_version"
+    --index-url "$safe_index"
+    "$sdist_path"
+  )
+  if ! run_bounded_command_log "$build_log" "${uv_build_command[@]}"; then
+    redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
+    remove_private_stage_log "$candidate_dir" "$build_log" || true
+    printf 'Pure Python sdist repair failed during build: %s\n' "$requirement" >&2
+    return 1
+  fi
+  remove_private_stage_log "$candidate_dir" "$build_log" || return
+
+  if ! snapshot_built_wheel "$wheel_dir" "$candidate_dir" snapshot_dir wheel_path; then
+    printf '%s\n' 'validation failed: exactly one safe wheel build output is required' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  before_signature="$(distribution_file_signature "$wheel_path")" || {
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    return 1
+  }
+  wheel_error="$(mktemp "$candidate_dir/.validation-log.XXXXXXXX")" || {
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    return 1
+  }
+  if ! chmod 600 -- "$wheel_error"; then
+    remove_private_stage_log "$candidate_dir" "$wheel_error" || true
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    return 1
+  fi
+  if ! wheel_output="$(env "${clean_env_args[@]}" python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
+    wheel "$snapshot_dir" --name "$metadata_name" --version "$metadata_version" 2>"$wheel_error")"; then
+    redact_pip_log <"$wheel_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
+    remove_private_stage_log "$candidate_dir" "$wheel_error" || true
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! remove_private_stage_log "$candidate_dir" "$wheel_error"; then
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    return 1
+  fi
+  after_signature="$(distribution_file_signature "$wheel_path")" || {
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    return 1
+  }
+  if [[ "$before_signature" != "$after_signature" ]]; then
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    printf '%s\n' 'validation failed: wheel snapshot changed during validation' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! parse_distribution_validator_record \
+    "$wheel_output" "$snapshot_dir" wheel_path wheel_name wheel_version || \
+    [[ "$wheel_name" != "$metadata_name" || "$wheel_version" != "$metadata_version" ]]; then
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    printf '%s\n' 'validation failed: invalid wheel validator result' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! admit_validated_snapshot "$wheel_path" "$built_wheels_dir" "$after_signature"; then
+    cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
+    printf '%s\n' 'validation failed: unable to admit validated wheel safely' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  rmdir -- "$snapshot_dir" || return
+  printf 'Pure Python wheel admitted: %s\n' "$(basename -- "$wheel_path")"
+}
+
+repair_one_pure_sdist() (
+  umask 077
+  local pip_command_name=$1
+  local uv_command=$2
+  local requirement=$3
+  local canonical_name=$4
+  local python_version=$5
+  local repair_dir=$6
+  local socks_site_dir=$7
+  local ordinal=$8
+  local safe_index repair_lock_dir
 
   validate_sdist_repair_dir "$repair_dir" || return
   validate_sdist_repair_identifiers \
@@ -1296,87 +1738,23 @@ repair_one_pure_sdist() {
     printf 'Python distribution validator is unavailable\n' >&2
     return 1
   }
-  validate_sdist_repair_layout_before_create "$repair_dir" "$ordinal" || {
-    printf 'pure Python sdist repair candidate staging is unsafe or already exists\n' >&2
-    return 1
-  }
-
-  candidate_dir="$repair_dir/candidate-$ordinal"
-  source_dir="$candidate_dir/source"
-  wheel_dir="$candidate_dir/wheel"
-  built_wheels_dir="$repair_dir/built-wheels"
-  uv_cache_dir="$repair_dir/uv-cache"
-  uv_python_dir="$repair_dir/uv-python"
-  download_log="$candidate_dir/download.log"
-  build_log="$candidate_dir/build.log"
-  sdist_record="$candidate_dir/sdist.record"
-  sdist_error="$candidate_dir/sdist-validation.log"
-  wheel_record="$candidate_dir/wheel.record"
-  wheel_error="$candidate_dir/wheel-validation.log"
-
-  mkdir -p -- \
-    "$source_dir" "$wheel_dir" "$built_wheels_dir" "$uv_cache_dir" "$uv_python_dir" || return
-  if ! download_sdist \
-    "$pip_command_name" "$requirement" "$python_version" "$source_dir" "$socks_site_dir" "$download_log"; then
-    safe_index="$(redact_url_for_log "$PIP_MIRROR_URL")"
-    printf 'Pure Python sdist repair failed during download: %s (index: %s)\n' \
-      "$requirement" "$safe_index" >&2
+  if ! safe_index="$(printf '%s' "$PIP_MIRROR_URL" | sanitize_index_url_for_tools)"; then
+    printf 'Pure Python sdist repair rejected the configured package index\n' >&2
     return 1
   fi
-
-  if ! python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
-    sdist "$source_dir" --name "$canonical_name" >"$sdist_record" 2>"$sdist_error"; then
-    redact_pip_log <"$sdist_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
-    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+  ensure_private_repair_directory "$repair_dir" || return
+  repair_lock_dir="$repair_dir/.repair-lock"
+  if ! mkdir -m 700 -- "$repair_lock_dir"; then
+    printf 'pure Python sdist repair lock is already held or stale\n' >&2
     return 1
   fi
-  if ! parse_distribution_validator_record \
-    "$sdist_record" "$source_dir" sdist_path metadata_name metadata_version || \
-    [[ "$metadata_name" != "$canonical_name" ]]; then
-    redact_pip_log <"$sdist_error" >&2 || true
-    printf '%s\n' 'validation failed: invalid sdist validator result' >&2
-    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
-    return 1
-  fi
-
-  : >"$build_log"
-  if ! UV_CACHE_DIR="$uv_cache_dir" \
-    UV_PYTHON_INSTALL_DIR="$uv_python_dir" \
-    UV_PYTHON_PREFERENCE=only-managed \
-    "$uv_command" build \
-      --wheel \
-      --no-config \
-      --out-dir "$wheel_dir" \
-      --python "$python_version" \
-      --index-url "$PIP_MIRROR_URL" \
-      "$sdist_path" >"$build_log" 2>&1; then
-    redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
-    printf 'Pure Python sdist repair failed during build: %s\n' "$requirement" >&2
-    return 1
-  fi
-
-  if ! python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
-    wheel "$wheel_dir" --name "$metadata_name" --version "$metadata_version" \
-    >"$wheel_record" 2>"$wheel_error"; then
-    redact_pip_log <"$wheel_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
-    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
-    return 1
-  fi
-  if ! parse_distribution_validator_record \
-    "$wheel_record" "$wheel_dir" wheel_path wheel_name wheel_version || \
-    [[ "$wheel_name" != "$metadata_name" || "$wheel_version" != "$metadata_version" ]]; then
-    redact_pip_log <"$wheel_error" >&2 || true
-    printf '%s\n' 'validation failed: invalid wheel validator result' >&2
-    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
-    return 1
-  fi
-  if ! admit_pure_python_wheel "$wheel_path" "$built_wheels_dir"; then
-    printf '%s\n' 'validation failed: unable to admit validated wheel safely' >&2
-    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
-    return 1
-  fi
-  printf 'Pure Python wheel admitted: %s\n' "$(basename -- "$wheel_path")"
-}
+  REPAIR_LOCK_TO_RELEASE=$repair_lock_dir
+  trap 'rmdir -- "$REPAIR_LOCK_TO_RELEASE" 2>/dev/null || true' EXIT
+  validate_sdist_repair_dir "$repair_dir" || return
+  repair_one_pure_sdist_locked \
+    "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" \
+    "$repair_dir" "$socks_site_dir" "$ordinal" "$safe_index"
+)
 
 download_wheels_once() {
   local requirements=$1
