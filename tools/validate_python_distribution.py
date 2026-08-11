@@ -23,9 +23,40 @@ MAX_TOTAL_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
 STREAM_CHUNK_SIZE = 1024 * 1024
 PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 VERSION_RE = re.compile(
-    r"v?(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?(?:[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?(?:[-_.]?dev[-_.]?[0-9]*)?(?:\+[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*)?$",
-    re.IGNORECASE,
+    r"""
+    \s*v?
+    (?:
+        (?:(?P<epoch>[0-9]+)!)?
+        (?P<release>[0-9]+(?:\.[0-9]+)*)
+        (?P<pre>
+            [-_.]?
+            (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
+            [-_.]?
+            (?P<pre_n>[0-9]+)?
+        )?
+        (?P<post>
+            (?:-(?P<post_n1>[0-9]+))
+            |
+            (?:
+                [-_.]?
+                (?P<post_l>post|rev|r)
+                [-_.]?
+                (?P<post_n2>[0-9]+)?
+            )
+        )?
+        (?P<dev>
+            [-_.]?
+            (?P<dev_l>dev)
+            [-_.]?
+            (?P<dev_n>[0-9]+)?
+        )?
+    )
+    (?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?
+    \s*
+    """,
+    re.ASCII | re.IGNORECASE | re.VERBOSE,
 )
+WHEEL_DISTRIBUTION_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?$")
 
 
 class Parser(argparse.ArgumentParser):
@@ -41,8 +72,47 @@ def has_ascii_control(value):
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
-def wheel_component(value):
-    return re.sub(r"[^A-Za-z0-9.]+", "_", value)
+def normalize_version(version):
+    if has_ascii_control(version):
+        raise ValueError("version contains an ASCII control character")
+    match = VERSION_RE.fullmatch(version)
+    if match is None:
+        raise ValueError("version is not PEP 440 compliant")
+
+    normalized = []
+    epoch = int(match.group("epoch") or 0)
+    if epoch:
+        normalized.append(f"{epoch}!")
+    normalized.append(".".join(str(int(part)) for part in match.group("release").split(".")))
+
+    if match.group("pre") is not None:
+        label = match.group("pre_l").lower()
+        label = {"alpha": "a", "beta": "b", "c": "rc", "pre": "rc", "preview": "rc"}.get(label, label)
+        normalized.append(f"{label}{int(match.group('pre_n') or 0)}")
+
+    if match.group("post") is not None:
+        number = match.group("post_n1") or match.group("post_n2") or "0"
+        normalized.append(f".post{int(number)}")
+
+    if match.group("dev") is not None:
+        normalized.append(f".dev{int(match.group('dev_n') or 0)}")
+
+    local = match.group("local")
+    if local is not None:
+        segments = re.split(r"[-_.]", local.lower())
+        normalized_segments = [str(int(segment)) if re.fullmatch(r"[0-9]+", segment) else segment for segment in segments]
+        normalized.append("+" + ".".join(normalized_segments))
+    return "".join(normalized)
+
+
+def wheel_distribution_component(name):
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def wheel_distribution_matches(component, name):
+    if "__" in component or not WHEEL_DISTRIBUTION_RE.fullmatch(component):
+        return False
+    return canonical_name(component) == canonical_name(name)
 
 
 def parse_metadata(contents, label):
@@ -56,7 +126,9 @@ def parse_metadata(contents, label):
     name, version = name.strip(), version.strip()
     if not PROJECT_NAME_RE.fullmatch(name):
         raise ValidationError("invalid metadata Name")
-    if has_ascii_control(version) or not VERSION_RE.fullmatch(version):
+    try:
+        version = normalize_version(version)
+    except ValueError:
         raise ValidationError("invalid metadata version")
     return name, version, message
 
@@ -236,12 +308,14 @@ def parse_wheel_filename(filename):
     if len(parts) not in (5, 6):
         raise ValidationError("invalid wheel filename")
     distribution, version = parts[0], parts[1]
-    build = parts[2:-3]
+    build = parts[2] if len(parts) == 6 else None
     python_tag, abi_tag, platform_tag = parts[-3:]
-    if not distribution or not version or not python_tag:
+    if not WHEEL_DISTRIBUTION_RE.fullmatch(distribution) or not version or not python_tag:
         raise ValidationError("invalid wheel filename")
-    if build and not re.fullmatch(r"[0-9][0-9A-Za-z_.]*", build[0]):
+    if build is not None and (not build or has_ascii_control(build) or build[0] not in "0123456789"):
         raise ValidationError("invalid wheel build tag")
+    if any(has_ascii_control(component) for component in (python_tag, abi_tag, platform_tag)):
+        raise ValidationError("invalid wheel filename")
     if any(not tag for tag in python_tag.split(".")):
         raise ValidationError("invalid Python tag")
     if any(tag != "none" for tag in abi_tag.split(".")):
@@ -302,14 +376,24 @@ def validate_wheel(directory, expected_name, expected_version):
                 raise ValidationError("METADATA and WHEEL are not siblings")
             contents, magics = stream_members(archive, members, set(metadata + wheel_files))
             name, version, _ = parse_metadata(contents[metadata[0]], "METADATA")
+            try:
+                normalized_filename_version = normalize_version(filename_version)
+            except ValueError:
+                raise ValidationError("invalid wheel version")
+            if filename_version != normalized_filename_version:
+                raise ValidationError("invalid wheel version")
+            try:
+                expected_version = normalize_version(expected_version)
+            except ValueError:
+                raise ValidationError("invalid expected version")
             wheel_message = BytesParser(policy=policy.compat32).parsebytes(contents[wheel_files[0]])
             wheel_parent = Path(metadata[0].filename).parent.name
-            expected_dist_info = f"{wheel_component(name)}-{wheel_component(version)}.dist-info"
+            expected_dist_info = f"{wheel_distribution_component(name)}-{version}.dist-info"
             if canonical_name(name) != canonical_name(expected_name):
                 raise ValidationError("metadata name does not match expected name")
             if version != expected_version:
                 raise ValidationError("metadata version does not match expected version")
-            if filename_name != wheel_component(name) or filename_version != wheel_component(version):
+            if not wheel_distribution_matches(filename_name, name) or filename_version != version:
                 raise ValidationError("wheel filename identity does not match metadata")
             if wheel_parent != expected_dist_info:
                 raise ValidationError("dist-info directory does not match wheel filename")

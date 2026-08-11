@@ -29,6 +29,10 @@ def wheel_metadata(name="docopt", version="0.6.2", purelib="true", tags=None):
     return ("\n".join(lines) + "\n\n").encode()
 
 
+def normalized_wheel_name(name):
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
 def corrupt_stored_zip_member(path, member_name, offset):
     with zipfile.ZipFile(path) as archive:
         info = archive.getinfo(member_name)
@@ -127,8 +131,13 @@ class DistributionFixture:
         return path
 
     def wheel(self, filename="docopt-0.6.2-py2.py3-none-any.whl", name="docopt",
-              version="0.6.2", purelib="true", tags=None, extra=None):
-        dist_info = f"{re.sub(r'[^A-Za-z0-9.]+', '_', name)}-{re.sub(r'[^A-Za-z0-9.]+', '_', version)}.dist-info"
+              version="0.6.2", purelib="true", tags=None, extra=None,
+              dist_info_name=None, dist_info_version=None):
+        if dist_info_name is None:
+            dist_info_name = normalized_wheel_name(name)
+        if dist_info_version is None:
+            dist_info_version = version
+        dist_info = f"{dist_info_name}-{dist_info_version}.dist-info"
         entries = [
             (f"{dist_info}/METADATA", pkg_info(name, version), "file"),
             (f"{dist_info}/WHEEL", wheel_metadata(name, version, purelib, tags), "file"),
@@ -250,13 +259,107 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_pure_wheel_with_general_pep427_build_tag_is_accepted(self):
+        self.fixture.wheel(filename="docopt-0.6.2-1@local-py3-none-any.whl")
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_wheel_epoch_local_filename_identity_is_accepted(self):
         artifact = self.fixture.wheel(
-            filename="docopt-1_2.0_local-py3-none-any.whl", version="1!2.0+local",
+            filename="docopt-1!2.0+local-py3-none-any.whl", version="1!2.0+local",
         )
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "1!2.0+local")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t1!2.0+local\n")
+
+    def test_wheel_underscore_escaped_epoch_and_local_version_is_rejected(self):
+        self.fixture.wheel(
+            filename="docopt-1_2.0_local-py3-none-any.whl", version="1!2.0+local",
+            dist_info_version="1_2.0_local",
+        )
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "1!2.0+local")
+        self.assert_error(result, "invalid wheel version")
+
+    def test_wheel_project_name_uses_normalized_filename_component(self):
+        artifact = self.fixture.wheel(
+            filename="my_project_name-0.6.2-py3-none-any.whl", name="My.Project-Name",
+        )
+        result = self.run_validator(
+            "wheel", self.fixture.directory, "--name", "my-project-name", "--version", "0.6.2",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{artifact.resolve()}\tmy-project-name\t0.6.2\n")
+
+    def test_wheel_legacy_project_name_separators_are_accepted_safely(self):
+        for legacy_name in ("My..Project", "My._Project"):
+            with self.subTest(legacy_name=legacy_name), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                artifact = fixture.wheel(
+                    filename=f"{legacy_name}-0.6.2-py3-none-any.whl", name=legacy_name,
+                )
+                result = self.run_validator(
+                    "wheel", directory, "--name", "my-project", "--version", "0.6.2",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{artifact.resolve()}\tmy-project\t0.6.2\n")
+
+    def test_pep440_alternate_versions_are_normalized(self):
+        cases = [
+            ("v1.0", "1.0"),
+            (" 1.0 ", "1.0"),
+            ("01!02.003", "1!2.3"),
+            ("1.0alpha", "1.0a0"),
+            ("1.0beta2", "1.0b2"),
+            ("1.0preview.3", "1.0rc3"),
+            ("1.0-1", "1.0.post1"),
+            ("1.0rev", "1.0.post0"),
+            ("1.0dev", "1.0.dev0"),
+            ("1.0+ABC-01_local", "1.0+abc.1.local"),
+        ]
+        for raw_version, normalized_version in cases:
+            with self.subTest(raw_version=raw_version), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                artifact = fixture.wheel(
+                    filename=f"docopt-{normalized_version}-py3-none-any.whl",
+                    version=raw_version,
+                    dist_info_version=normalized_version,
+                )
+                result = self.run_validator(
+                    "wheel", directory, "--name", "docopt", "--version", raw_version,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t{normalized_version}\n")
+
+    def test_expected_alternate_version_matches_normalized_wheel_version(self):
+        artifact = self.fixture.wheel(
+            filename="docopt-1.0.post1-py3-none-any.whl", version="1.0.post1",
+        )
+        result = self.run_validator(
+            "wheel", self.fixture.directory, "--name", "docopt", "--version", "1.0-1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t1.0.post1\n")
+
+    def test_malformed_pep440_versions_are_rejected(self):
+        malformed_versions = [
+            "bad!",
+            "1_2.0_local",
+            "1.0+abc+def",
+            "1.0+abc..def",
+            "1.0\x01",
+        ]
+        for version in malformed_versions:
+            with self.subTest(version=repr(version)), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                fixture.wheel(
+                    filename="docopt-1.0-py3-none-any.whl",
+                    version=version,
+                    dist_info_version="1.0",
+                )
+                result = self.run_validator(
+                    "wheel", directory, "--name", "docopt", "--version", "1.0",
+                )
+                self.assert_error(result, "invalid metadata version")
 
     def test_wheel_invalid_metadata_version_is_rejected(self):
         self.fixture.wheel(filename="docopt-bad!-py3-none-any.whl", version="bad!")
