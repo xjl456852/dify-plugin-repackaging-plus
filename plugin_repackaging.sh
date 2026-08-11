@@ -954,6 +954,430 @@ run_pip_with_socks_retry() {
   return "$retry_status"
 }
 
+validate_sdist_repair_dir() {
+  local repair_dir=${1:-}
+
+  python3 -B - "$repair_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+path = sys.argv[1]
+try:
+    if (
+        not path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or not os.path.isabs(path)
+        or os.path.normpath(path) != path
+    ):
+        raise ValueError
+    if os.path.basename(path) != "sdist-repair":
+        raise ValueError
+    parent = os.path.dirname(path)
+    if parent in {"", ".", os.path.sep, path}:
+        raise ValueError
+
+    current = os.path.sep
+    for component in path.split(os.path.sep)[1:]:
+        current = os.path.join(current, component)
+        if not os.path.lexists(current):
+            break
+        mode = os.lstat(current).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  if (($? != 0)); then
+    printf 'safe absolute sdist-repair staging directory is required\n' >&2
+    return 1
+  fi
+}
+
+validate_sdist_repair_identifiers() {
+  local pip_command_name=$1
+  local uv_command=$2
+  local requirement=$3
+  local canonical_name=$4
+  local python_version=$5
+  local ordinal=$6
+  local normalized_python declaration
+
+  [[ "$pip_command_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+    printf 'invalid pip command array name for pure Python sdist repair\n' >&2
+    return 1
+  }
+  declaration="$(declare -p "$pip_command_name" 2>/dev/null)" || {
+    printf 'pip command array not found for pure Python sdist repair\n' >&2
+    return 1
+  }
+  local -n selected_pip_command=$pip_command_name
+  [[ "$declaration" == 'declare -a '* && ${#selected_pip_command[@]} -gt 0 && -n "${selected_pip_command[0]}" ]] || {
+    printf 'pip command array is invalid for pure Python sdist repair\n' >&2
+    return 1
+  }
+  command -v "${selected_pip_command[0]}" >/dev/null 2>&1 || {
+    printf 'pip command not found for pure Python sdist repair\n' >&2
+    return 1
+  }
+  [[ -n "$uv_command" ]] && command -v "$uv_command" >/dev/null 2>&1 || {
+    printf 'uv command not found for pure Python sdist repair\n' >&2
+    return 1
+  }
+  [[ "$ordinal" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'pure Python sdist repair candidate ordinal must be a positive decimal\n' >&2
+    return 1
+  }
+  normalized_python="$(normalize_python_version "$python_version")" || return
+  [[ "$normalized_python" == "$python_version" ]] || {
+    printf 'pure Python sdist repair requires an exact MAJOR.MINOR target Python\n' >&2
+    return 1
+  }
+  python3 -B - "$requirement" "$canonical_name" <<'PY'
+import re
+import sys
+
+
+requirement, expected_name = sys.argv[1:]
+name_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+specifier = r"(?:===|==|!=|~=|<=|>=|<|>)[A-Za-z0-9][A-Za-z0-9.!+_*-]*"
+requirement_pattern = re.compile(
+    rf"^(?P<name>{name_pattern})(?:{specifier}(?:,{specifier})*)?$"
+)
+canonical_pattern = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+
+match = requirement_pattern.fullmatch(requirement)
+if match is None or canonical_pattern.fullmatch(expected_name) is None:
+    raise SystemExit(1)
+normalized_name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
+if normalized_name != expected_name:
+    raise SystemExit(1)
+PY
+  if (($? != 0)); then
+    printf 'unsafe or mismatched requirement for pure Python sdist repair\n' >&2
+    return 1
+  fi
+}
+
+validate_sdist_repair_layout_before_create() {
+  local repair_dir=$1
+  local ordinal=$2
+
+  python3 -B - "$repair_dir" "$ordinal" <<'PY'
+import os
+import stat
+import sys
+
+
+repair_dir, ordinal = sys.argv[1:]
+candidate_dir = os.path.join(repair_dir, f"candidate-{ordinal}")
+if os.path.lexists(candidate_dir):
+    raise SystemExit(1)
+for leaf in ("built-wheels", "uv-cache", "uv-python"):
+    path = os.path.join(repair_dir, leaf)
+    if os.path.lexists(path):
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise SystemExit(1)
+PY
+}
+
+validate_optional_socks_site_dir() {
+  local socks_site_dir=$1
+
+  [[ -z "$socks_site_dir" ]] && return 0
+  python3 -B - "$socks_site_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+path = sys.argv[1]
+try:
+    if (
+        not os.path.isabs(path)
+        or os.path.normpath(path) != path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+    ):
+        raise ValueError
+    current = os.path.sep
+    for component in path.split(os.path.sep)[1:]:
+        current = os.path.join(current, component)
+        mode = os.lstat(current).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  if (($? != 0)); then
+    printf 'safe temporary SOCKS site directory is required for pure Python sdist repair\n' >&2
+    return 1
+  fi
+}
+
+validate_candidate_source_dir() {
+  local source_dir=$1
+  local error_log=$2
+
+  python3 -B - "$source_dir" "$error_log" <<'PY'
+import os
+import re
+import stat
+import sys
+
+
+source_dir, error_log = sys.argv[1:]
+try:
+    if not os.path.isabs(source_dir) or os.path.normpath(source_dir) != source_dir:
+        raise ValueError
+    candidate_dir = os.path.dirname(source_dir)
+    repair_dir = os.path.dirname(candidate_dir)
+    if (
+        os.path.basename(source_dir) != "source"
+        or re.fullmatch(r"candidate-[1-9][0-9]*", os.path.basename(candidate_dir)) is None
+        or os.path.basename(repair_dir) != "sdist-repair"
+        or error_log != os.path.join(candidate_dir, "download.log")
+    ):
+        raise ValueError
+    for path in (repair_dir, candidate_dir, source_dir):
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError
+    if any(os.scandir(source_dir)):
+        raise ValueError
+    if os.path.lexists(error_log):
+        mode = os.lstat(error_log).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+download_sdist() {
+  local pip_command_name=$1
+  local requirement=$2
+  local python_version=$3
+  local source_dir=$4
+  local socks_site_dir=$5
+  local error_log=$6
+  local proxy_url= normalized_python declaration repair_dir
+  local -a download_args=()
+
+  [[ "$pip_command_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  declaration="$(declare -p "$pip_command_name" 2>/dev/null)" || return
+  local -n selected_pip_command=$pip_command_name
+  [[ "$declaration" == 'declare -a '* && ${#selected_pip_command[@]} -gt 0 ]] || return 1
+  normalized_python="$(normalize_python_version "$python_version")" || return
+  [[ "$normalized_python" == "$python_version" ]] || return 1
+  python3 -B - "$requirement" <<'PY'
+import re
+import sys
+
+
+name = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+specifier = r"(?:===|==|!=|~=|<=|>=|<|>)[A-Za-z0-9][A-Za-z0-9.!+_*-]*"
+if re.fullmatch(rf"{name}(?:{specifier}(?:,{specifier})*)?", sys.argv[1]) is None:
+    raise SystemExit(1)
+PY
+  if (($? != 0)); then
+    printf 'unsafe requirement for pure Python sdist download\n' >&2
+    return 1
+  fi
+  repair_dir="$(dirname -- "$(dirname -- "$source_dir")")"
+  validate_sdist_repair_dir "$repair_dir" || return
+  validate_optional_socks_site_dir "$socks_site_dir" || return
+  validate_candidate_source_dir "$source_dir" "$error_log" || {
+    printf 'unsafe source staging for pure Python sdist download\n' >&2
+    return 1
+  }
+  proxy_url="$(detect_socks_proxy)" || true
+  download_args=(
+    download
+    --disable-pip-version-check
+    --index-url "$PIP_MIRROR_URL"
+    --python-version "$python_version"
+    --implementation cp
+    --no-deps
+    --no-binary=:all:
+    --dest "$source_dir"
+    "$requirement"
+  )
+  run_pip_with_socks_retry \
+    "$pip_command_name" \
+    download_args \
+    "$socks_site_dir" \
+    "$error_log" \
+    "$([[ -n "$proxy_url" ]] && printf true || printf false)"
+}
+
+parse_distribution_validator_record() {
+  local record_file=$1
+  local expected_dir=$2
+  local path_result_name=$3
+  local name_result_name=$4
+  local version_result_name=$5
+  local -n path_result=$path_result_name
+  local -n name_result=$name_result_name
+  local -n version_result=$version_result_name
+  local line extra expected_real artifact_real
+  local -a lines=()
+
+  mapfile -t lines <"$record_file" || return
+  [[ ${#lines[@]} -eq 1 ]] || return 1
+  line=${lines[0]}
+  [[ "$line" == *$'\t'*$'\t'* && "$line" != *$'\t'*$'\t'*$'\t'* ]] || return 1
+  IFS=$'\t' read -r path_result name_result version_result extra <<<"$line"
+  [[ -n "$path_result" && -n "$name_result" && -n "$version_result" && -z "$extra" ]] || return 1
+  [[ "$name_result" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  [[ "$version_result" =~ ^[A-Za-z0-9.!+]+$ ]] || return 1
+  [[ -f "$path_result" && ! -L "$path_result" ]] || return 1
+  expected_real="$(realpath -e -- "$expected_dir")" || return
+  artifact_real="$(realpath -e -- "$path_result")" || return
+  [[ "$path_result" == "$artifact_real" && "$(dirname -- "$artifact_real")" == "$expected_real" ]] || return 1
+}
+
+admit_pure_python_wheel() {
+  local wheel_path=$1
+  local built_wheels_dir=$2
+  local basename target temporary
+
+  basename="$(basename -- "$wheel_path")"
+  [[ "$basename" == *.whl && "$basename" != */* ]] || return 1
+  [[ -d "$built_wheels_dir" && ! -L "$built_wheels_dir" ]] || return 1
+  target="$built_wheels_dir/$basename"
+  if [[ -e "$target" || -L "$target" ]]; then
+    [[ -f "$target" && ! -L "$target" ]] || return 1
+    cmp -s -- "$wheel_path" "$target"
+    return
+  fi
+  temporary="$(mktemp "$built_wheels_dir/.admit.XXXXXX")" || return
+  if ! cp -- "$wheel_path" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! mv -n -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if [[ -e "$temporary" ]]; then
+    if [[ -f "$target" && ! -L "$target" ]] && cmp -s -- "$temporary" "$target"; then
+      rm -f -- "$temporary"
+    else
+      rm -f -- "$temporary"
+      return 1
+    fi
+  fi
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+}
+
+repair_one_pure_sdist() {
+  local pip_command_name=$1
+  local uv_command=$2
+  local requirement=$3
+  local canonical_name=$4
+  local python_version=$5
+  local repair_dir=$6
+  local socks_site_dir=$7
+  local ordinal=$8
+  local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir
+  local download_log build_log sdist_record sdist_error wheel_record wheel_error
+  local sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version safe_index
+
+  validate_sdist_repair_dir "$repair_dir" || return
+  validate_sdist_repair_identifiers \
+    "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" "$ordinal" || return
+  validate_optional_socks_site_dir "$socks_site_dir" || return
+  [[ -f "$SCRIPT_DIR/tools/validate_python_distribution.py" && \
+    ! -L "$SCRIPT_DIR/tools/validate_python_distribution.py" ]] || {
+    printf 'Python distribution validator is unavailable\n' >&2
+    return 1
+  }
+  validate_sdist_repair_layout_before_create "$repair_dir" "$ordinal" || {
+    printf 'pure Python sdist repair candidate staging is unsafe or already exists\n' >&2
+    return 1
+  }
+
+  candidate_dir="$repair_dir/candidate-$ordinal"
+  source_dir="$candidate_dir/source"
+  wheel_dir="$candidate_dir/wheel"
+  built_wheels_dir="$repair_dir/built-wheels"
+  uv_cache_dir="$repair_dir/uv-cache"
+  uv_python_dir="$repair_dir/uv-python"
+  download_log="$candidate_dir/download.log"
+  build_log="$candidate_dir/build.log"
+  sdist_record="$candidate_dir/sdist.record"
+  sdist_error="$candidate_dir/sdist-validation.log"
+  wheel_record="$candidate_dir/wheel.record"
+  wheel_error="$candidate_dir/wheel-validation.log"
+
+  mkdir -p -- \
+    "$source_dir" "$wheel_dir" "$built_wheels_dir" "$uv_cache_dir" "$uv_python_dir" || return
+  if ! download_sdist \
+    "$pip_command_name" "$requirement" "$python_version" "$source_dir" "$socks_site_dir" "$download_log"; then
+    safe_index="$(redact_url_for_log "$PIP_MIRROR_URL")"
+    printf 'Pure Python sdist repair failed during download: %s (index: %s)\n' \
+      "$requirement" "$safe_index" >&2
+    return 1
+  fi
+
+  if ! python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
+    sdist "$source_dir" --name "$canonical_name" >"$sdist_record" 2>"$sdist_error"; then
+    redact_pip_log <"$sdist_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! parse_distribution_validator_record \
+    "$sdist_record" "$source_dir" sdist_path metadata_name metadata_version || \
+    [[ "$metadata_name" != "$canonical_name" ]]; then
+    redact_pip_log <"$sdist_error" >&2 || true
+    printf '%s\n' 'validation failed: invalid sdist validator result' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+
+  : >"$build_log"
+  if ! UV_CACHE_DIR="$uv_cache_dir" \
+    UV_PYTHON_INSTALL_DIR="$uv_python_dir" \
+    UV_PYTHON_PREFERENCE=only-managed \
+    "$uv_command" build \
+      --wheel \
+      --no-config \
+      --out-dir "$wheel_dir" \
+      --python "$python_version" \
+      --index-url "$PIP_MIRROR_URL" \
+      "$sdist_path" >"$build_log" 2>&1; then
+    redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
+    printf 'Pure Python sdist repair failed during build: %s\n' "$requirement" >&2
+    return 1
+  fi
+
+  if ! python3 -B "$SCRIPT_DIR/tools/validate_python_distribution.py" \
+    wheel "$wheel_dir" --name "$metadata_name" --version "$metadata_version" \
+    >"$wheel_record" 2>"$wheel_error"; then
+    redact_pip_log <"$wheel_error" >&2 || printf 'validator output could not be displayed safely\n' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! parse_distribution_validator_record \
+    "$wheel_record" "$wheel_dir" wheel_path wheel_name wheel_version || \
+    [[ "$wheel_name" != "$metadata_name" || "$wheel_version" != "$metadata_version" ]]; then
+    redact_pip_log <"$wheel_error" >&2 || true
+    printf '%s\n' 'validation failed: invalid wheel validator result' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  if ! admit_pure_python_wheel "$wheel_path" "$built_wheels_dir"; then
+    printf '%s\n' 'validation failed: unable to admit validated wheel safely' >&2
+    printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
+    return 1
+  fi
+  printf 'Pure Python wheel admitted: %s\n' "$(basename -- "$wheel_path")"
+}
+
 download_wheels_once() {
   local requirements=$1
   local wheels_dir=$2

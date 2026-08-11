@@ -711,6 +711,466 @@ else
   pass 'pre-pip failure cannot leave stale classifiable output'
 fi
 
+set +e
+sdist_repair_fixture_dir="$FIXTURE_DIR/sdist-repair-fixtures"
+mkdir -p "$sdist_repair_fixture_dir"
+python3 - "$sdist_repair_fixture_dir" <<'PY'
+from pathlib import Path
+import io
+import sys
+import tarfile
+import zipfile
+
+
+root = Path(sys.argv[1])
+
+
+def write_sdist(path, name="docopt", version="0.6.2"):
+    prefix = f"{name}-{version}"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n".encode()
+    with tarfile.open(path, "w:gz") as archive:
+        for member_name, contents in (
+            (f"{prefix}/PKG-INFO", metadata),
+            (f"{prefix}/setup.py", b"from setuptools import setup\nsetup()\n"),
+        ):
+            info = tarfile.TarInfo(member_name)
+            info.size = len(contents)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(contents))
+
+
+def write_wheel(path, name="docopt", version="0.6.2", pure=True, native=False):
+    distribution = name.replace("-", "_")
+    dist_info = f"{distribution}-{version}.dist-info"
+    wheel = (
+        "Wheel-Version: 1.0\n"
+        "Generator: repair-test\n"
+        f"Root-Is-Purelib: {'true' if pure else 'false'}\n"
+        "Tag: py2-none-any\n"
+        "Tag: py3-none-any\n\n"
+    ).encode()
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n".encode()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{dist_info}/METADATA", metadata)
+        archive.writestr(f"{dist_info}/WHEEL", wheel)
+        archive.writestr(f"{distribution}.py", b"__version__ = '0.6.2'\n")
+        if native:
+            archive.writestr(f"{distribution}/native_payload", b"\x7fELF" + b"\0" * 32)
+
+
+write_sdist(root / "docopt-0.6.2.tar.gz")
+write_sdist(root / "other-1.0.tar.gz", "other", "1.0")
+write_wheel(root / "docopt-0.6.2-py2.py3-none-any.whl")
+write_wheel(root / "other-1.0-py3-none-any.whl", "other", "1.0")
+write_wheel(root / "docopt-0.6.2-py3-none-any.whl", pure=False)
+write_wheel(root / "docopt-0.6.2-py2.py3-none-any-native.whl", native=True)
+PY
+
+cat >"$fake_bin/pip-sdist-repair" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+{
+  printf 'CALL\n'
+  printf 'ARG:%s\n' "$@"
+} >>"$REPAIR_PIP_ARGS_LOG"
+dest=
+while (($#)); do
+  if [[ "$1" == --dest ]]; then
+    shift
+    dest=${1:-}
+  fi
+  shift
+done
+case "${REPAIR_PIP_MODE:-success}" in
+  failure)
+    printf 'download failed via https://download-user:download-password@mirror.example/simple?token=download-query#download-fragment\033[31m\n' >&2
+    exit 41
+    ;;
+  truststore)
+    attempt=0
+    [[ -f "$REPAIR_PIP_ATTEMPT_FILE" ]] && attempt="$(<"$REPAIR_PIP_ATTEMPT_FILE")"
+    attempt=$((attempt + 1))
+    printf '%s\n' "$attempt" >"$REPAIR_PIP_ATTEMPT_FILE"
+    if ((attempt == 1)); then
+      printf '%s\n' "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" >&2
+      exit 42
+    fi
+    [[ "${PIP_USE_DEPRECATED:-}" == legacy-certs ]] || exit 43
+    ;;
+esac
+[[ -n "$dest" ]]
+mkdir -p "$dest"
+case "${REPAIR_PIP_MODE:-success}" in
+  multiple)
+    cp "$REPAIR_SDIST_FIXTURE" "$dest/"
+    cp "$REPAIR_OTHER_SDIST_FIXTURE" "$dest/"
+    ;;
+  mismatch)
+    cp "$REPAIR_OTHER_SDIST_FIXTURE" "$dest/"
+    ;;
+  corrupt)
+    printf 'not an archive\n' >"$dest/docopt-0.6.2.tar.gz"
+    ;;
+  *)
+    cp "$REPAIR_SDIST_FIXTURE" "$dest/"
+    ;;
+esac
+EOF
+
+cat >"$fake_bin/uv-sdist-repair" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+{
+  printf 'CALL\n'
+  printf 'ENV:UV_CACHE_DIR=%s\n' "${UV_CACHE_DIR:-}"
+  printf 'ENV:UV_PYTHON_INSTALL_DIR=%s\n' "${UV_PYTHON_INSTALL_DIR:-}"
+  printf 'ENV:CONDA_PREFIX=%s\n' "${CONDA_PREFIX:-}"
+  printf 'ARG:%s\n' "$@"
+} >>"$REPAIR_UV_ARGS_LOG"
+if [[ "${REPAIR_UV_MODE:-success}" == failure ]]; then
+  printf 'build failed via socks5h://build-user:build-password@10.10.10.10:28802/path?token=build-query#build-fragment diagnostic\033[31m\n' >&2
+  exit 51
+fi
+out_dir=
+while (($#)); do
+  if [[ "$1" == --out-dir ]]; then
+    shift
+    out_dir=${1:-}
+  fi
+  shift
+done
+[[ -n "$out_dir" ]]
+mkdir -p "$out_dir"
+case "${REPAIR_UV_MODE:-success}" in
+  native)
+    cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
+    ;;
+  nonpure)
+    cp "$REPAIR_NONPURE_WHEEL_FIXTURE" "$out_dir/"
+    ;;
+  mismatch)
+    cp "$REPAIR_OTHER_WHEEL_FIXTURE" "$out_dir/"
+    ;;
+  multiple)
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    printf 'not a wheel\n' >"$out_dir/extra-1.0-py3-none-any.whl"
+    ;;
+  *)
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    ;;
+esac
+EOF
+chmod +x "$fake_bin/pip-sdist-repair" "$fake_bin/uv-sdist-repair"
+
+export REPAIR_PIP_ARGS_LOG="$FIXTURE_DIR/sdist-repair-pip.args"
+export REPAIR_UV_ARGS_LOG="$FIXTURE_DIR/sdist-repair-uv.args"
+export REPAIR_SDIST_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2.tar.gz"
+export REPAIR_OTHER_SDIST_FIXTURE="$sdist_repair_fixture_dir/other-1.0.tar.gz"
+export REPAIR_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py3-none-any.whl"
+export REPAIR_OTHER_WHEEL_FIXTURE="$sdist_repair_fixture_dir/other-1.0-py3-none-any.whl"
+export REPAIR_NONPURE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py3-none-any.whl"
+export REPAIR_NATIVE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py3-none-any-native.whl"
+: >"$REPAIR_PIP_ARGS_LOG"
+: >"$REPAIR_UV_ARGS_LOG"
+
+repair_parent="$FIXTURE_DIR/repair parent with spaces"
+mkdir -p "$repair_parent"
+repair_dir="$repair_parent/sdist-repair"
+fake_conda_prefix="$FIXTURE_DIR/fake-conda"
+mkdir -p "$fake_conda_prefix"
+printf 'unchanged\n' >"$fake_conda_prefix/marker"
+repair_requirement='docopt>=0.6,<1'
+repair_pip_command=("$fake_bin/pip-sdist-repair")
+repair_success_log="$FIXTURE_DIR/sdist-repair-success.log"
+if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  CONDA_PREFIX="$fake_conda_prefix" \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command \
+    "$fake_bin/uv-sdist-repair" \
+    "$repair_requirement" \
+    docopt \
+    3.12 \
+    "$repair_dir" \
+    '' \
+    1 >"$repair_success_log" 2>&1; then
+  pass 'one pure source distribution is repaired in isolated staging'
+else
+  fail 'one pure source distribution is repaired in isolated staging'
+fi
+assert_file_contains "$repair_success_log" 'Pure Python wheel admitted: docopt-0.6.2-py2.py3-none-any.whl' 'successful repair reports admitted wheel only after validation'
+if [[ -f "$repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl" ]]; then
+  pass 'validated universal wheel reaches built-wheels'
+else
+  fail 'validated universal wheel reaches built-wheels'
+fi
+expected_repair_pip_args="$FIXTURE_DIR/expected-repair-pip.args"
+printf '%s\n' \
+  'CALL' \
+  'ARG:download' \
+  'ARG:--disable-pip-version-check' \
+  'ARG:--index-url' \
+  'ARG:https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  'ARG:--python-version' \
+  'ARG:3.12' \
+  'ARG:--implementation' \
+  'ARG:cp' \
+  'ARG:--no-deps' \
+  'ARG:--no-binary=:all:' \
+  'ARG:--dest' \
+  "ARG:$repair_dir/candidate-1/source" \
+  "ARG:$repair_requirement" >"$expected_repair_pip_args"
+if diff -u "$expected_repair_pip_args" "$REPAIR_PIP_ARGS_LOG" >/dev/null; then
+  pass 'sdist download uses exact target, index, isolation, destination, and one requirement argument'
+else
+  fail 'sdist download uses exact target, index, isolation, destination, and one requirement argument'
+fi
+assert_eq 1 "$(grep -Fxc -- "ARG:$repair_requirement" "$REPAIR_PIP_ARGS_LOG")" 'legal version constraint remains one pip argument'
+validated_sdist_path="$(realpath -m -- "$repair_dir/candidate-1/source/docopt-0.6.2.tar.gz")"
+expected_repair_uv_args="$FIXTURE_DIR/expected-repair-uv.args"
+printf '%s\n' \
+  'CALL' \
+  "ENV:UV_CACHE_DIR=$repair_dir/uv-cache" \
+  "ENV:UV_PYTHON_INSTALL_DIR=$repair_dir/uv-python" \
+  "ENV:CONDA_PREFIX=$fake_conda_prefix" \
+  'ARG:build' \
+  'ARG:--wheel' \
+  'ARG:--no-config' \
+  'ARG:--out-dir' \
+  "ARG:$repair_dir/candidate-1/wheel" \
+  'ARG:--python' \
+  'ARG:3.12' \
+  'ARG:--index-url' \
+  'ARG:https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  "ARG:$validated_sdist_path" >"$expected_repair_uv_args"
+if diff -u "$expected_repair_uv_args" "$REPAIR_UV_ARGS_LOG" >/dev/null; then
+  pass 'uv build uses exact target Python, configured index, validated sdist, and controlled cache paths'
+else
+  fail 'uv build uses exact target Python, configured index, validated sdist, and controlled cache paths'
+fi
+assert_eq unchanged "$(<"$fake_conda_prefix/marker")" 'repair leaves caller Conda prefix contents unchanged'
+
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" '--index-url=evil' docopt 3.12 "$repair_dir" '' 2 \
+  >"$FIXTURE_DIR/sdist-repair-unsafe-requirement.log" 2>&1; then
+  fail 'option-like sdist requirement is rejected before pip'
+else
+  pass 'option-like sdist requirement is rejected before pip'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'unsafe requirement cannot invoke pip'
+assert_file_missing "$repair_dir/candidate-2" 'unsafe requirement creates no candidate staging'
+for invalid_identifier_case in pip-name canonical-name python-version; do
+  identifier_pip_name=repair_pip_command
+  identifier_canonical_name=docopt
+  identifier_python_version=3.12
+  case "$invalid_identifier_case" in
+    pip-name)
+      identifier_pip_name='bad[name]'
+      ;;
+    canonical-name)
+      identifier_canonical_name='docopt/../../outside'
+      ;;
+    python-version)
+      identifier_python_version='3.12 --system'
+      ;;
+  esac
+  if without_proxy_environment repair_one_pure_sdist \
+    "$identifier_pip_name" "$fake_bin/uv-sdist-repair" docopt "$identifier_canonical_name" \
+    "$identifier_python_version" "$repair_dir" '' 2 \
+    >"$FIXTURE_DIR/sdist-repair-invalid-$invalid_identifier_case.log" 2>&1; then
+    fail "$invalid_identifier_case is rejected before repair side effects"
+  else
+    pass "$invalid_identifier_case is rejected before repair side effects"
+  fi
+done
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'invalid repair identifiers cannot invoke pip'
+assert_file_missing "$repair_dir/candidate-2" 'invalid repair identifiers create no candidate staging'
+assert_file_contains "$FIXTURE_DIR/sdist-repair-invalid-pip-name.log" \
+  'invalid pip command array name for pure Python sdist repair' \
+  'invalid pip array name is rejected before Bash nameref evaluation'
+assert_file_not_contains "$FIXTURE_DIR/sdist-repair-invalid-pip-name.log" \
+  'invalid variable name for name reference' \
+  'invalid pip array name cannot trigger a Bash nameref diagnostic'
+identifier_function_source="$(sed -n '/^validate_sdist_repair_identifiers() {/,/^}/p' "$ROOT_DIR/plugin_repackaging.sh")"
+identifier_name_check_line="$(grep -n 'pip_command_name.*=~' <<<"$identifier_function_source" | head -n1 | cut -d: -f1)"
+identifier_nameref_line="$(grep -n 'local -n selected_pip_command' <<<"$identifier_function_source" | head -n1 | cut -d: -f1)"
+if [[ -n "$identifier_name_check_line" && -n "$identifier_nameref_line" ]] && \
+  ((identifier_name_check_line < identifier_nameref_line)); then
+  pass 'pip array identifier syntax is checked before creating a Bash nameref'
+else
+  fail 'pip array identifier syntax is checked before creating a Bash nameref'
+fi
+
+if validate_sdist_repair_dir relative/sdist-repair >/dev/null 2>&1 || \
+  validate_sdist_repair_dir "$repair_parent/not-repair" >/dev/null 2>&1; then
+  fail 'repair staging requires an absolute path with the exact sdist-repair leaf'
+else
+  pass 'repair staging requires an absolute path with the exact sdist-repair leaf'
+fi
+symlink_parent_target="$FIXTURE_DIR/symlink-parent-target"
+symlink_parent="$FIXTURE_DIR/symlink-parent"
+mkdir -p "$symlink_parent_target"
+ln -s "$symlink_parent_target" "$symlink_parent"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$symlink_parent/sdist-repair" '' 1 \
+  >"$FIXTURE_DIR/sdist-repair-symlink.log" 2>&1; then
+  fail 'symlinked repair staging parent is rejected before writes'
+else
+  pass 'symlinked repair staging parent is rejected before writes'
+fi
+assert_file_missing "$symlink_parent_target/sdist-repair" 'symlink rejection prevents writes outside controlled tree'
+mkdir -p "$symlink_parent_target/sdist-repair/candidate-1/source"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if without_proxy_environment download_sdist \
+  repair_pip_command docopt 3.12 \
+  "$symlink_parent/sdist-repair/candidate-1/source" '' \
+  "$symlink_parent/sdist-repair/candidate-1/download.log" \
+  >"$FIXTURE_DIR/sdist-download-symlink.log" 2>&1; then
+  fail 'direct sdist download rejects a symlinked repair ancestor'
+else
+  pass 'direct sdist download rejects a symlinked repair ancestor'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'symlinked direct sdist download cannot invoke pip'
+invalid_socks_target="$FIXTURE_DIR/invalid-socks-target"
+invalid_socks_link="$FIXTURE_DIR/invalid-socks-link"
+mkdir -p "$invalid_socks_target"
+ln -s "$invalid_socks_target" "$invalid_socks_link"
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" "$invalid_socks_link" 11 \
+  >"$FIXTURE_DIR/sdist-repair-invalid-socks-site.log" 2>&1; then
+  fail 'symlinked temporary SOCKS site is rejected before repair side effects'
+else
+  pass 'symlinked temporary SOCKS site is rejected before repair side effects'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'unsafe temporary SOCKS site cannot invoke pip'
+assert_file_missing "$repair_dir/candidate-11" 'unsafe temporary SOCKS site creates no candidate staging'
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 0 \
+  >"$FIXTURE_DIR/sdist-repair-ordinal.log" 2>&1; then
+  fail 'candidate ordinal must be a positive decimal'
+else
+  pass 'candidate ordinal must be a positive decimal'
+fi
+pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 1 \
+  >"$FIXTURE_DIR/sdist-repair-reuse.log" 2>&1; then
+  fail 'existing candidate staging cannot be reused'
+else
+  pass 'existing candidate staging cannot be reused'
+fi
+assert_eq "$pip_calls_before" "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'candidate reuse is rejected before pip'
+
+uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
+download_failure_log="$FIXTURE_DIR/sdist-repair-download-failure.log"
+if PIP_MIRROR_URL='https://index-user:index-password@target-index.example/simple?token=index-query#fragment' \
+  REPAIR_PIP_MODE=failure \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 2 \
+    >"$download_failure_log" 2>&1; then
+  fail 'sdist download failure stops repair'
+else
+  pass 'sdist download failure stops repair'
+fi
+assert_file_contains "$download_failure_log" 'Pure Python sdist repair failed during download: docopt (index: https://***@target-index.example/simple)' 'download failure reports a stable sanitized stage error'
+for secret_value in download-user download-password download-query download-fragment index-user index-password index-query $'\033'; do
+  assert_file_not_contains "$download_failure_log" "$secret_value" "download repair diagnostic hides $secret_value"
+done
+assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" 'download failure does not invoke uv'
+assert_file_missing "$repair_dir/built-wheels/partial-2.whl" 'download failure admits no partial wheel'
+
+for sdist_mode in corrupt multiple mismatch; do
+  ordinal=3
+  [[ "$sdist_mode" == multiple ]] && ordinal=4
+  [[ "$sdist_mode" == mismatch ]] && ordinal=5
+  uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
+  validation_log="$FIXTURE_DIR/sdist-repair-$sdist_mode-sdist.log"
+  if REPAIR_PIP_MODE="$sdist_mode" \
+    without_proxy_environment repair_one_pure_sdist \
+      repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
+      >"$validation_log" 2>&1; then
+    fail "$sdist_mode sdist is rejected during validation"
+  else
+    pass "$sdist_mode sdist is rejected during validation"
+  fi
+  assert_file_contains "$validation_log" 'Pure Python sdist repair failed during validation: docopt' "$sdist_mode sdist reports the validation stage"
+  assert_file_contains "$validation_log" 'validation failed:' "$sdist_mode sdist retains the validator explanation"
+  assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" "$sdist_mode sdist cannot invoke uv"
+done
+
+build_failure_log="$FIXTURE_DIR/sdist-repair-build-failure.log"
+if REPAIR_UV_MODE=failure \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 6 \
+    >"$build_failure_log" 2>&1; then
+  fail 'uv build failure stops repair'
+else
+  pass 'uv build failure stops repair'
+fi
+assert_file_contains "$build_failure_log" 'Pure Python sdist repair failed during build: docopt' 'build failure reports a stable stage error'
+assert_file_contains "$build_failure_log" 'socks5h://***@10.10.10.10:28802/path' 'build failure retains a safe proxy location'
+for secret_value in build-user build-password build-query build-fragment $'\033'; do
+  assert_file_not_contains "$build_failure_log" "$secret_value" "build repair diagnostic hides $secret_value"
+done
+
+for wheel_mode in native nonpure multiple mismatch; do
+  ordinal=7
+  [[ "$wheel_mode" == nonpure ]] && ordinal=8
+  [[ "$wheel_mode" == multiple ]] && ordinal=9
+  [[ "$wheel_mode" == mismatch ]] && ordinal=10
+  validation_log="$FIXTURE_DIR/sdist-repair-$wheel_mode-wheel.log"
+  if REPAIR_UV_MODE="$wheel_mode" \
+    without_proxy_environment repair_one_pure_sdist \
+      repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
+      >"$validation_log" 2>&1; then
+    fail "$wheel_mode wheel is rejected during validation"
+  else
+    pass "$wheel_mode wheel is rejected during validation"
+  fi
+  assert_file_contains "$validation_log" 'Pure Python sdist repair failed during validation: docopt' "$wheel_mode wheel reports the validation stage"
+  assert_file_contains "$validation_log" 'validation failed:' "$wheel_mode wheel retains the validator explanation"
+done
+assert_eq 1 "$(find "$repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'rejected wheels never enter built-wheels'
+
+conflict_repair_parent="$FIXTURE_DIR/conflict repair parent"
+conflict_repair_dir="$conflict_repair_parent/sdist-repair"
+mkdir -p "$conflict_repair_dir/built-wheels"
+printf 'preexisting different wheel\n' >"$conflict_repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl"
+conflict_repair_log="$FIXTURE_DIR/sdist-repair-conflict.log"
+if without_proxy_environment repair_one_pure_sdist \
+  repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$conflict_repair_dir" '' 1 \
+  >"$conflict_repair_log" 2>&1; then
+  fail 'a different existing admitted-wheel filename is never overwritten'
+else
+  pass 'a different existing admitted-wheel filename is never overwritten'
+fi
+assert_eq 'preexisting different wheel' \
+  "$(<"$conflict_repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl")" \
+  'failed wheel admission preserves the preexisting file byte-for-byte'
+assert_file_contains "$conflict_repair_log" 'Pure Python sdist repair failed during validation: docopt' 'wheel admission conflict reports a stable validation-stage failure'
+
+socks_repair_parent="$FIXTURE_DIR/socks repair parent"
+mkdir -p "$socks_repair_parent"
+socks_repair_dir="$socks_repair_parent/sdist-repair"
+mkdir -p "$FIXTURE_DIR/fake-socks-site"
+export REPAIR_PIP_ATTEMPT_FILE="$FIXTURE_DIR/sdist-repair-socks-attempt"
+: >"$REPAIR_PIP_ARGS_LOG"
+rm -f -- "$REPAIR_PIP_ATTEMPT_FILE"
+socks_repair_log="$FIXTURE_DIR/sdist-repair-socks.log"
+if https_proxy='socks5h://10.10.10.10:28802' HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  REPAIR_PIP_MODE=truststore repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$socks_repair_dir" "$FIXTURE_DIR/fake-socks-site" 1 \
+    >"$socks_repair_log" 2>&1; then
+  pass 'sdist download preserves the exact SOCKS truststore compatibility retry'
+else
+  fail 'sdist download preserves the exact SOCKS truststore compatibility retry'
+fi
+assert_eq 2 "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'sdist SOCKS truststore workaround retries exactly once'
+assert_file_contains "$socks_repair_log" 'retrying once with PIP_USE_DEPRECATED=legacy-certs' 'sdist SOCKS retry is explained'
+assert_file_not_contains "$socks_repair_dir/candidate-1/download.log" 'key_proxy_ssl_context' 'successful retry truncates stale first-attempt diagnostics'
+set -e
+
 cat >"$fake_bin/pip-fail" <<'EOF'
 #!/usr/bin/env bash
 exit 23
