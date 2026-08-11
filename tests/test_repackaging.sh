@@ -119,6 +119,14 @@ if detect_proxy_fixture HTTPS_PROXY '' >/dev/null; then
 else
   pass 'empty proxy environment does not require SOCKS support'
 fi
+assert_eq \
+  'socks5h://***@10.10.10.10:28802' \
+  "$(redact_url_for_log 'socks5h://proxy-user:proxy-secret@10.10.10.10:28802')" \
+  'proxy credentials are redacted for logs'
+assert_eq \
+  'https://***@mirror.example/simple' \
+  "$(redact_url_for_log 'https://mirror-user:mirror-secret@mirror.example/simple?token=query-secret#fragment')" \
+  'index credentials and query tokens are redacted for logs'
 if uv_version_at_least 0.7.21 0.7.21 && uv_version_at_least 0.11.24 0.7.21; then
   pass 'supported uv versions satisfy the minimum'
 else
@@ -466,6 +474,43 @@ else
   fail 'dependency download receives temporary PySocks PYTHONPATH'
 fi
 
+unsafe_scheme_page="$FIXTURE_DIR/pysocks-unsafe-scheme.html"
+printf '%s\n' \
+  '<a href="file:///tmp/PySocks-1.7.1-py3-none-any.whl">PySocks</a>' \
+  >"$unsafe_scheme_page"
+if resolve_pysocks_wheel "$unsafe_scheme_page" 'https://mirror.example/simple/pysocks/' >/dev/null 2>&1; then
+  fail 'PySocks wheel URL rejects non-HTTP schemes'
+else
+  pass 'PySocks wheel URL rejects non-HTTP schemes'
+fi
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+missing_bootstrap_case_dir="$FIXTURE_DIR/socks-missing-bootstrap-case"
+mkdir -p "$missing_bootstrap_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$FIXTURE_DIR/pysocks-simple.html" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$missing_bootstrap_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    >"$missing_bootstrap_case_dir/output.log" 2>&1; then
+  fail 'SOCKS repair requires an explicit staging bootstrap directory'
+else
+  pass 'SOCKS repair requires an explicit staging bootstrap directory'
+fi
+assert_file_contains "$missing_bootstrap_case_dir/output.log" 'safe pip bootstrap directory is required' 'missing bootstrap directory fails clearly'
+if [[ ! -s "$SOCKS_CURL_LOG" ]]; then
+  pass 'missing bootstrap directory fails before network access'
+else
+  fail 'missing bootstrap directory fails before network access'
+fi
+
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
 tls_bug_case_dir="$FIXTURE_DIR/socks-tls-context-case"
@@ -545,9 +590,34 @@ assert_file_missing "$installed_case_dir/pip-bootstrap" 'existing PySocks create
 
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
+installed_tls_bug_case_dir="$FIXTURE_DIR/pysocks-installed-tls-context-case"
+mkdir -p "$installed_tls_bug_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_PIP_HAS_PYSOCKS=1 \
+  FAKE_PIP_SOCKS_TLS_BUG=1 \
+  PATH="$socks_fake_bin:$PATH" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$installed_tls_bug_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$installed_tls_bug_case_dir/pip-bootstrap" \
+    >"$installed_tls_bug_case_dir/output.log" 2>&1; then
+  pass 'installed PySocks also retries the proxy SSL context bug'
+else
+  fail 'installed PySocks also retries the proxy SSL context bug'
+fi
+assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'installed PySocks compatibility retry runs exactly once'
+assert_file_contains "$installed_tls_bug_case_dir/output.log" 'legacy-certs' 'installed PySocks compatibility retry is explained'
+assert_file_missing "$installed_tls_bug_case_dir/pip-bootstrap" 'installed PySocks retry creates no bootstrap directory'
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
 disabled_case_dir="$FIXTURE_DIR/socks-disabled-case"
 mkdir -p "$disabled_case_dir"
-if https_proxy='socks5h://10.10.10.10:28802' \
+if https_proxy='socks5h://proxy-user:proxy-secret@10.10.10.10:28802' \
   HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
   DIFY_AUTO_FIX_SOCKS=0 \
   PATH="$socks_fake_bin:$PATH" \
@@ -564,6 +634,8 @@ else
   pass 'disabled SOCKS repair fails before dependency download'
 fi
 assert_file_contains "$disabled_case_dir/output.log" 'automatic repair is disabled' 'disabled repair explains how it was disabled'
+assert_file_not_contains "$disabled_case_dir/output.log" 'proxy-user' 'disabled repair log hides proxy username'
+assert_file_not_contains "$disabled_case_dir/output.log" 'proxy-secret' 'disabled repair log hides proxy password'
 assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'disabled repair does not invoke dependency download'
 if [[ ! -s "$SOCKS_CURL_LOG" ]]; then
   pass 'disabled SOCKS repair performs no network request'
@@ -655,7 +727,7 @@ if https_proxy='socks5h://10.10.10.10:28802' \
   HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
   FAKE_CURL_EXIT=92 \
   PATH="$socks_fake_bin:$PATH" \
-  PIP_MIRROR_URL='https://mirror.example/simple' \
+  PIP_MIRROR_URL='https://mirror-user:mirror-secret@mirror.example/simple' \
   DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
   download_wheels \
     "$metadata_dir/download.txt" \
@@ -669,7 +741,18 @@ else
   pass 'PySocks index download failure stops dependency download'
 fi
 assert_file_contains "$curl_failure_case_dir/output.log" 'failed to download the PySocks simple index' 'bootstrap curl failure is explicit'
+assert_file_not_contains "$curl_failure_case_dir/output.log" 'mirror-user' 'bootstrap failure log hides index username'
+assert_file_not_contains "$curl_failure_case_dir/output.log" 'mirror-secret' 'bootstrap failure log hides index password'
 assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'bootstrap curl failure prevents dependency download'
+
+report_failure_log="$FIXTURE_DIR/report-wheel-failure.log"
+PIP_MIRROR_URL='https://index-user:index-secret@mirror.example/simple?token=query-secret' \
+  report_wheel_download_failure aarch64 3.12 cp312 manylinux_2_28_aarch64 \
+  >"$report_failure_log" 2>&1
+assert_file_contains "$report_failure_log" 'Package index: https://***@mirror.example/simple' 'wheel failure reports a safe index location'
+assert_file_not_contains "$report_failure_log" 'index-user' 'wheel failure log hides index username'
+assert_file_not_contains "$report_failure_log" 'index-secret' 'wheel failure log hides index password'
+assert_file_not_contains "$report_failure_log" 'query-secret' 'wheel failure log hides index query token'
 
 cat >"$fake_bin/uv-runtime" <<'EOF'
 #!/usr/bin/env bash
@@ -873,6 +956,35 @@ fi
 
 staging_count="$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*' | wc -l)"
 assert_eq 0 "$staging_count" 'successful build cleans its staging directory'
+
+rm -f -- "$GENERATED_TEST_OUTPUT"
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  PATH="$socks_fake_bin:$fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$FIXTURE_DIR/pysocks-simple.html" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" \
+    >"$FIXTURE_DIR/socks-repackage.log" 2>&1; then
+  pass 'full repackaging repairs missing PySocks'
+else
+  fail 'full repackaging repairs missing PySocks'
+  sed 's/^/# socks repackage: /' "$FIXTURE_DIR/socks-repackage.log"
+fi
+if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
+  socks_archive_entries="$(unzip -Z1 "$GENERATED_TEST_OUTPUT")"
+  assert_eq 1 "$(grep -c '^wheels/example-1.0-py3-none-any.whl$' <<<"$socks_archive_entries")" 'SOCKS-repaired archive contains runtime wheelhouse'
+  assert_eq 0 "$(grep -ci 'pip-bootstrap' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes bootstrap directory'
+  assert_eq 0 "$(grep -ci 'PySocks' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes PySocks wheel'
+  assert_eq 0 "$(grep -c '/socks.py$' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes temporary socks module'
+else
+  fail 'SOCKS-repaired offline package is created'
+fi
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
 if env -u http_proxy -u https_proxy -u all_proxy \

@@ -134,6 +134,30 @@ detect_socks_proxy() {
   return 1
 }
 
+redact_url_for_log() {
+  local url=$1
+
+  python3 - "$url" <<'PY'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+try:
+    parsed = urlsplit(sys.argv[1])
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("URL must include a scheme and host")
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        host = f"***@{host}"
+    print(urlunsplit((parsed.scheme, host, parsed.path, "", "")))
+except (TypeError, ValueError):
+    print("<redacted-url>")
+PY
+}
+
 detect_manifest_python_version() {
   local manifest_file=$1
   local detected
@@ -512,6 +536,8 @@ target = "pysocks-1.7.1-py3-none-any.whl"
 for href in parser.links:
     absolute = urljoin(sys.argv[2], href)
     parsed = urlsplit(absolute)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        continue
     filename = unquote(parsed.path.rsplit("/", 1)[-1]).lower()
     if filename != target:
         continue
@@ -546,7 +572,7 @@ prepare_pip_socks_support() {
   local -n selected_pip_command=$pip_command_name
   local -n result=$result_name
   local proxy_url simple_url simple_page wheel_record wheel_url expected_sha256
-  local wheel_file site_dir actual_sha256
+  local wheel_file site_dir actual_sha256 safe_proxy_url safe_simple_url safe_wheel_url
 
   result=
   if ! proxy_url="$(detect_socks_proxy)"; then
@@ -557,7 +583,8 @@ prepare_pip_socks_support() {
   fi
   case "${DIFY_AUTO_FIX_SOCKS:-1}" in
     0 | false | FALSE | no | NO)
-      printf 'pip requires PySocks for proxy %s; automatic repair is disabled by DIFY_AUTO_FIX_SOCKS\n' "$proxy_url" >&2
+      safe_proxy_url="$(redact_url_for_log "$proxy_url")"
+      printf 'pip requires PySocks for proxy %s; automatic repair is disabled by DIFY_AUTO_FIX_SOCKS\n' "$safe_proxy_url" >&2
       return 1
       ;;
   esac
@@ -567,23 +594,26 @@ prepare_pip_socks_support() {
   }
 
   simple_url="${PIP_MIRROR_URL%/}/pysocks/"
+  safe_proxy_url="$(redact_url_for_log "$proxy_url")"
+  safe_simple_url="$(redact_url_for_log "$simple_url")"
   simple_page="$bootstrap_dir/pysocks-simple.html"
   wheel_file="$bootstrap_dir/PySocks-1.7.1-py3-none-any.whl"
   site_dir="$bootstrap_dir/site-packages"
   mkdir -p "$bootstrap_dir" "$site_dir"
-  printf 'Preparing temporary pip SOCKS support for %s ...\n' "$proxy_url"
+  printf 'Preparing temporary pip SOCKS support for %s ...\n' "$safe_proxy_url"
   if ! curl --fail --location --show-error --output "$simple_page" "$simple_url"; then
-    printf 'failed to download the PySocks simple index from %s\n' "$simple_url" >&2
+    printf 'failed to download the PySocks simple index from %s\n' "$safe_simple_url" >&2
     return 1
   fi
   if ! wheel_record="$(resolve_pysocks_wheel "$simple_page" "$simple_url")"; then
-    printf 'failed to locate PySocks 1.7.1 universal wheel in %s\n' "$simple_url" >&2
+    printf 'failed to locate PySocks 1.7.1 universal wheel in %s\n' "$safe_simple_url" >&2
     return 1
   fi
   wheel_url=${wheel_record%%$'\t'*}
   expected_sha256=${wheel_record#*$'\t'}
+  safe_wheel_url="$(redact_url_for_log "$wheel_url")"
   if ! curl --fail --location --show-error --output "$wheel_file" "$wheel_url"; then
-    printf 'failed to download temporary PySocks wheel from %s\n' "$wheel_url" >&2
+    printf 'failed to download temporary PySocks wheel from %s\n' "$safe_wheel_url" >&2
     return 1
   fi
   if [[ "$expected_sha256" != - ]]; then
@@ -615,16 +645,17 @@ report_wheel_download_failure() {
   local python_version=$2
   local abi=$3
   shift 3
-  local platform_list
+  local platform_list safe_index_url
 
   platform_list="$(IFS=,; printf '%s' "$*")"
+  safe_index_url="$(redact_url_for_log "$PIP_MIRROR_URL")"
   printf '%s\n' \
     'failed to download a complete binary wheel dependency set' \
     "Target Python: $python_version" \
     "Target ABI: $abi" \
     "Target architecture: $target_arch" \
     "Target platforms: $platform_list" \
-    "Package index: $PIP_MIRROR_URL" \
+    "Package index: $safe_index_url" \
     'Common causes: no compatible binary wheel for the target, conflicting version constraints, an additional package index is required, or the proxy/index is unreachable.' \
     'The packager will not compile source distributions or fall back to the build host architecture.' >&2
 }
@@ -643,13 +674,29 @@ reset_wheels_dir() {
   mkdir -p "$wheels_dir"
 }
 
+validate_pip_bootstrap_dir() {
+  local bootstrap_dir=$1
+  local parent
+
+  if [[ -z "$bootstrap_dir" || "$(basename -- "$bootstrap_dir")" != pip-bootstrap ]]; then
+    printf 'safe pip bootstrap directory is required for SOCKS repair\n' >&2
+    return 1
+  fi
+  parent="$(dirname -- "$bootstrap_dir")"
+  if [[ "$parent" == / || "$parent" == . || "$parent" == "$bootstrap_dir" ]]; then
+    printf 'safe pip bootstrap directory is required for SOCKS repair\n' >&2
+    return 1
+  fi
+}
+
 download_wheels() {
   local requirements=$1
   local wheels_dir=$2
   local target_arch=$3
   local python_version=$4
-  local bootstrap_dir=${5:-"$(dirname "$wheels_dir")/.pip-bootstrap"}
-  local abi platform socks_site_dir= pip_error_log=
+  local bootstrap_dir=${5:-}
+  local abi platform socks_proxy_url= socks_site_dir= pip_error_log= bootstrap_parent=
+  local download_succeeded=false retry_succeeded=false
   local -a pip_command=()
   local -a platform_args=()
   local -a platform_names=()
@@ -660,6 +707,10 @@ download_wheels() {
     return 0
   fi
 
+  socks_proxy_url="$(detect_socks_proxy)" || true
+  if [[ -n "$socks_proxy_url" ]]; then
+    validate_pip_bootstrap_dir "$bootstrap_dir" || return
+  fi
   resolve_pip_command pip_command || return
   prepare_pip_socks_support pip_command "$bootstrap_dir" socks_site_dir || return
   abi="$(python_abi "$python_version")" || return
@@ -681,21 +732,41 @@ download_wheels() {
     --requirement "$requirements"
     --dest "$wheels_dir"
   )
-  if [[ -n "$socks_site_dir" ]]; then
-    pip_error_log="$bootstrap_dir/pip-download.stderr"
-    if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-      "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
+  if [[ -n "$socks_proxy_url" ]]; then
+    bootstrap_parent="$(dirname -- "$bootstrap_dir")"
+    pip_error_log="$bootstrap_parent/pip-download.stderr"
+    if [[ -n "$socks_site_dir" ]]; then
+      if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+        "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
+        download_succeeded=true
+      fi
+    else
+      if "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
+        download_succeeded=true
+      fi
+    fi
+    if [[ "$download_succeeded" == true ]]; then
       cat "$pip_error_log" >&2
       rm -f -- "$pip_error_log"
       return 0
     fi
     cat "$pip_error_log" >&2
-    if grep -Fq 'key_proxy_ssl_context' "$pip_error_log"; then
+    if grep -Fq "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" "$pip_error_log"; then
       printf '%s\n' \
         'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
-      if PIP_USE_DEPRECATED=legacy-certs \
-        PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-        "${pip_command[@]}" "${download_args[@]}"; then
+      if [[ -n "$socks_site_dir" ]]; then
+        if PIP_USE_DEPRECATED=legacy-certs \
+          PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+          "${pip_command[@]}" "${download_args[@]}"; then
+          retry_succeeded=true
+        fi
+      else
+        if PIP_USE_DEPRECATED=legacy-certs \
+          "${pip_command[@]}" "${download_args[@]}"; then
+          retry_succeeded=true
+        fi
+      fi
+      if [[ "$retry_succeeded" == true ]]; then
         rm -f -- "$pip_error_log"
         return 0
       fi
