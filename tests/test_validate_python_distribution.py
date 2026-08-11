@@ -28,6 +28,17 @@ def wheel_metadata(name="docopt", version="0.6.2", purelib="true", tags=None):
     return ("\n".join(lines) + "\n\n").encode()
 
 
+def corrupt_stored_zip_member(path, member_name, offset):
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member_name)
+        payload_offset = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    with Path(path).open("r+b") as artifact:
+        artifact.seek(payload_offset + offset)
+        original = artifact.read(1)
+        artifact.seek(payload_offset + offset)
+        artifact.write(bytes([original[0] ^ 0xFF]))
+
+
 class DistributionFixture:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -137,8 +148,22 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         self.fixture.tar("docopt.tar.gz", [("docopt/PKG-INFO", pkg_info("other"), "file")])
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "metadata name does not match")
 
+    def test_sdist_corrupt_non_metadata_zip_member_is_rejected(self):
+        artifact = self.fixture.zip("docopt.zip", [
+            ("docopt/PKG-INFO", pkg_info(), "file"),
+            ("docopt/data.txt", b"0123456789", "file"),
+        ])
+        corrupt_stored_zip_member(artifact, "docopt/data.txt", 5)
+        self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "invalid zip sdist")
+
     def test_pure_wheel_is_accepted(self):
         artifact = self.fixture.wheel()
+        result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
+
+    def test_pure_wheel_with_legal_numeric_build_tag_is_accepted(self):
+        artifact = self.fixture.wheel(filename="docopt-0.6.2-1_local-py3-none-any.whl")
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
@@ -163,6 +188,11 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         self.fixture.wheel(extra=[("payload.bin", b"\x7fELFpayload", "file")])
         self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "ELF binary")
 
+    def test_wheel_corrupt_payload_after_first_four_bytes_is_rejected(self):
+        artifact = self.fixture.wheel(extra=[("payload.bin", b"0" * 8192, "file")])
+        corrupt_stored_zip_member(artifact, "payload.bin", 5000)
+        self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "invalid wheel archive")
+
     def test_wheel_metadata_identity_mismatch_is_rejected(self):
         self.fixture.wheel(name="other")
         self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "metadata name does not match")
@@ -180,6 +210,13 @@ class ValidatePythonDistributionTests(unittest.TestCase):
             ("docopt.py", b"two", "file"),
         ], duplicate_warning=True)
         self.assert_error(self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"), "duplicate archive entry")
+
+    def test_wheel_dot_path_alias_is_rejected_as_duplicate(self):
+        self.fixture.wheel(extra=[("./docopt.py", b"# aliased path\n", "file")])
+        self.assert_error(
+            self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"),
+            "duplicate archive entry",
+        )
 
 
 if __name__ == "__main__":

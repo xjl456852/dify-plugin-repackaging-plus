@@ -10,7 +10,7 @@ import tarfile
 import zipfile
 from email import policy
 from email.parser import BytesParser
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 
 class ValidationError(Exception):
@@ -40,10 +40,13 @@ def validate_path(name):
         raise ValidationError("unsafe archive path")
     if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
         raise ValidationError("unsafe archive path")
-    path = PurePosixPath(name)
-    if any(part in ("", ".", "..") for part in path.parts):
+    raw_parts = name.split("/")
+    if ".." in raw_parts:
         raise ValidationError("unsafe archive path")
-    return name.rstrip("/")
+    normalized_parts = [part for part in raw_parts if part not in ("", ".")]
+    if not normalized_parts:
+        raise ValidationError("unsafe archive path")
+    return "/".join(normalized_parts)
 
 
 def validate_tar_members(archive):
@@ -91,6 +94,10 @@ def validate_zip_members(archive):
     return regular
 
 
+def read_zip_members(archive, members):
+    return {info: archive.read(info) for info in members}
+
+
 def candidate(directory, suffixes, kind):
     path = Path(directory)
     if not path.exists() or not path.is_dir() or path.is_symlink():
@@ -122,10 +129,11 @@ def validate_sdist(directory, expected_name):
         else:
             with zipfile.ZipFile(artifact) as archive:
                 members = validate_zip_members(archive)
+                contents = read_zip_members(archive, members)
                 metadata = [info for info in members if re.fullmatch(r"[^/]+/PKG-INFO", info.filename)]
                 if len(metadata) != 1:
                     raise ValidationError("exactly one top-level PKG-INFO")
-                name, version, _ = parse_metadata(archive.read(metadata[0]), "PKG-INFO")
+                name, version, _ = parse_metadata(contents[metadata[0]], "PKG-INFO")
     except ValidationError:
         raise
     except (tarfile.TarError, OSError, EOFError) as error:
@@ -149,7 +157,7 @@ def parse_wheel_filename(filename):
     python_tag, abi_tag, platform_tag = parts[-3:]
     if not distribution or not version or not python_tag:
         raise ValidationError("invalid wheel filename")
-    if build and not re.fullmatch(r"[0-9][0-9A-Za-z.]*", build[0]):
+    if build and not re.fullmatch(r"[0-9][0-9A-Za-z_]*", build[0]):
         raise ValidationError("invalid wheel build tag")
     if any(not tag for tag in python_tag.split(".")):
         raise ValidationError("invalid Python tag")
@@ -183,13 +191,12 @@ MACH_O_MAGICS = {
 }
 
 
-def reject_native_content(archive, members):
+def reject_native_content(members, contents):
     for info in members:
         lower_name = info.filename.casefold()
         if lower_name.endswith((".so", ".dll", ".pyd", ".dylib")) or ".so." in lower_name:
             raise ValidationError("native extension")
-        with archive.open(info) as stream:
-            magic = stream.read(4)
+        magic = contents[info][:4]
         if magic == b"\x7fELF":
             raise ValidationError("ELF binary")
         if magic.startswith(b"MZ"):
@@ -204,14 +211,15 @@ def validate_wheel(directory, expected_name, expected_version):
     try:
         with zipfile.ZipFile(artifact) as archive:
             members = validate_zip_members(archive)
+            contents = read_zip_members(archive, members)
             metadata = [info for info in members if re.fullmatch(r"[^/]+\.dist-info/METADATA", info.filename)]
             wheel_files = [info for info in members if re.fullmatch(r"[^/]+\.dist-info/WHEEL", info.filename)]
             if len(metadata) != 1 or len(wheel_files) != 1:
                 raise ValidationError("exactly one dist-info METADATA and WHEEL")
             if Path(metadata[0].filename).parent != Path(wheel_files[0].filename).parent:
                 raise ValidationError("METADATA and WHEEL are not siblings")
-            name, version, _ = parse_metadata(archive.read(metadata[0]), "METADATA")
-            wheel_message = BytesParser(policy=policy.compat32).parsebytes(archive.read(wheel_files[0]))
+            name, version, _ = parse_metadata(contents[metadata[0]], "METADATA")
+            wheel_message = BytesParser(policy=policy.compat32).parsebytes(contents[wheel_files[0]])
             wheel_parent = Path(metadata[0].filename).parent.name
             expected_dist_info = f"{filename_name.replace('-', '_')}-{filename_version}.dist-info"
             if canonical_name(name) != canonical_name(expected_name):
@@ -223,7 +231,7 @@ def validate_wheel(directory, expected_name, expected_version):
             if wheel_parent != expected_dist_info:
                 raise ValidationError("dist-info directory does not match wheel filename")
             validate_wheel_tags(wheel_message)
-            reject_native_content(archive, members)
+            reject_native_content(members, contents)
     except ValidationError:
         raise
     except (zipfile.BadZipFile, OSError, EOFError) as error:
