@@ -1313,10 +1313,13 @@ PY
   fi
   if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
     wait "$REPAIR_SUPERVISOR_PID" 2>/dev/null || true
-    REPAIR_SUPERVISOR_PID=
+  fi
+  REPAIR_SUPERVISOR_STATE=reaped
+  REPAIR_SUPERVISOR_PID=
+  REPAIR_SUPERVISOR_STATE=idle
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
     exit "${REPAIR_CANCELLATION_EXIT_STATUS:-143}"
   fi
-  REPAIR_SUPERVISOR_PID=
   return "$supervisor_status"
 }
 
@@ -2040,6 +2043,16 @@ cancel_sdist_repair() {
   exit "$exit_status"
 }
 
+cross_sdist_non_admission_cancellation_barrier() {
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    exit "${REPAIR_CANCELLATION_EXIT_STATUS:-143}"
+  fi
+  REPAIR_ADMISSION_BARRIER_CROSSED=true
+  if [[ "${REPAIR_CANCELLATION_ACTIVE:-false}" == true ]]; then
+    exit "${REPAIR_CANCELLATION_EXIT_STATUS:-143}"
+  fi
+}
+
 repair_one_pure_sdist_locked() {
   local pip_command_name=$1
   local uv_command=$2
@@ -2147,6 +2160,7 @@ repair_one_pure_sdist_locked() {
   fi
   remove_private_stage_log "$candidate_dir" "$build_log" || return
 
+  cross_sdist_non_admission_cancellation_barrier
   if ! snapshot_built_wheel "$wheel_dir" "$candidate_dir" snapshot_dir wheel_path; then
     printf '%s\n' 'validation failed: exactly one safe wheel build output is required' >&2
     printf 'Pure Python sdist repair failed during validation: %s\n' "$requirement" >&2
@@ -2224,9 +2238,11 @@ repair_one_pure_sdist() (
   REPAIR_STAGE_LOG_TO_CLEAN=
   REPAIR_SUPERVISOR_PID=
   REPAIR_SUPERVISOR_STARTING=false
+  REPAIR_SUPERVISOR_STATE=idle
   REPAIR_CANCELLATION_ACTIVE=false
   REPAIR_CANCELLATION_EXIT_STATUS=
   REPAIR_CANCELLATION_SIGNAL_NAME=
+  REPAIR_ADMISSION_BARRIER_CROSSED=false
   trap cleanup_sdist_repair_state EXIT
   trap 'cancel_sdist_repair HUP 129' HUP
   trap 'cancel_sdist_repair INT 130' INT

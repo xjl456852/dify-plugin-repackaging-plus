@@ -1624,6 +1624,73 @@ fi
 assert_eq 0 "$(find "$cancel_repair_dir" -type f \( -name '*build*log*' -o -name '*.netrc' \) | wc -l)" \
   'TERM cancellation removes raw build logs and retains no credential artifact'
 
+late_cancel_parent="$FIXTURE_DIR/late cancel repair parent"
+mkdir -p "$late_cancel_parent"
+late_cancel_repair_dir="$late_cancel_parent/sdist-repair"
+late_cancel_log="$FIXTURE_DIR/sdist-repair-late-cancel.log"
+late_cancel_trigger_file="$FIXTURE_DIR/sdist-repair-late-cancel.triggered"
+rm -f -- "$late_cancel_trigger_file"
+if (
+  set -T
+  trap '
+    if [[ "$BASH_COMMAND" == "REPAIR_SUPERVISOR_PID=" && \
+      "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+      trap - DEBUG
+      printf "triggered\n" >"$late_cancel_trigger_file"
+      kill -TERM "$BASHPID"
+    fi
+  ' DEBUG
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$late_cancel_repair_dir" '' 1
+) >"$late_cancel_log" 2>&1; then
+  late_cancel_status=0
+else
+  late_cancel_status=$?
+fi
+assert_file_contains "$late_cancel_trigger_file" 'triggered' 'DEBUG trap deterministically reaches the post-wait PID-clear boundary'
+assert_eq 143 "$late_cancel_status" 'late TERM after supervisor wait is preserved as cancellation'
+if [[ -d "$late_cancel_repair_dir/built-wheels" ]]; then
+  assert_eq 0 "$(find "$late_cancel_repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" \
+    'late TERM cannot admit a wheel after the supervisor wait'
+else
+  pass 'late TERM cannot admit a wheel after the supervisor wait'
+fi
+assert_eq 0 "$(find "$late_cancel_repair_dir" -type d -name '.admission.*' | wc -l)" \
+  'late TERM creates no admission snapshot'
+assert_eq 1 "$(find "$late_cancel_repair_dir/candidate-1/wheel" -maxdepth 1 -type f -name '*.whl' | wc -l)" \
+  'late TERM leaves the build output unmoved before the non-admission barrier'
+assert_file_missing "$late_cancel_repair_dir/.repair-lock" 'late TERM releases the exact repair-tree lock'
+assert_eq 0 "$(find "$late_cancel_repair_dir" -type f -name '*log*' | wc -l)" \
+  'late TERM removes its exact raw stage log'
+
+for late_cancel_iteration in $(seq 1 8); do
+  late_cancel_stress_log="$FIXTURE_DIR/late-cancel-stress-$late_cancel_iteration.log"
+  if (
+    REPAIR_SUPERVISOR_PID=
+    REPAIR_SUPERVISOR_STARTING=false
+    REPAIR_CANCELLATION_ACTIVE=false
+    REPAIR_CANCELLATION_EXIT_STATUS=
+    REPAIR_CANCELLATION_SIGNAL_NAME=
+    trap 'cancel_sdist_repair TERM 143' TERM
+    set -T
+    trap '
+      if [[ "$BASH_COMMAND" == "REPAIR_SUPERVISOR_PID=" && \
+        "${REPAIR_SUPERVISOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+        trap - DEBUG
+        kill -TERM "$BASHPID"
+      fi
+    ' DEBUG
+    run_supervised_command_log "$late_cancel_stress_log" 5 bash -c 'exit 0'
+  ) >/dev/null 2>&1; then
+    late_cancel_stress_status=0
+  else
+    late_cancel_stress_status=$?
+  fi
+  assert_eq 143 "$late_cancel_stress_status" \
+    "post-wait late cancellation stress iteration $late_cancel_iteration"
+  rm -f -- "$late_cancel_stress_log"
+done
+
 mutation_repair_parent="$FIXTURE_DIR/mutation repair parent"
 mkdir -p "$mutation_repair_parent"
 mutation_repair_dir="$mutation_repair_parent/sdist-repair"
