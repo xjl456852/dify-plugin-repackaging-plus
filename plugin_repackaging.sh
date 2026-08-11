@@ -162,21 +162,29 @@ redact_pip_log() {
   python3 /dev/fd/3 3<<'PY'
 import re
 import sys
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 
 url_pattern = re.compile(
-    r"(?i)(?:https?|socks(?:4a?|5h?))://[^\s<>'\"]+"
+    r"(?i)(?:https?|socks(?:4a?|5h?))://\S+"
 )
 
 
 def redact_url(match):
     raw_url = match.group(0)
     trailing = ""
-    while raw_url and raw_url[-1] in ".,;)":
+    while raw_url and raw_url[-1] in "'\"].,;)}>":
         trailing = raw_url[-1] + trailing
         raw_url = raw_url[:-1]
     try:
+        if any(
+            not character.isprintable()
+            or unicodedata.category(character).startswith("C")
+            or character in "<>\"\\"
+            for character in raw_url
+        ) or re.search(r"%(?![0-9A-Fa-f]{2})", raw_url):
+            raise ValueError("unsafe character in URL")
         parsed = urlsplit(raw_url)
         if not parsed.scheme or not parsed.hostname:
             raise ValueError("URL must include a scheme and host")
@@ -188,13 +196,35 @@ def redact_url(match):
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             host = f"***@{host}"
         safe_url = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
-    except (TypeError, ValueError):
+    except (TypeError, UnicodeError, ValueError):
         safe_url = "<redacted-url>"
     return safe_url + trailing
 
 
-for line in sys.stdin:
-    sys.stdout.write(url_pattern.sub(redact_url, line))
+raw_input = sys.stdin.buffer.read()
+text = raw_input.decode("utf-8", errors="surrogateescape")
+redacted = url_pattern.sub(redact_url, text)
+safe_output = []
+for character in redacted:
+    if character in "\n\t":
+        safe_output.append(character)
+        continue
+    codepoint = ord(character)
+    category = unicodedata.category(character)
+    if 0xDC80 <= codepoint <= 0xDCFF:
+        safe_output.append(f"\\x{codepoint - 0xDC00:02x}")
+    elif character == "\r":
+        safe_output.append("\\r")
+    elif not character.isprintable() or category.startswith("C") or category in {"Zl", "Zp"}:
+        if codepoint < 0x80:
+            safe_output.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            safe_output.append(f"\\u{codepoint:04x}")
+        else:
+            safe_output.append(f"\\U{codepoint:08x}")
+    else:
+        safe_output.append(character)
+sys.stdout.buffer.write("".join(safe_output).encode("utf-8"))
 PY
 }
 
@@ -911,7 +941,6 @@ download_wheels_once() {
   local -a pip_command=()
   local -a platform_args=()
   local -a download_args=()
-  local -a local_wheel_args=()
 
   : >"$pip_output_log" || return
   if [[ -n "$local_wheels_dir" ]]; then
@@ -920,7 +949,6 @@ download_wheels_once() {
       return 1
     fi
     local_wheels_dir="$(realpath -- "$local_wheels_dir")" || return
-    local_wheel_args=(--find-links "$local_wheels_dir")
   fi
   socks_proxy_url="$(detect_socks_proxy)" || true
   if [[ -n "$socks_proxy_url" ]]; then
@@ -939,7 +967,11 @@ download_wheels_once() {
     download
     --disable-pip-version-check
     --index-url "$PIP_MIRROR_URL"
-    "${local_wheel_args[@]}"
+  )
+  if [[ -n "$local_wheels_dir" ]]; then
+    download_args+=(--find-links "$local_wheels_dir")
+  fi
+  download_args+=(
     --python-version "$python_version"
     --implementation cp
     --abi "$abi"

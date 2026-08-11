@@ -357,6 +357,56 @@ for secret_value in mirror-user mirror-secret query-secret proxy-user proxy-secr
   assert_file_not_contains "$redacted_pip_log" "$secret_value" "captured pip diagnostics redact $secret_value"
 done
 
+apostrophe_url_log="$FIXTURE_DIR/apostrophe-url.log"
+printf '%s\n' \
+  'HTTPS "https://review-user:before'"'"'apostrophe-tail-secret@mirror.example/simple?review-query-secret=yes#review-fragment-secret"' \
+  "HTTP 'http://http-user:http-password@mirror.example/simple?http-query-secret=yes#http-fragment-secret'" \
+  'SOCKS [socks5h://socks-review-user:socks-review-password@10.10.10.10:28802/path?socks-review-query=yes#socks-review-fragment]' \
+  | redact_pip_log >"$apostrophe_url_log" 2>/dev/null || true
+assert_file_contains "$apostrophe_url_log" 'https://***@mirror.example/simple' 'apostrophe-bearing HTTPS userinfo is redacted as one URL token'
+assert_file_contains "$apostrophe_url_log" 'http://***@mirror.example/simple' 'quoted HTTP userinfo is redacted'
+assert_file_contains "$apostrophe_url_log" 'socks5h://***@10.10.10.10:28802/path' 'surrounded SOCKS userinfo is redacted'
+for secret_value in \
+  review-user before apostrophe-tail-secret review-query-secret review-fragment-secret \
+  http-user http-password http-query-secret http-fragment-secret \
+  socks-review-user socks-review-password socks-review-query socks-review-fragment; do
+  assert_file_not_contains "$apostrophe_url_log" "$secret_value" "maximal URL token redaction hides $secret_value"
+done
+
+unsafe_terminal_input="$FIXTURE_DIR/unsafe-terminal-input.bin"
+unsafe_terminal_output="$FIXTURE_DIR/unsafe-terminal-output.txt"
+printf '%s' $'URL https://terminal-user:terminal-password@mirror.example/simple?terminal-query-secret=yes#terminal-fragment-secret\n' >"$unsafe_terminal_input"
+printf '%s' $'OSC52 \e]52;c;clipboard-payload\a end\nCR safe-prefix\roverwrite-text\nNEL before\u0085after\nBIDI before\u202eafter\n' >>"$unsafe_terminal_input"
+printf '\377invalid-utf8\n' >>"$unsafe_terminal_input"
+redact_pip_log <"$unsafe_terminal_input" >"$unsafe_terminal_output" 2>/dev/null || true
+if python3 - "$unsafe_terminal_output" <<'PY'
+from pathlib import Path
+import sys
+import unicodedata
+
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8")
+except UnicodeError:
+    raise SystemExit(1)
+for character in text:
+    if character in "\n\t":
+        continue
+    category = unicodedata.category(character)
+    if character == "\r" or category.startswith("C") or category in {"Zl", "Zp"}:
+        raise SystemExit(1)
+PY
+then
+  pass 'displayed pip diagnostics contain only safe UTF-8 terminal text'
+else
+  fail 'displayed pip diagnostics contain only safe UTF-8 terminal text'
+fi
+for visible_escape in '\x1b' '\x07' '\r' '\u0085' '\u202e' '\xff'; do
+  assert_file_contains "$unsafe_terminal_output" "$visible_escape" "unsafe terminal byte is rendered visibly as $visible_escape"
+done
+for secret_value in terminal-user terminal-password terminal-query-secret terminal-fragment-secret; do
+  assert_file_not_contains "$unsafe_terminal_output" "$secret_value" "terminal-safe display still redacts $secret_value"
+done
+
 metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
 printf '3.12.7\n' >"$metadata_dir/.python-version"
@@ -505,15 +555,44 @@ assert_file_contains "$PIP_ARGS_LOG" 'cp312' 'pip receives CPython ABI'
 assert_file_contains "$PIP_ARGS_LOG" 'manylinux_2_28_aarch64' 'pip accepts modern ARM64 wheels'
 assert_file_contains "$PIP_ARGS_LOG" 'manylinux2014_aarch64' 'pip accepts legacy ARM64 wheels'
 assert_file_contains "$PIP_ARGS_LOG" '--only-binary=:all:' 'pip rejects source distributions'
+assert_file_not_contains "$PIP_ARGS_LOG" '--find-links' 'default wheel download passes no optional find-links arguments'
 assert_file_missing "$wheel_dir/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl" 'wheelhouse is rebuilt without stale x86 wheel'
 
 platform_count="$(grep -c -- '--platform' "$PIP_ARGS_LOG")"
 assert_eq 2 "$platform_count" 'pip receives exactly two target platform options'
 
+if grep -Fq -- '"${local_wheel_args[@]}"' "$ROOT_DIR/plugin_repackaging.sh"; then
+  fail 'default download path avoids Bash 4.3 empty-array expansion'
+else
+  pass 'default download path avoids Bash 4.3 empty-array expansion'
+fi
+
+if bash43_command="$(command -v bash4.3 2>/dev/null)" && [[ -n "$bash43_command" ]]; then
+  bash43_case_dir="$FIXTURE_DIR/bash43-case"
+  mkdir -p "$bash43_case_dir/wheels"
+  if env \
+    -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    BASH43_ROOT="$ROOT_DIR" \
+    BASH43_REQUIREMENTS="$metadata_dir/download.txt" \
+    BASH43_WHEELS="$bash43_case_dir/wheels" \
+    BASH43_LOG="$bash43_case_dir/pip-output.log" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+    PIP_ARGS_LOG="$PIP_ARGS_LOG" \
+    "$bash43_command" -uc \
+      'source "$BASH43_ROOT/plugin_repackaging.sh"; download_wheels_once "$BASH43_REQUIREMENTS" "$BASH43_WHEELS" aarch64 3.12 "$BASH43_LOG"'; then
+    pass 'Bash 4.3 executes the default one-shot download path'
+  else
+    fail 'Bash 4.3 executes the default one-shot download path'
+  fi
+else
+  pass 'Bash 4.3 runtime unavailable; static empty-array regression covers its known set-u limitation'
+fi
+
 download_once_case_dir="$FIXTURE_DIR/download-once-case"
 download_once_wheel_dir="$download_once_case_dir/wheels"
 download_once_log="$download_once_case_dir/pip-output.log"
-local_built_wheels="$download_once_case_dir/built wheels"
+local_built_wheels="$download_once_case_dir/--built wheels"
 mkdir -p "$download_once_wheel_dir" "$local_built_wheels"
 if PIP_MIRROR_URL='https://target-index.example/simple' \
   DIFY_PIP_COMMAND="$fake_bin/pip-download" \
