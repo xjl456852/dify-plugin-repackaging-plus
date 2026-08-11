@@ -28,14 +28,20 @@ MAX_ARCHIVE_MEMBERS = 100000
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_CENTRAL_DIRECTORY_BYTES = 64 * 1024 * 1024
+MAX_TAR_EXTENSION_BYTES = 1024 * 1024
+MAX_TAR_EXTENSION_HEADERS = 128
+MAX_TOTAL_TAR_EXTENSION_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_PATH_LENGTH = 4096
 STREAM_CHUNK_SIZE = 1024 * 1024
 ZIP_MAX_COMMENT_BYTES = 65535
 ZIP_EOCD = struct.Struct("<4s4H2LH")
 ZIP64_LOCATOR = struct.Struct("<4sLQL")
 ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")
+ZIP_CENTRAL_DIRECTORY = struct.Struct("<4s4B4HL2L5H2L")
 ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
 ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
 PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 VERSION_RE = re.compile(
     r"""
@@ -72,6 +78,38 @@ VERSION_RE = re.compile(
     re.ASCII | re.IGNORECASE | re.VERBOSE,
 )
 WHEEL_DISTRIBUTION_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?$")
+
+
+class BoundedTarInfo(tarfile.TarInfo):
+    def _proc_member(self, archive):
+        extension_types = (
+            tarfile.GNUTYPE_LONGNAME,
+            tarfile.GNUTYPE_LONGLINK,
+            tarfile.XHDTYPE,
+            tarfile.XGLTYPE,
+            tarfile.SOLARIS_XHDTYPE,
+        )
+        if self.type not in extension_types:
+            return super()._proc_member(archive)
+        if self.size < 0 or self.size > MAX_TAR_EXTENSION_BYTES:
+            raise ValidationError("tar extension header exceeds size limit")
+
+        previous_count = getattr(archive, "_validator_tar_extension_count", 0)
+        previous_bytes = getattr(archive, "_validator_tar_extension_bytes", 0)
+        extension_count = previous_count + 1
+        extension_bytes = previous_bytes + self.size
+        if extension_count > MAX_TAR_EXTENSION_HEADERS:
+            raise ValidationError("tar extension header count limit exceeded")
+        if extension_bytes > MAX_TOTAL_TAR_EXTENSION_BYTES:
+            raise ValidationError("tar extension header aggregate size limit exceeded")
+
+        archive._validator_tar_extension_count = extension_count
+        archive._validator_tar_extension_bytes = extension_bytes
+        try:
+            return super()._proc_member(archive)
+        finally:
+            archive._validator_tar_extension_count = previous_count
+            archive._validator_tar_extension_bytes = previous_bytes
 
 
 class Parser(argparse.ArgumentParser):
@@ -159,7 +197,10 @@ def validate_path(name):
     normalized_parts = [part for part in raw_parts if part not in ("", ".")]
     if not normalized_parts:
         raise ValidationError("unsafe archive path")
-    return "/".join(normalized_parts)
+    normalized = "/".join(normalized_parts)
+    if len(normalized) > MAX_ARCHIVE_PATH_LENGTH:
+        raise ValidationError("archive path length limit exceeded")
+    return normalized
 
 
 def validate_tar_archive(archive):
@@ -182,6 +223,8 @@ def validate_tar_archive(archive):
         if member.issym() or member.islnk():
             raise ValidationError("link entry")
         if not (member.isfile() or member.isdir()):
+            raise ValidationError("unsafe archive entry")
+        if member.isdir() and member.size != 0:
             raise ValidationError("unsafe archive entry")
         if member.isfile():
             total_size += member.size
@@ -248,8 +291,35 @@ def validate_zip_directory_limits(entries, central_directory_size):
         raise ValidationError("archive member limit exceeded")
     if central_directory_size > MAX_CENTRAL_DIRECTORY_BYTES:
         raise ValidationError("central directory size limit exceeded")
-    if entries and central_directory_size < entries * 46:
+    if entries and central_directory_size < entries * ZIP_CENTRAL_DIRECTORY.size:
         raise ZipPreflightError("invalid ZIP end of central directory")
+
+
+def validate_zip_central_directory(stream, directory_offset, directory_size, declared_entries):
+    position = directory_offset
+    remaining = directory_size
+    actual_entries = 0
+    while remaining:
+        if remaining < ZIP_CENTRAL_DIRECTORY.size:
+            raise ZipPreflightError("truncated ZIP central directory")
+        values = ZIP_CENTRAL_DIRECTORY.unpack(
+            read_zip_record(stream, position, ZIP_CENTRAL_DIRECTORY.size)
+        )
+        if values[0] != ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+            raise ZipPreflightError("invalid ZIP central directory record")
+        if values[15] != 0:
+            raise ZipPreflightError("unsupported multi-disk ZIP archive")
+        variable_size = sum(values[12:15])
+        record_size = ZIP_CENTRAL_DIRECTORY.size + variable_size
+        if record_size > remaining:
+            raise ZipPreflightError("truncated ZIP central directory")
+        actual_entries += 1
+        if actual_entries > MAX_ARCHIVE_MEMBERS:
+            raise ValidationError("archive member limit exceeded")
+        position += record_size
+        remaining -= record_size
+    if actual_entries != declared_entries:
+        raise ZipPreflightError("inconsistent ZIP central directory entry count")
 
 
 def validate_normal_zip_directory(values, eocd_offset):
@@ -259,6 +329,7 @@ def validate_normal_zip_directory(values, eocd_offset):
     validate_zip_directory_limits(total_entries, directory_size)
     if directory_size > eocd_offset or directory_offset > eocd_offset - directory_size:
         raise ZipPreflightError("invalid ZIP central directory placement")
+    return eocd_offset - directory_size, directory_size, total_entries
 
 
 def zip64_value_matches(normal_value, zip64_value, sentinel):
@@ -312,6 +383,7 @@ def validate_zip64_directory(stream, values, eocd_offset):
     central_directory_offset = archive_start + directory_offset
     if central_directory_offset + directory_size != record_offset:
         raise ZipPreflightError("invalid ZIP64 central directory placement")
+    return central_directory_offset, directory_size, total_entries
 
 
 def preflight_zip_archive(path):
@@ -332,9 +404,10 @@ def preflight_zip_archive(path):
             and read_zip_record(stream, eocd_offset - ZIP64_LOCATOR.size, 4) == ZIP64_LOCATOR_SIGNATURE
         )
         if any(sentinels) or has_zip64_locator:
-            validate_zip64_directory(stream, values, eocd_offset)
+            directory = validate_zip64_directory(stream, values, eocd_offset)
         else:
-            validate_normal_zip_directory(values, eocd_offset)
+            directory = validate_normal_zip_directory(values, eocd_offset)
+        validate_zip_central_directory(stream, *directory)
 
 
 def zip_entry_type(info):
@@ -364,6 +437,8 @@ def validate_zip_members(archive):
         if kind == stat.S_IFDIR and not info.is_dir():
             raise ValidationError("unsafe archive entry")
         if kind == stat.S_IFREG and info.is_dir():
+            raise ValidationError("unsafe archive entry")
+        if info.is_dir() and (info.file_size != 0 or info.compress_size != 0 or info.CRC != 0):
             raise ValidationError("unsafe archive entry")
         if not info.is_dir():
             total_size += info.file_size
@@ -438,12 +513,12 @@ def validate_sdist(directory, expected_name):
     artifact = candidate(directory, (".tar.gz", ".zip"), "sdist")
     if artifact.name.lower().endswith(".tar.gz"):
         try:
-            with tarfile.open(artifact, "r|gz") as archive:
+            with tarfile.open(artifact, "r|gz", tarinfo=BoundedTarInfo) as archive:
                 name, version, _ = validate_tar_archive(archive)
             verify_gzip_stream(artifact)
         except ValidationError:
             raise
-        except (tarfile.TarError, OSError, EOFError, zlib.error) as error:
+        except (tarfile.TarError, OSError, EOFError, zlib.error, RuntimeError) as error:
             raise ValidationError("invalid tar.gz sdist") from error
     else:
         try:

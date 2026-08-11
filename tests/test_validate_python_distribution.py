@@ -99,6 +99,24 @@ def patch_zip_member_size(path, member_name, size):
         position += 46 + name_length
 
 
+def patch_zip_member_crc(path, member_name, crc):
+    target = member_name.encode()
+    data = bytearray(Path(path).read_bytes())
+    position = 0
+    while True:
+        position = data.find(b"PK\x01\x02", position)
+        if position < 0:
+            raise AssertionError(f"central directory entry not found: {member_name}")
+        name_length = int.from_bytes(data[position + 28:position + 30], "little")
+        if bytes(data[position + 46:position + 46 + name_length]) == target:
+            local_offset = int.from_bytes(data[position + 42:position + 46], "little")
+            data[position + 16:position + 20] = crc.to_bytes(4, "little")
+            data[local_offset + 14:local_offset + 18] = crc.to_bytes(4, "little")
+            Path(path).write_bytes(data)
+            return
+        position += 46 + name_length
+
+
 def patch_zip_eocd(path, *, entries=None, central_directory_size=None):
     data = bytearray(Path(path).read_bytes())
     position = data.rfind(b"PK\x05\x06")
@@ -173,8 +191,29 @@ class DistributionFixture:
                     info.type = tarfile.SYMTYPE
                     info.linkname = data.decode()
                     archive.addfile(info)
+                elif kind == "directory":
+                    info.type = tarfile.DIRTYPE
+                    info.size = len(data)
+                    archive.addfile(info)
                 else:
                     raise ValueError(kind)
+        return path
+
+    def tar_with_extension(self, filename, extension_type, payload):
+        return self.tar_with_extensions(filename, extension_type, payload, 1)
+
+    def tar_with_extensions(self, filename, extension_type, payload, count):
+        path = self.directory / filename
+        with tarfile.open(path, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+            for _ in range(count):
+                extension = tarfile.TarInfo("././@Extension")
+                extension.type = extension_type
+                extension.size = len(payload)
+                archive.addfile(extension, io.BytesIO(payload))
+            member = tarfile.TarInfo("docopt/PKG-INFO")
+            contents = pkg_info()
+            member.size = len(contents)
+            archive.addfile(member, io.BytesIO(contents))
         return path
 
     def zip(self, filename, entries, duplicate_warning=False):
@@ -190,7 +229,7 @@ class DistributionFixture:
                     if kind == "symlink":
                         info.create_system = 3
                         info.external_attr = (stat.S_IFLNK | 0o777) << 16
-                    elif kind == "directory_no_slash":
+                    elif kind in ("directory", "directory_no_slash"):
                         info.create_system = 3
                         info.external_attr = (stat.S_IFDIR | 0o755) << 16
                     archive.writestr(info, data)
@@ -314,6 +353,122 @@ raise SystemExit(validator.main(sys.argv[3:]))
         self.assertEqual(str(caught), "archive member limit exceeded")
         getmembers.assert_not_called()
 
+    def test_tar_pax_extension_limit_precedes_payload_processing(self):
+        self.fixture.tar_with_extension(
+            "docopt-0.6.2.tar.gz", tarfile.XHDTYPE, b"\0" * 513,
+        )
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_TAR_EXTENSION_BYTES", 512, create=True), \
+                mock.patch.object(tarfile.TarInfo, "_proc_pax", side_effect=AssertionError("PAX payload processed")) as process:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header exceeds size limit")
+        process.assert_not_called()
+
+    def test_tar_gnu_longname_limit_precedes_payload_processing(self):
+        longname = b"docopt/PKG-INFO\0"
+        self.fixture.tar_with_extension(
+            "docopt-0.6.2.tar.gz", tarfile.GNUTYPE_LONGNAME,
+            longname + b"\0" * (513 - len(longname)),
+        )
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_TAR_EXTENSION_BYTES", 512, create=True), \
+                mock.patch.object(tarfile.TarInfo, "_proc_gnulong", side_effect=AssertionError("GNU payload processed")) as process:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header exceeds size limit")
+        process.assert_not_called()
+
+    def test_tar_extension_chain_count_limit_precedes_recursive_processing(self):
+        self.fixture.tar_with_extensions(
+            "docopt-0.6.2.tar.gz", tarfile.XGLTYPE, b"5 x=\n", 4,
+        )
+        validator = load_validator_module()
+        original_process = tarfile.TarInfo._proc_pax
+        processed = 0
+
+        def process_with_limit(member, archive):
+            nonlocal processed
+            processed += 1
+            if processed > 3:
+                raise AssertionError("PAX extension chain recursed past limit")
+            return original_process(member, archive)
+
+        caught = None
+        with mock.patch.object(validator, "MAX_TAR_EXTENSION_HEADERS", 3, create=True), \
+                mock.patch.object(tarfile.TarInfo, "_proc_pax", new=process_with_limit):
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header count limit exceeded")
+        self.assertEqual(processed, 3)
+
+    def test_tar_extension_chain_aggregate_limit_precedes_payload_processing(self):
+        self.fixture.tar_with_extensions(
+            "docopt-0.6.2.tar.gz", tarfile.XGLTYPE, b"5 x=\n", 2,
+        )
+        validator = load_validator_module()
+        original_process = tarfile.TarInfo._proc_pax
+        processed = 0
+
+        def process_with_limit(member, archive):
+            nonlocal processed
+            processed += 1
+            if processed > 1:
+                raise AssertionError("PAX aggregate payload processed past limit")
+            return original_process(member, archive)
+
+        caught = None
+        with mock.patch.object(validator, "MAX_TOTAL_TAR_EXTENSION_BYTES", 9, create=True), \
+                mock.patch.object(tarfile.TarInfo, "_proc_pax", new=process_with_limit):
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "tar extension header aggregate size limit exceeded")
+        self.assertEqual(processed, 1)
+
+    def test_sdist_rejects_long_tar_extension_chain_without_traceback(self):
+        self.fixture.tar_with_extensions(
+            "docopt-0.6.2.tar.gz", tarfile.XGLTYPE, b"5 x=\n", 129,
+        )
+        result = self.run_validator("sdist", self.fixture.directory, "--name", "docopt")
+        self.assert_error(result, "tar extension header count limit exceeded")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_archive_path_length_limit_applies_to_standard_and_pax_tar_paths(self):
+        cases = (
+            ("docopt/PKG-INFO", tarfile.REGTYPE),
+            ("x" * 200 + "/PKG-INFO", tarfile.XHDTYPE),
+        )
+        for name, expected_header_type in cases:
+            with self.subTest(name_length=len(name)), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                artifact = fixture.tar("docopt-0.6.2.tar.gz", [(name, pkg_info(), "file")])
+                with gzip.open(artifact, "rb") as stream:
+                    self.assertEqual(stream.read(512)[156:157], expected_header_type)
+                validator = load_validator_module()
+                with mock.patch.object(validator, "MAX_ARCHIVE_PATH_LENGTH", 14, create=True):
+                    with self.assertRaisesRegex(
+                        validator.ValidationError, "^archive path length limit exceeded$",
+                    ):
+                        validator.validate_sdist(directory, "docopt")
+
     def test_multiple_sdist_candidates_are_rejected(self):
         self.fixture.tar("a.tar.gz", [("a/PKG-INFO", pkg_info(), "file")])
         self.fixture.zip("b.zip", [("b/PKG-INFO", pkg_info(), "file")])
@@ -341,6 +496,16 @@ raise SystemExit(validator.main(sys.argv[3:]))
         ])
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "link entry")
 
+    def test_sdist_rejects_directory_with_nonzero_declared_size(self):
+        self.fixture.tar("docopt.tar.gz", [
+            ("docopt/PKG-INFO", pkg_info(), "file"),
+            ("docopt/hidden/", b"\x7fELF" + b"x" * 21, "directory"),
+        ])
+        self.assert_error(
+            self.run_validator("sdist", self.fixture.directory, "--name", "docopt"),
+            "unsafe archive entry",
+        )
+
     def test_safe_zip_sdist_is_accepted(self):
         artifact = self.fixture.zip("docopt.zip", [("docopt/PKG-INFO", pkg_info(), "file")])
         result = self.run_validator("sdist", self.fixture.directory, "--name", "Docopt")
@@ -350,6 +515,53 @@ raise SystemExit(validator.main(sys.argv[3:]))
     def test_zip_preflight_rejects_normal_entry_count_before_zipfile_open(self):
         artifact = self.fixture.zip("docopt.zip", [("docopt/PKG-INFO", pkg_info(), "file")])
         patch_zip_eocd(artifact, entries=2)
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_ARCHIVE_MEMBERS", 1), \
+                mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "archive member limit exceeded")
+        zip_open.assert_not_called()
+        result = self.run_validator_with_member_limit(
+            1, "sdist", self.fixture.directory, "--name", "docopt",
+        )
+        self.assert_error(result, "archive member limit exceeded")
+
+    def test_zip_preflight_rejects_understated_normal_entry_count_before_zipfile_open(self):
+        artifact = self.fixture.zip("docopt.zip", [
+            ("docopt/PKG-INFO", pkg_info(), "file"),
+            ("docopt/module.py", b"# pure python\n", "file"),
+        ])
+        patch_zip_eocd(artifact, entries=1)
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_ARCHIVE_MEMBERS", 1), \
+                mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "archive member limit exceeded")
+        zip_open.assert_not_called()
+        result = self.run_validator_with_member_limit(
+            1, "sdist", self.fixture.directory, "--name", "docopt",
+        )
+        self.assert_error(result, "archive member limit exceeded")
+
+    def test_zip_preflight_rejects_understated_zip64_entry_count_before_zipfile_open(self):
+        artifact = self.fixture.zip("docopt.zip", [
+            ("docopt/PKG-INFO", pkg_info(), "file"),
+            ("docopt/module.py", b"# pure python\n", "file"),
+        ])
+        patch_zip_eocd(artifact, entries=0xFFFF)
+        insert_zip64_chain(artifact, 1)
         validator = load_validator_module()
         caught = None
         with mock.patch.object(validator, "MAX_ARCHIVE_MEMBERS", 1), \
@@ -675,6 +887,21 @@ raise SystemExit(validator.main(sys.argv[3:]))
 
     def test_wheel_rejects_directory_mode_entry_without_directory_name(self):
         self.fixture.wheel(extra=[("docopt/payload.bin", b"\x7fELFpayload", "directory_no_slash")])
+        self.assert_error(
+            self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"),
+            "unsafe archive entry",
+        )
+
+    def test_wheel_rejects_payload_bearing_directory_entry(self):
+        self.fixture.wheel(extra=[("hidden/", b"\x7fELF" + b"x" * 21, "directory")])
+        self.assert_error(
+            self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"),
+            "unsafe archive entry",
+        )
+
+    def test_wheel_rejects_directory_entry_with_nonzero_crc(self):
+        artifact = self.fixture.wheel(extra=[("hidden/", b"", "directory")])
+        patch_zip_member_crc(artifact, "hidden/", 1)
         self.assert_error(
             self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2"),
             "unsafe archive entry",
