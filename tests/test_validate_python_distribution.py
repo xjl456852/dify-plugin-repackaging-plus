@@ -1,7 +1,10 @@
+import gzip
 import io
+import importlib.util
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -11,10 +14,18 @@ import warnings
 import zipfile
 from email.message import Message
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = ROOT / "tools" / "validate_python_distribution.py"
+
+
+def load_validator_module():
+    spec = importlib.util.spec_from_file_location("validate_python_distribution", VALIDATOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def pkg_info(name="docopt", version="0.6.2"):
@@ -86,6 +97,64 @@ def patch_zip_member_size(path, member_name, size):
             Path(path).write_bytes(data)
             return
         position += 46 + name_length
+
+
+def patch_zip_eocd(path, *, entries=None, central_directory_size=None):
+    data = bytearray(Path(path).read_bytes())
+    position = data.rfind(b"PK\x05\x06")
+    if position < 0 or position + 22 > len(data):
+        raise AssertionError("ZIP end of central directory not found")
+    comment_size = int.from_bytes(data[position + 20:position + 22], "little")
+    if position + 22 + comment_size != len(data):
+        raise AssertionError("ZIP end of central directory does not reach EOF")
+    if entries is not None:
+        data[position + 8:position + 10] = entries.to_bytes(2, "little")
+        data[position + 10:position + 12] = entries.to_bytes(2, "little")
+    if central_directory_size is not None:
+        data[position + 12:position + 16] = central_directory_size.to_bytes(4, "little")
+    Path(path).write_bytes(data)
+
+
+def minimal_zip64_archive():
+    zip64_eocd = struct.pack(
+        "<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, 0, 0, 0, 0,
+    )
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+    eocd = struct.pack(
+        "<4s4H2LH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0,
+    )
+    return zip64_eocd + locator + eocd
+
+
+def insert_zip64_chain(path, entries):
+    data = bytearray(Path(path).read_bytes())
+    eocd_offset = data.rfind(b"PK\x05\x06")
+    if eocd_offset < 0:
+        raise AssertionError("ZIP end of central directory not found")
+    values = struct.unpack_from("<4s4H2LH", data, eocd_offset)
+    directory_size, directory_offset = values[5:7]
+    zip64_eocd = struct.pack(
+        "<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries,
+        directory_size, directory_offset,
+    )
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, eocd_offset, 1)
+    data[eocd_offset:eocd_offset] = zip64_eocd + locator
+    Path(path).write_bytes(data)
+
+
+def patch_zip_filename_as_invalid_utf8(path):
+    data = bytearray(Path(path).read_bytes())
+    central_offset = data.find(b"PK\x01\x02")
+    if central_offset < 0:
+        raise AssertionError("ZIP central directory entry not found")
+    local_offset = int.from_bytes(data[central_offset + 42:central_offset + 46], "little")
+    central_flags = int.from_bytes(data[central_offset + 8:central_offset + 10], "little") | 0x0800
+    local_flags = int.from_bytes(data[local_offset + 6:local_offset + 8], "little") | 0x0800
+    data[central_offset + 8:central_offset + 10] = central_flags.to_bytes(2, "little")
+    data[local_offset + 6:local_offset + 8] = local_flags.to_bytes(2, "little")
+    data[central_offset + 46] = 0xFF
+    data[local_offset + 30] = 0xFF
+    Path(path).write_bytes(data)
 
 
 class DistributionFixture:
@@ -162,6 +231,22 @@ class ValidatePythonDistributionTests(unittest.TestCase):
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
 
+    def run_validator_with_member_limit(self, member_limit, *arguments):
+        script = """\
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("validate_python_distribution", sys.argv[1])
+validator = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(validator)
+validator.MAX_ARCHIVE_MEMBERS = int(sys.argv[2])
+raise SystemExit(validator.main(sys.argv[3:]))
+"""
+        return subprocess.run(
+            [sys.executable, "-B", "-c", script, str(VALIDATOR), str(member_limit), *map(str, arguments)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+
     def assert_error(self, result, reason):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"validation failed: {reason}", result.stderr)
@@ -182,6 +267,52 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         ])
         corrupt_gzip_trailer(artifact)
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "invalid tar.gz sdist")
+
+    def test_sdist_rejects_corrupt_concatenated_gzip_member(self):
+        artifact = self.fixture.tar("docopt-0.6.2.tar.gz", [
+            ("docopt-0.6.2/PKG-INFO", pkg_info(), "file"),
+        ])
+        invalid_member = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x07" + b"\x00" * 8
+        with artifact.open("ab") as stream:
+            stream.write(invalid_member)
+
+        result = self.run_validator("sdist", self.fixture.directory, "--name", "docopt")
+        self.assert_error(result, "invalid tar.gz sdist")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_gzip_verification_counts_concatenated_members(self):
+        artifact = self.fixture.tar("docopt-0.6.2.tar.gz", [
+            ("docopt-0.6.2/PKG-INFO", pkg_info(), "file"),
+        ])
+        with gzip.open(artifact, "rb") as stream:
+            tar_size = len(stream.read())
+        with artifact.open("ab") as raw_stream:
+            with gzip.GzipFile(fileobj=raw_stream, mode="wb") as stream:
+                stream.write(b"tail")
+
+        validator = load_validator_module()
+        with mock.patch.object(validator, "MAX_TOTAL_UNCOMPRESSED_BYTES", tar_size + 3), \
+                mock.patch.object(validator, "STREAM_CHUNK_SIZE", 1024):
+            with self.assertRaisesRegex(validator.ValidationError, "^archive size limit exceeded$"):
+                validator.verify_gzip_stream(artifact)
+
+    def test_tar_member_limit_is_enforced_without_getmembers(self):
+        self.fixture.tar("docopt-0.6.2.tar.gz", [
+            ("docopt-0.6.2/PKG-INFO", pkg_info(), "file"),
+            ("docopt-0.6.2/docopt.py", b"# pure python\n", "file"),
+        ])
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_ARCHIVE_MEMBERS", 1), \
+                mock.patch.object(tarfile.TarFile, "getmembers", side_effect=AssertionError("getmembers called")) as getmembers:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "archive member limit exceeded")
+        getmembers.assert_not_called()
 
     def test_multiple_sdist_candidates_are_rejected(self):
         self.fixture.tar("a.tar.gz", [("a/PKG-INFO", pkg_info(), "file")])
@@ -216,9 +347,48 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
 
+    def test_zip_preflight_rejects_normal_entry_count_before_zipfile_open(self):
+        artifact = self.fixture.zip("docopt.zip", [("docopt/PKG-INFO", pkg_info(), "file")])
+        patch_zip_eocd(artifact, entries=2)
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator, "MAX_ARCHIVE_MEMBERS", 1), \
+                mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_sdist(self.fixture.directory, "docopt")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "archive member limit exceeded")
+        zip_open.assert_not_called()
+        result = self.run_validator_with_member_limit(
+            1, "sdist", self.fixture.directory, "--name", "docopt",
+        )
+        self.assert_error(result, "archive member limit exceeded")
+
     def test_corrupt_zip_sdist_is_rejected(self):
         (self.fixture.directory / "docopt.zip").write_bytes(b"not a zip")
         self.assert_error(self.run_validator("sdist", self.fixture.directory, "--name", "docopt"), "invalid zip sdist")
+
+    def test_zip_invalid_utf8_filename_is_normalized(self):
+        cases = (
+            ("sdist", "invalid zip sdist"),
+            ("wheel", "invalid wheel archive"),
+        )
+        for kind, reason in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                fixture = DistributionFixture(directory)
+                if kind == "sdist":
+                    artifact = fixture.zip("docopt.zip", [("docopt/PKG-INFO", pkg_info(), "file")])
+                    arguments = ("sdist", directory, "--name", "docopt")
+                else:
+                    artifact = fixture.wheel()
+                    arguments = ("wheel", directory, "--name", "docopt", "--version", "0.6.2")
+                patch_zip_filename_as_invalid_utf8(artifact)
+                result = self.run_validator(*arguments)
+                self.assert_error(result, reason)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_sdist_metadata_name_mismatch_is_rejected(self):
         self.fixture.tar("docopt.tar.gz", [("docopt/PKG-INFO", pkg_info("other"), "file")])
@@ -247,6 +417,108 @@ class ValidatePythonDistributionTests(unittest.TestCase):
         result = self.run_validator("wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"{artifact.resolve()}\tdocopt\t0.6.2\n")
+
+    def test_zip_preflight_rejects_oversize_central_directory_before_zipfile_open(self):
+        artifact = self.fixture.wheel()
+        validator = load_validator_module()
+        self.assertTrue(hasattr(validator, "MAX_CENTRAL_DIRECTORY_BYTES"))
+        patch_zip_eocd(
+            artifact, central_directory_size=validator.MAX_CENTRAL_DIRECTORY_BYTES + 1,
+        )
+        caught = None
+        with mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_wheel(self.fixture.directory, "docopt", "0.6.2")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "central directory size limit exceeded")
+        zip_open.assert_not_called()
+        result = self.run_validator(
+            "wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2",
+        )
+        self.assert_error(result, "central directory size limit exceeded")
+
+    def test_zip_preflight_rejects_missing_zip64_locator_before_zipfile_open(self):
+        artifact = self.fixture.wheel()
+        patch_zip_eocd(artifact, central_directory_size=0xFFFFFFFF)
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_wheel(self.fixture.directory, "docopt", "0.6.2")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "invalid wheel archive")
+        zip_open.assert_not_called()
+        result = self.run_validator(
+            "wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2",
+        )
+        self.assert_error(result, "invalid wheel archive")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_zip_preflight_accepts_valid_minimal_zip64_chain(self):
+        artifact = Path(self.fixture.directory) / "minimal.zip"
+        artifact.write_bytes(minimal_zip64_archive())
+        validator = load_validator_module()
+        self.assertTrue(hasattr(validator, "preflight_zip_archive"))
+        validator.preflight_zip_archive(artifact)
+
+    def test_zip_preflight_accepts_prefixed_minimal_zip64_chain(self):
+        artifact = Path(self.fixture.directory) / "prefixed.zip"
+        artifact.write_bytes(b"MZprefix" + minimal_zip64_archive())
+        with zipfile.ZipFile(artifact) as archive:
+            self.assertEqual(archive.namelist(), [])
+
+        validator = load_validator_module()
+        caught = None
+        try:
+            validator.preflight_zip_archive(artifact)
+        except Exception as error:
+            caught = error
+        self.assertIsNone(caught, str(caught))
+
+    def test_zip_preflight_rejects_eocd_signature_in_comment_before_zipfile_open(self):
+        artifact = self.fixture.wheel()
+        fake_eocd = struct.pack(
+            "<4s4H2LH", b"PK\x05\x06", 0, 0, 0, 0, 0xFFFFFFFF, 0, 0,
+        )
+        with zipfile.ZipFile(artifact, "a") as archive:
+            archive.comment = fake_eocd + b"x"
+
+        validator = load_validator_module()
+        caught = None
+        with mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_wheel(self.fixture.directory, "docopt", "0.6.2")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "invalid wheel archive")
+        zip_open.assert_not_called()
+
+    def test_zip_preflight_checks_zip64_locator_without_normal_sentinels(self):
+        artifact = self.fixture.wheel()
+        validator = load_validator_module()
+        insert_zip64_chain(artifact, validator.MAX_ARCHIVE_MEMBERS + 1)
+        caught = None
+        with mock.patch.object(validator.zipfile, "ZipFile", side_effect=AssertionError("ZipFile constructed")) as zip_open:
+            try:
+                validator.validate_wheel(self.fixture.directory, "docopt", "0.6.2")
+            except Exception as error:
+                caught = error
+
+        self.assertIsInstance(caught, validator.ValidationError)
+        self.assertEqual(str(caught), "archive member limit exceeded")
+        zip_open.assert_not_called()
+        result = self.run_validator(
+            "wheel", self.fixture.directory, "--name", "docopt", "--version", "0.6.2",
+        )
+        self.assert_error(result, "archive member limit exceeded")
 
     def test_pure_wheel_with_legal_numeric_build_tag_is_accepted(self):
         artifact = self.fixture.wheel(filename="docopt-0.6.2-1_local-py3-none-any.whl")
