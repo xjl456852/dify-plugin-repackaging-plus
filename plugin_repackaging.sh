@@ -117,6 +117,60 @@ default_platforms() {
   printf 'manylinux_2_28_%s\nmanylinux2014_%s\n' "$suffix" "$suffix"
 }
 
+detect_manifest_python_version() {
+  local manifest_file=$1
+  local detected
+
+  [[ -f "$manifest_file" ]] || return 1
+  detected="$(
+    awk '
+      function indentation(line, first_non_space) {
+        first_non_space = match(line, /[^[:space:]]/)
+        return first_non_space ? first_non_space - 1 : length(line)
+      }
+      {
+        line = $0
+        sub(/[[:space:]]+#.*$/, "", line)
+        if (line ~ /^[[:space:]]*meta[[:space:]]*:[[:space:]]*$/) {
+          in_meta = 1
+          meta_indent = indentation(line)
+          next
+        }
+        if (in_meta && line !~ /^[[:space:]]*$/) {
+          current_indent = indentation(line)
+          if (current_indent <= meta_indent) {
+            in_meta = 0
+            in_runner = 0
+          } else if (line ~ /^[[:space:]]*runner[[:space:]]*:[[:space:]]*$/) {
+            in_runner = 1
+            runner_indent = current_indent
+            next
+          }
+        }
+        if (in_runner && line !~ /^[[:space:]]*$/) {
+          current_indent = indentation(line)
+          if (current_indent <= runner_indent) {
+            in_runner = 0
+          } else if (line ~ /^[[:space:]]*version[[:space:]]*:/) {
+            sub(/^[[:space:]]*version[[:space:]]*:[[:space:]]*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            first = substr(line, 1, 1)
+            last = substr(line, length(line), 1)
+            if ((first == "\"" && last == "\"") || (first == "\047" && last == "\047")) {
+              line = substr(line, 2, length(line) - 2)
+            }
+            print line
+            exit
+          }
+        }
+      }
+    ' "$manifest_file"
+  )"
+
+  [[ -n "$detected" ]] || return 1
+  normalize_python_version "$detected" 2>/dev/null
+}
+
 detect_python_version() {
   local plugin_dir=$1
   local requested=${DIFY_PYTHON_VERSION:-}
@@ -127,7 +181,9 @@ detect_python_version() {
     return
   fi
 
-  if [[ -f "$plugin_dir/.python-version" ]]; then
+  if detected="$(detect_manifest_python_version "$plugin_dir/manifest.yaml")"; then
+    :
+  elif [[ -f "$plugin_dir/.python-version" ]]; then
     detected="$(tr -d '[:space:]' <"$plugin_dir/.python-version")"
   elif [[ -f "$plugin_dir/pyproject.toml" ]]; then
     detected="$(

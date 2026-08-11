@@ -127,6 +127,29 @@ printf '%s\n' 'wheels/' '/wheels/**' 'uv.toml' '.venv/' >"$metadata_dir/.difyign
 
 assert_eq 3.12 "$(detect_python_version "$metadata_dir")" 'reads .python-version'
 assert_eq 3.13 "$(DIFY_PYTHON_VERSION=3.13 detect_python_version "$metadata_dir")" 'Python version override'
+printf '%s\n' \
+  'meta:' \
+  '  runner:' \
+  '    language: python' \
+  '    version: "3.11.9"' >"$metadata_dir/manifest.yaml"
+assert_eq 3.11 "$(detect_python_version "$metadata_dir")" 'manifest runner version precedes .python-version'
+assert_eq 3.13 "$(DIFY_PYTHON_VERSION=3.13 detect_python_version "$metadata_dir")" 'Python version override precedes manifest'
+printf '%s\n' \
+  'meta:' \
+  '  version: 9.9.9' \
+  '  runner:' \
+  '    language: python' \
+  "    version: '3.10'" >"$metadata_dir/manifest.yaml"
+assert_eq 3.10 "$(detect_python_version "$metadata_dir")" 'manifest parser reads single-quoted runner version only'
+printf '%s\n' \
+  'meta:' \
+  '  runner:' \
+  '    language: python' \
+  '    version: latest' >"$metadata_dir/manifest.yaml"
+assert_eq 3.12 "$(detect_python_version "$metadata_dir")" 'invalid manifest runner version falls back to .python-version'
+printf '%s\n' 'meta:' '  version: 9.9.9' >"$metadata_dir/manifest.yaml"
+assert_eq 3.12 "$(detect_python_version "$metadata_dir")" 'manifest without runner falls back to .python-version'
+rm -f -- "$metadata_dir/manifest.yaml"
 
 prepare_download_requirements "$metadata_dir" "$metadata_dir/download.txt"
 assert_file_not_contains "$metadata_dir/download.txt" '--no-index' 'download input strips old no-index directive'
