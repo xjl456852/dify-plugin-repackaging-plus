@@ -158,6 +158,140 @@ except (TypeError, ValueError):
 PY
 }
 
+redact_pip_log() {
+  python3 /dev/fd/3 3<<'PY'
+import re
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+
+url_pattern = re.compile(
+    r"(?i)(?:https?|socks(?:4a?|5h?))://[^\s<>'\"]+"
+)
+
+
+def redact_url(match):
+    raw_url = match.group(0)
+    trailing = ""
+    while raw_url and raw_url[-1] in ".,;)":
+        trailing = raw_url[-1] + trailing
+        raw_url = raw_url[:-1]
+    try:
+        parsed = urlsplit(raw_url)
+        if not parsed.scheme or not parsed.hostname:
+            raise ValueError("URL must include a scheme and host")
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            host = f"***@{host}"
+        safe_url = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        safe_url = "<redacted-url>"
+    return safe_url + trailing
+
+
+for line in sys.stdin:
+    sys.stdout.write(url_pattern.sub(redact_url, line))
+PY
+}
+
+extract_missing_requirement() {
+  local pip_output_file=$1
+
+  python3 - "$pip_output_file" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+
+MAX_PIP_OUTPUT_BYTES = 16 * 1024 * 1024
+path = Path(sys.argv[1])
+try:
+    if not path.is_file() or path.stat().st_size > MAX_PIP_OUTPUT_BYTES:
+        raise ValueError("invalid pip output file")
+    log = path.read_text(encoding="utf-8", errors="replace")
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+unsafe_failure_patterns = (
+    r"\bproxy(?:error)?\b",
+    r"\bnetwork\b",
+    r"\b(?:connect(?:ion|error)?|(?:new)?connectionerror)\b",
+    r"\b(?:(?:connect|read)?timeouterror|timeout|timed\s+out)\b",
+    r"\b(?:(?:ssl|tls)error|ssl|tls|certificate)\b",
+    r"certificate(?:_|[\s-])+verify(?:_|[\s-])+failed",
+    r"\b(?:authentication|authorization|unauthorized|forbidden|credentials?)\b",
+    r"(?:http(?:\s+status|\s+error)?\s*)?(?:401|403)\b",
+    r"\btraceback\b",
+    r"\bresolution(?:impossible)?\b",
+    r"\bconflict(?:ing)?\b",
+    r"cannot install .+ because these package versions have conflicting dependencies",
+    r"packages do not match the hashes",
+    r"hash(?:es)? (?:are required|mismatch|do not match|failed)",
+    r"\bhashmismatch\b",
+    r"error sending request",
+    r"could not fetch url",
+    r"max retries exceeded",
+)
+if any(re.search(pattern, log, re.IGNORECASE) for pattern in unsafe_failure_patterns):
+    raise SystemExit(1)
+
+missing_versions = re.findall(
+    r"^\s*(?:ERROR:\s*)?Could not find a version that satisfies the requirement "
+    r"(.+?) \(from versions: none\)\s*$",
+    log,
+    re.MULTILINE,
+)
+missing_distributions = re.findall(
+    r"^\s*(?:ERROR:\s*)?No matching distribution found for (.+?)\s*$",
+    log,
+    re.MULTILINE,
+)
+if len(missing_versions) != 1 or len(missing_distributions) != 1:
+    raise SystemExit(1)
+
+dependency_context = re.compile(r"\s+\(from [^()\r\n]+\)\s*$", re.IGNORECASE)
+requirement_pattern = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"(?:\s*(?P<spec>"
+    r"(?:===|==|!=|~=|<=|>=|<|>)\s*[A-Za-z0-9][A-Za-z0-9.!+_*-]*"
+    r"(?:\s*,\s*(?:===|==|!=|~=|<=|>=|<|>)\s*[A-Za-z0-9][A-Za-z0-9.!+_*-]*)*"
+    r"))?\s*$"
+)
+
+
+def normalize_requirement(value, strip_context=False):
+    if strip_context:
+        while True:
+            stripped = dependency_context.sub("", value)
+            if stripped == value:
+                break
+            value = stripped
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("control character in requirement")
+    match = requirement_pattern.fullmatch(value)
+    if match is None:
+        raise ValueError("unsupported requirement")
+    name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
+    spec = match.group("spec") or ""
+    spec = re.sub(r"\s+", "", spec)
+    return name + spec
+
+
+try:
+    first = normalize_requirement(missing_versions[0], strip_context=True)
+    second = normalize_requirement(missing_distributions[0])
+except ValueError:
+    raise SystemExit(1)
+if first != second:
+    raise SystemExit(1)
+print(first)
+PY
+}
+
 detect_manifest_python_version() {
   local manifest_file=$1
   local detected
@@ -689,24 +823,90 @@ validate_pip_bootstrap_dir() {
   fi
 }
 
-download_wheels() {
+run_pip_with_socks_retry() {
+  local pip_command_name=$1
+  local download_args_name=$2
+  local socks_site_dir=$3
+  local pip_output_log=$4
+  local allow_legacy_retry=${5:-false}
+  local -n selected_pip_command=$pip_command_name
+  local -n selected_download_args=$download_args_name
+  local pip_status retry_status
+  local truststore_error="TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'"
+
+  : >"$pip_output_log"
+  if [[ -n "$socks_site_dir" ]]; then
+    if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
+      >"$pip_output_log" 2>&1; then
+      pip_status=0
+    else
+      pip_status=$?
+    fi
+  else
+    if "${selected_pip_command[@]}" "${selected_download_args[@]}" \
+      >"$pip_output_log" 2>&1; then
+      pip_status=0
+    else
+      pip_status=$?
+    fi
+  fi
+  redact_pip_log <"$pip_output_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
+  if ((pip_status == 0)); then
+    return 0
+  fi
+  if [[ "$allow_legacy_retry" != true ]] || ! grep -Fxq -- "$truststore_error" "$pip_output_log"; then
+    return "$pip_status"
+  fi
+
+  printf '%s\n' \
+    'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
+  : >"$pip_output_log"
+  if [[ -n "$socks_site_dir" ]]; then
+    if PIP_USE_DEPRECATED=legacy-certs \
+      PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
+      >"$pip_output_log" 2>&1; then
+      retry_status=0
+    else
+      retry_status=$?
+    fi
+  else
+    if PIP_USE_DEPRECATED=legacy-certs \
+      "${selected_pip_command[@]}" "${selected_download_args[@]}" \
+      >"$pip_output_log" 2>&1; then
+      retry_status=0
+    else
+      retry_status=$?
+    fi
+  fi
+  redact_pip_log <"$pip_output_log" >&2 || printf 'pip retry output could not be displayed safely\n' >&2
+  return "$retry_status"
+}
+
+download_wheels_once() {
   local requirements=$1
   local wheels_dir=$2
   local target_arch=$3
   local python_version=$4
-  local bootstrap_dir=${5:-}
-  local abi platform socks_proxy_url= socks_site_dir= pip_error_log= bootstrap_parent=
-  local download_succeeded=false retry_succeeded=false
+  local pip_output_log=$5
+  local bootstrap_dir=${6:-}
+  local local_wheels_dir=${7:-}
+  local abi platform socks_proxy_url= socks_site_dir=
   local -a pip_command=()
   local -a platform_args=()
-  local -a platform_names=()
   local -a download_args=()
+  local -a local_wheel_args=()
 
-  reset_wheels_dir "$wheels_dir" || return
-  if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
-    return 0
+  : >"$pip_output_log" || return
+  if [[ -n "$local_wheels_dir" ]]; then
+    if [[ ! -d "$local_wheels_dir" ]]; then
+      printf 'local built-wheel directory not found: %s\n' "$local_wheels_dir" >&2
+      return 1
+    fi
+    local_wheels_dir="$(realpath -- "$local_wheels_dir")" || return
+    local_wheel_args=(--find-links "$local_wheels_dir")
   fi
-
   socks_proxy_url="$(detect_socks_proxy)" || true
   if [[ -n "$socks_proxy_url" ]]; then
     validate_pip_bootstrap_dir "$bootstrap_dir" || return
@@ -716,7 +916,6 @@ download_wheels() {
   abi="$(python_abi "$python_version")" || return
   while IFS= read -r platform; do
     if [[ -n "$platform" ]]; then
-      platform_names+=("$platform")
       platform_args+=(--platform "$platform")
     fi
   done < <(default_platforms "$target_arch")
@@ -724,6 +923,7 @@ download_wheels() {
   download_args=(
     download
     --index-url "$PIP_MIRROR_URL"
+    "${local_wheel_args[@]}"
     --python-version "$python_version"
     --implementation cp
     --abi "$abi"
@@ -732,49 +932,47 @@ download_wheels() {
     --requirement "$requirements"
     --dest "$wheels_dir"
   )
-  if [[ -n "$socks_proxy_url" ]]; then
-    bootstrap_parent="$(dirname -- "$bootstrap_dir")"
-    pip_error_log="$bootstrap_parent/pip-download.stderr"
-    if [[ -n "$socks_site_dir" ]]; then
-      if PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-        "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
-        download_succeeded=true
-      fi
-    else
-      if "${pip_command[@]}" "${download_args[@]}" 2>"$pip_error_log"; then
-        download_succeeded=true
-      fi
-    fi
-    if [[ "$download_succeeded" == true ]]; then
-      cat "$pip_error_log" >&2
-      rm -f -- "$pip_error_log"
-      return 0
-    fi
-    cat "$pip_error_log" >&2
-    if grep -Fq "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" "$pip_error_log"; then
-      printf '%s\n' \
-        'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
-      if [[ -n "$socks_site_dir" ]]; then
-        if PIP_USE_DEPRECATED=legacy-certs \
-          PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
-          "${pip_command[@]}" "${download_args[@]}"; then
-          retry_succeeded=true
-        fi
-      else
-        if PIP_USE_DEPRECATED=legacy-certs \
-          "${pip_command[@]}" "${download_args[@]}"; then
-          retry_succeeded=true
-        fi
-      fi
-      if [[ "$retry_succeeded" == true ]]; then
-        rm -f -- "$pip_error_log"
-        return 0
-      fi
-    fi
-    rm -f -- "$pip_error_log"
-  else
-    "${pip_command[@]}" "${download_args[@]}" && return 0
+
+  run_pip_with_socks_retry \
+    pip_command \
+    download_args \
+    "$socks_site_dir" \
+    "$pip_output_log" \
+    "$([[ -n "$socks_proxy_url" ]] && printf true || printf false)"
+}
+
+download_wheels() {
+  local requirements=$1
+  local wheels_dir=$2
+  local target_arch=$3
+  local python_version=$4
+  local bootstrap_dir=${5:-}
+  local abi platform pip_output_log wheels_parent
+  local -a platform_names=()
+
+  reset_wheels_dir "$wheels_dir" || return
+  if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
+    return 0
   fi
+  abi="$(python_abi "$python_version")" || return
+  while IFS= read -r platform; do
+    if [[ -n "$platform" ]]; then
+      platform_names+=("$platform")
+    fi
+  done < <(default_platforms "$target_arch")
+  wheels_parent="$(dirname -- "$wheels_dir")"
+  pip_output_log="$(mktemp "$wheels_parent/.pip-download.XXXXXX")" || return
+  if download_wheels_once \
+    "$requirements" \
+    "$wheels_dir" \
+    "$target_arch" \
+    "$python_version" \
+    "$pip_output_log" \
+    "$bootstrap_dir"; then
+    rm -f -- "$pip_output_log"
+    return 0
+  fi
+  rm -f -- "$pip_output_log"
   report_wheel_download_failure \
     "$target_arch" \
     "$python_version" \

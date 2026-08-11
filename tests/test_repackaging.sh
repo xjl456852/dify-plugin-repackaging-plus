@@ -165,6 +165,100 @@ cleanup_test_files() {
 
 trap cleanup_test_files EXIT
 
+write_missing_wheel_log() {
+  local file=$1
+  local first_requirement=$2
+  local second_requirement=${3:-$2}
+
+  printf '%s\n' \
+    "ERROR: Could not find a version that satisfies the requirement $first_requirement (from versions: none)" \
+    "ERROR: No matching distribution found for $second_requirement" \
+    >"$file"
+}
+
+missing_log="$FIXTURE_DIR/missing-wheel.log"
+write_missing_wheel_log "$missing_log" 'docopt (from records)' docopt
+assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'unconstrained missing wheel is classified from exact paired pip errors'
+
+write_missing_wheel_log "$missing_log" 'DocOpt == 0.6.2' 'docopt==0.6.2'
+assert_eq 'docopt==0.6.2' "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'constrained missing wheel is normalized and classified'
+
+for unsafe_failure_marker in \
+  'ProxyError' \
+  'ConnectTimeoutError' \
+  'ReadTimeoutError' \
+  'connection refused' \
+  'operation timed out' \
+  'SSLError' \
+  'TLS handshake failed' \
+  'certificate verify failed' \
+  'CERTIFICATE_VERIFY_FAILED' \
+  '401 authentication required' \
+  'invalid credentials' \
+  'THESE PACKAGES DO NOT MATCH THE HASHES' \
+  'HashMismatch' \
+  'ResolutionImpossible: conflicting dependencies' \
+  'Traceback (most recent call last):'; do
+  write_missing_wheel_log "$missing_log" docopt
+  printf '%s\n' "$unsafe_failure_marker" >>"$missing_log"
+  if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+    fail "missing-wheel classification rejects $unsafe_failure_marker"
+  else
+    pass "missing-wheel classification rejects $unsafe_failure_marker"
+  fi
+done
+
+write_missing_wheel_log "$missing_log" docopt click
+if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+  fail 'mismatched missing requirements are rejected'
+else
+  pass 'mismatched missing requirements are rejected'
+fi
+
+write_missing_wheel_log "$missing_log" docopt
+printf '%s\n' \
+  'ERROR: Could not find a version that satisfies the requirement click (from versions: none)' \
+  'ERROR: No matching distribution found for click' \
+  >>"$missing_log"
+if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+  fail 'multiple missing requirements are rejected'
+else
+  pass 'multiple missing requirements are rejected'
+fi
+
+unsafe_requirements=(
+  '--extra-index-url=https://evil.example/simple'
+  'https://evil.example/docopt.tar.gz'
+  '../docopt'
+  'docopt @ https://evil.example/docopt.tar.gz'
+  'docopt; python_version >= "3.12"'
+  'docopt[all]'
+  '-e git+https://evil.example/docopt.git'
+  'docopt$(touch exploit)'
+  $'docopt\t==0.6.2'
+)
+for unsafe_requirement in "${unsafe_requirements[@]}"; do
+  write_missing_wheel_log "$missing_log" "$unsafe_requirement"
+  if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+    fail "unsafe missing requirement is rejected: $unsafe_requirement"
+  else
+    pass "unsafe missing requirement is rejected: $unsafe_requirement"
+  fi
+done
+
+redacted_pip_log="$FIXTURE_DIR/redacted-pip.log"
+printf '%s\n' \
+  'Looking in indexes: https://mirror-user:mirror-secret@mirror.example/simple?token=query-secret#fragment' \
+  'Using proxy socks5h://proxy-user:proxy-secret@10.10.10.10:28802/route?socks-token=secret#fragment' \
+  'Found link https://links-user:links-password@wheels.example/packages/docopt.whl?download=links-token#sha256=secret' \
+  | redact_pip_log >"$redacted_pip_log" 2>/dev/null || true
+assert_file_contains "$redacted_pip_log" 'https://***@mirror.example/simple' 'captured pip diagnostics retain a safe index location'
+assert_file_contains "$redacted_pip_log" 'socks5h://***@10.10.10.10:28802/route' 'captured pip diagnostics retain a safe SOCKS proxy location'
+assert_file_contains "$redacted_pip_log" 'https://***@wheels.example/packages/docopt.whl' 'captured pip diagnostics retain a safe find-links location'
+for secret_value in mirror-user mirror-secret query-secret proxy-user proxy-secret socks-token links-user links-password links-token; do
+  assert_file_not_contains "$redacted_pip_log" "$secret_value" "captured pip diagnostics redact $secret_value"
+done
+
 metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
 printf '3.12.7\n' >"$metadata_dir/.python-version"
@@ -285,6 +379,11 @@ assert_file_not_contains "$UV_EXPORT_LOG" '--frozen' 'uv export resolves pyproje
 cat >"$fake_bin/pip-download" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$PIP_ARGS_LOG"
+if [[ "${FAKE_PIP_DIAGNOSTIC_FAILURE:-0}" == 1 ]]; then
+  printf '%s\n' 'Looking in indexes: https://diag-user:diag-password@mirror.example/simple?token=diag-token#fragment'
+  printf '%s\n' 'Proxy socks5h://socks-user:socks-password@10.10.10.10:28802/path?socks-query=secret#fragment' >&2
+  exit 64
+fi
 while (($#)); do
   if [[ "$1" == '-d' || "$1" == '--dest' ]]; then
     shift
@@ -312,6 +411,72 @@ assert_file_missing "$wheel_dir/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl"
 
 platform_count="$(grep -c -- '--platform' "$PIP_ARGS_LOG")"
 assert_eq 2 "$platform_count" 'pip receives exactly two target platform options'
+
+download_once_case_dir="$FIXTURE_DIR/download-once-case"
+download_once_wheel_dir="$download_once_case_dir/wheels"
+download_once_log="$download_once_case_dir/pip-output.log"
+local_built_wheels="$download_once_case_dir/built wheels"
+mkdir -p "$download_once_wheel_dir" "$local_built_wheels"
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$download_once_log" \
+    '' \
+    "$local_built_wheels"; then
+  pass 'one-shot wheel download accepts a local built-wheel directory'
+else
+  fail 'one-shot wheel download accepts a local built-wheel directory'
+fi
+assert_file_contains "$PIP_ARGS_LOG" '--only-binary=:all:' 'one-shot wheel download keeps binary-only policy'
+assert_file_contains "$PIP_ARGS_LOG" '--python-version' 'one-shot wheel download keeps target Python'
+assert_file_contains "$PIP_ARGS_LOG" 'cp312' 'one-shot wheel download keeps target ABI'
+assert_file_contains "$PIP_ARGS_LOG" 'manylinux_2_28_aarch64' 'one-shot wheel download keeps target platform'
+assert_eq 1 "$(grep -Fxc -- '--find-links' "$PIP_ARGS_LOG")" 'local wheel directory uses one find-links option'
+assert_eq 1 "$(grep -Fxc -- "$local_built_wheels" "$PIP_ARGS_LOG")" 'local wheel directory with spaces is one find-links value'
+
+download_diagnostic_log="$download_once_case_dir/diagnostic-output.log"
+if FAKE_PIP_DIAGNOSTIC_FAILURE=1 \
+  DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$download_once_log" \
+    >"$download_diagnostic_log" 2>&1; then
+  fail 'one-shot diagnostic fixture fails as requested'
+else
+  pass 'one-shot diagnostic fixture fails as requested'
+fi
+assert_file_contains "$download_diagnostic_log" 'https://***@mirror.example/simple' 'download diagnostics expose only a safe index URL'
+assert_file_contains "$download_diagnostic_log" 'socks5h://***@10.10.10.10:28802/path' 'download diagnostics expose only a safe SOCKS URL'
+for secret_value in diag-user diag-password diag-token socks-user socks-password socks-query; do
+  assert_file_not_contains "$download_diagnostic_log" "$secret_value" "download diagnostics redact $secret_value"
+done
+
+write_missing_wheel_log "$download_once_log" docopt
+if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels_once \
+    "$metadata_dir/download.txt" \
+    "$download_once_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$download_once_log" \
+    '' \
+    "$download_once_case_dir/missing-built-wheels" \
+    >/dev/null 2>&1; then
+  fail 'invalid local wheel directory stops one-shot download'
+else
+  pass 'invalid local wheel directory stops one-shot download'
+fi
+if extract_missing_requirement "$download_once_log" >/dev/null 2>&1; then
+  fail 'pre-pip failure cannot leave stale classifiable output'
+else
+  pass 'pre-pip failure cannot leave stale classifiable output'
+fi
 
 cat >"$fake_bin/pip-fail" <<'EOF'
 #!/usr/bin/env bash
@@ -385,6 +550,11 @@ case "${1:-}" in
       printf '%s\n' \
         "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" >&2
       exit 86
+    fi
+    if [[ "${FAKE_PIP_SOCKS_TLS_NEAR_MATCH:-0}" == 1 ]]; then
+      printf '%s\n' \
+        "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context_extra'" >&2
+      exit 87
     fi
     printf '%s\n' "${PYTHONPATH:-}" >"$SOCKS_PYTHONPATH_LOG"
     while (($#)); do
@@ -618,6 +788,30 @@ fi
 assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'installed PySocks compatibility retry runs exactly once'
 assert_file_contains "$installed_tls_bug_case_dir/output.log" 'legacy-certs' 'installed PySocks compatibility retry is explained'
 assert_file_missing "$installed_tls_bug_case_dir/pip-bootstrap" 'installed PySocks retry creates no bootstrap directory'
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+near_match_case_dir="$FIXTURE_DIR/pysocks-near-match-case"
+mkdir -p "$near_match_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_PIP_HAS_PYSOCKS=1 \
+  FAKE_PIP_SOCKS_TLS_NEAR_MATCH=1 \
+  PATH="$socks_fake_bin:$PATH" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$near_match_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$near_match_case_dir/pip-bootstrap" \
+    >"$near_match_case_dir/output.log" 2>&1; then
+  fail 'near-match SOCKS truststore error remains a failure'
+else
+  pass 'near-match SOCKS truststore error remains a failure'
+fi
+assert_eq 1 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'near-match SOCKS truststore error is not retried'
+assert_file_not_contains "$near_match_case_dir/output.log" 'retrying once' 'near-match SOCKS error does not enable compatibility retry'
 
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
