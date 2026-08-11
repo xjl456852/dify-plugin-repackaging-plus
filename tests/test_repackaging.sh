@@ -148,6 +148,7 @@ FIXTURE_DIR="$(mktemp -d /tmp/dify-repackaging-tests.XXXXXX)"
 GENERATED_TEST_OUTPUT=
 GENERATED_REMOTE_FILES=()
 GENERATED_ROOT_TEST_DIRS=()
+GENERATED_OUTPUT_LOCKS=()
 
 cleanup_test_files() {
   rm -rf -- "$FIXTURE_DIR"
@@ -169,6 +170,17 @@ cleanup_test_files() {
         if [[ -d "$generated_root_test_dir" && ! -L "$generated_root_test_dir" && \
           "$(realpath -e -- "$generated_root_test_dir")" == "$generated_root_test_dir" ]]; then
           rm -rf -- "$generated_root_test_dir"
+        fi
+        ;;
+    esac
+  done
+  local generated_output_lock
+  for generated_output_lock in "${GENERATED_OUTPUT_LOCKS[@]}"; do
+    case "$generated_output_lock" in
+      "$ROOT_DIR"/.dify-publication-lock-*.lock)
+        if [[ -f "$generated_output_lock" && ! -L "$generated_output_lock" && \
+          "$(stat -c '%u' "$generated_output_lock")" == "$(id -u)" ]]; then
+          rm -f -- "$generated_output_lock"
         fi
         ;;
     esac
@@ -303,10 +315,13 @@ cleanup_race_victim="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)"
 cleanup_race_ready="$FIXTURE_DIR/cleanup-race.ready"
 cleanup_race_go="$FIXTURE_DIR/cleanup-race.go"
 cleanup_race_status="$FIXTURE_DIR/cleanup-race.status"
+cleanup_race_stderr="$FIXTURE_DIR/cleanup-race.stderr"
+cleanup_race_identity="$(stat -c '%d:%i:%u' "$cleanup_race_workspace")"
 chmod 000 -- "$cleanup_race_workspace" "$cleanup_race_victim"
 (
   if DIFY_TEST_RACE_READY="$cleanup_race_ready" DIFY_TEST_RACE_GO="$cleanup_race_go" \
-    python3 -B "$cleanup_python" "$cleanup_race_workspace"; then
+    python3 -B "$cleanup_python" "$cleanup_race_workspace" "$cleanup_race_identity" \
+      2>"$cleanup_race_stderr"; then
     cleanup_status=0
   else
     cleanup_status=$?
@@ -318,18 +333,247 @@ for _ in $(seq 1 200); do
   [[ -e "$cleanup_race_ready" ]] && break
   sleep 0.01
 done
-mv -- "$cleanup_race_workspace" "$cleanup_race_held"
-mv -- "$cleanup_race_victim" "$cleanup_race_workspace"
-: >"$cleanup_race_go"
+if [[ -e "$cleanup_race_ready" ]]; then
+  pass 'coordinator cleanup reaches the deterministic identity race barrier'
+  mv -- "$cleanup_race_workspace" "$cleanup_race_held"
+  mv -- "$cleanup_race_victim" "$cleanup_race_workspace"
+  : >"$cleanup_race_go"
+else
+  fail 'coordinator cleanup reaches the deterministic identity race barrier'
+  kill "$cleanup_runner_pid" 2>/dev/null || true
+fi
 wait "$cleanup_runner_pid"
 if [[ "$(<"$cleanup_race_status")" != 0 ]]; then
   pass 'coordinator cleanup fails closed when its top workspace is replaced'
 else
   fail 'coordinator cleanup fails closed when its top workspace is replaced'
 fi
+assert_file_not_contains "$cleanup_race_stderr" 'Traceback' 'coordinator cleanup race has no helper traceback'
 assert_eq 0 "$(stat -c '%a' "$cleanup_race_workspace")" 'coordinator cleanup never chmods an attacker replacement'
 chmod 700 -- "$cleanup_race_workspace" "$cleanup_race_held"
 rm -rf -- "$cleanup_race_workspace" "$cleanup_race_held"
+
+owned_cleanup_python="$FIXTURE_DIR/owned-temp-cleanup-race.py"
+awk '
+  /^remove_owned_temp_tree\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    if ($0 ~ /OWNED_TEMP_TREE_CLEANUP_IDENTITY_CAPTURED/) {
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+    print
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$owned_cleanup_python"
+owned_cleanup_parent="$(mktemp -d -- /tmp/dify-owned-cleanup-parent.XXXXXXXX)"
+owned_cleanup_workspace="$owned_cleanup_parent/.dify-output.0123456789abcdef0123456789abcdef"
+owned_cleanup_held="$owned_cleanup_workspace.held"
+owned_cleanup_ready="$FIXTURE_DIR/owned-cleanup-race.ready"
+owned_cleanup_go="$FIXTURE_DIR/owned-cleanup-race.go"
+owned_cleanup_status="$FIXTURE_DIR/owned-cleanup-race.status"
+owned_cleanup_stderr="$FIXTURE_DIR/owned-cleanup-race.stderr"
+mkdir -m 700 -- "$owned_cleanup_workspace"
+owned_cleanup_identity="$(stat -c '%d:%i:%u' "$owned_cleanup_workspace")"
+owned_cleanup_marker_nonce=0123456789abcdef0123456789abcdef
+printf '%s\n' "$owned_cleanup_marker_nonce" \
+  >"$owned_cleanup_workspace/.dify-owner-$owned_cleanup_marker_nonce"
+(
+  if DIFY_TEST_RACE_READY="$owned_cleanup_ready" DIFY_TEST_RACE_GO="$owned_cleanup_go" \
+    python3 -B "$owned_cleanup_python" "$owned_cleanup_workspace" \
+      "$owned_cleanup_parent" .dify-output. "$owned_cleanup_identity" \
+      "$owned_cleanup_marker_nonce" \
+      2>"$owned_cleanup_stderr"; then
+    owned_cleanup_exit=0
+  else
+    owned_cleanup_exit=$?
+  fi
+  printf '%s\n' "$owned_cleanup_exit" >"$owned_cleanup_status"
+) &
+owned_cleanup_pid=$!
+for _ in $(seq 1 200); do
+  [[ -e "$owned_cleanup_ready" ]] && break
+  sleep 0.01
+done
+if [[ -e "$owned_cleanup_ready" ]]; then
+  pass 'tracked temp cleanup reaches the deterministic descriptor race barrier'
+  mv -- "$owned_cleanup_workspace" "$owned_cleanup_held"
+  mkdir -m 700 -- "$owned_cleanup_workspace"
+  printf 'attacker replacement sentinel\n' >"$owned_cleanup_workspace/sentinel"
+  : >"$owned_cleanup_go"
+else
+  fail 'tracked temp cleanup reaches the deterministic descriptor race barrier'
+  kill "$owned_cleanup_pid" 2>/dev/null || true
+fi
+wait "$owned_cleanup_pid"
+assert_eq 1 "$(<"$owned_cleanup_status")" 'tracked temp cleanup rejects a path replacement after identity binding'
+owned_cleanup_sentinel_value='<missing>'
+[[ ! -f "$owned_cleanup_workspace/sentinel" ]] || \
+  owned_cleanup_sentinel_value="$(<"$owned_cleanup_workspace/sentinel")"
+assert_eq 'attacker replacement sentinel' "$owned_cleanup_sentinel_value" 'tracked temp cleanup never removes a replacement directory'
+if [[ -d "$owned_cleanup_held" && \
+  -f "$owned_cleanup_held/.dify-owner-$owned_cleanup_marker_nonce" ]]; then
+  pass 'tracked temp cleanup leaves a renamed owned inode for fail-closed recovery'
+else
+  fail 'tracked temp cleanup leaves a renamed owned inode for fail-closed recovery'
+fi
+assert_file_not_contains "$owned_cleanup_stderr" 'Traceback' 'tracked temp cleanup race has no helper traceback'
+rm -rf -- "$owned_cleanup_workspace" "$owned_cleanup_held" "$owned_cleanup_parent"
+
+tracked_creation_parent="$(mktemp -d -- /tmp/dify-tracked-creation-parent.XXXXXXXX)"
+tracked_creation_path="$tracked_creation_parent/.dify-output.0123456789abcdef0123456789abcdef"
+tracked_creation_held="$tracked_creation_path.held"
+tracked_creation_status=0
+if (
+  SCRIPT_DIR=$tracked_creation_parent
+  task3_python() {
+    if [[ "$*" == *'secrets.token_hex(16)'* ]]; then
+      printf '%s\n' 0123456789abcdef0123456789abcdef
+    else
+      env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV python3 "$@"
+    fi
+  }
+  set -T
+  trap '
+    if [[ "${TRACKED_CREATION_SWAP_FIRED:-0}" != 1 && \
+      "$BASH_COMMAND" == "tracked_temp_creation_barrier created-before-own \"\$tracking_variable\" \"\$candidate\"" ]]; then
+      TRACKED_CREATION_SWAP_FIRED=1
+      trap - DEBUG
+      mv -- "$candidate" "$candidate.held"
+      mkdir -m 700 -- "$candidate"
+      printf "attacker creation sentinel\n" >"$candidate/sentinel"
+    fi
+  ' DEBUG
+  create_tracked_temp_dir "$tracked_creation_parent" .dify-output. ACTIVE_OUTPUT_TEMP_DIR
+); then
+  tracked_creation_status=0
+else
+  tracked_creation_status=$?
+fi
+assert_eq 1 "$tracked_creation_status" 'tracked temp creation rejects replacement before ownership registration'
+assert_eq 'attacker creation sentinel' "$(<"$tracked_creation_path/sentinel")" 'tracked temp creation never claims or removes a replacement'
+if find "$tracked_creation_held" -maxdepth 1 -type f -name '.dify-owner-*' -print -quit | grep -q .; then
+  pass 'tracked temp creation marker remains bound to the originally created inode'
+else
+  fail 'tracked temp creation marker remains bound to the originally created inode'
+fi
+rm -rf -- "$tracked_creation_path" "$tracked_creation_held" "$tracked_creation_parent"
+
+publish_rollback_python="$FIXTURE_DIR/publish-rollback-race.py"
+awk '
+  /^publish_output_archive\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /^[[:space:]]*replaced = True$/) {
+      print "    os.replace(os.environ[\"DIFY_TEST_CONCURRENT_OUTPUT\"], output)"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$publish_rollback_python"
+publish_rollback_parent="$(mktemp -d -- /tmp/dify-publish-rollback.XXXXXXXX)"
+publish_rollback_temp="$publish_rollback_parent/.dify-output.0123456789abcdef0123456789abcdef"
+publish_rollback_bound="$publish_rollback_temp/.verified-0123456789abcdef0123456789abcdef.difypkg"
+publish_rollback_output="$publish_rollback_parent/test-offline.difypkg"
+publish_rollback_concurrent="$publish_rollback_parent/concurrent.difypkg"
+publish_rollback_stderr="$FIXTURE_DIR/publish-rollback-race.stderr"
+mkdir -m 700 -- "$publish_rollback_temp"
+publish_rollback_marker_nonce=0123456789abcdef0123456789abcdef
+printf '%s\n' "$publish_rollback_marker_nonce" \
+  >"$publish_rollback_temp/.dify-owner-$publish_rollback_marker_nonce"
+printf 'verified candidate\n' >"$publish_rollback_bound"
+printf 'prior package\n' >"$publish_rollback_output"
+printf 'concurrent writer sentinel\n' >"$publish_rollback_concurrent"
+publish_rollback_identity="$(stat -c '%d:%i:%u' "$publish_rollback_temp")"
+publish_rollback_signature="$(output_archive_signature "$publish_rollback_bound")"
+publish_rollback_lock="$publish_rollback_parent/.dify-publication-lock-test.lock"
+: >"$publish_rollback_lock"
+exec {publish_rollback_lock_fd}<>"$publish_rollback_lock"
+python3 -B - "$publish_rollback_lock_fd" <<'PY'
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)
+PY
+publish_rollback_lock_identity="$(stat -c '%d:%i:%u' "$publish_rollback_lock")"
+if DIFY_TEST_CONCURRENT_OUTPUT="$publish_rollback_concurrent" \
+  python3 -B "$publish_rollback_python" "$publish_rollback_parent" \
+    "$publish_rollback_temp" "$publish_rollback_identity" "$publish_rollback_marker_nonce" \
+    "$publish_rollback_bound" "$publish_rollback_output" "$publish_rollback_signature" \
+    "$publish_rollback_lock_fd" "$publish_rollback_lock" "$publish_rollback_lock_identity" \
+    2>"$publish_rollback_stderr"; then
+  publish_rollback_status=0
+else
+  publish_rollback_status=$?
+fi
+assert_eq 1 "$publish_rollback_status" 'post-publish verification failure returns failure'
+assert_eq 'concurrent writer sentinel' "$(<"$publish_rollback_output")" 'rollback CAS preserves a concurrent writer replacement'
+assert_file_not_contains "$publish_rollback_stderr" 'Traceback' 'publish rollback race has no helper traceback'
+exec {publish_rollback_lock_fd}>&-
+rm -rf -- "$publish_rollback_parent"
+
+lock_behavior_output="$ROOT_DIR/publication-lock-test-offline.difypkg"
+lock_behavior_path="$(publication_lock_path "$lock_behavior_output")"
+lock_behavior_ready="$FIXTURE_DIR/publication-lock.ready"
+lock_behavior_go="$FIXTURE_DIR/publication-lock.go"
+GENERATED_OUTPUT_LOCKS+=("$lock_behavior_path")
+(
+  ACTIVE_OUTPUT_LOCK_FD=
+  ACTIVE_OUTPUT_LOCK_PATH=
+  ACTIVE_OUTPUT_LOCK_IDENTITY=
+  ACTIVE_OUTPUT_LOCK_HELD=false
+  acquire_output_lock "$lock_behavior_output" || exit
+  : >"$lock_behavior_ready"
+  while [[ ! -e "$lock_behavior_go" ]]; do sleep 0.01; done
+  release_output_lock
+) &
+lock_behavior_holder=$!
+for _ in $(seq 1 200); do
+  [[ -e "$lock_behavior_ready" ]] && break
+  sleep 0.01
+done
+if [[ -e "$lock_behavior_ready" ]]; then
+  pass 'production output lock is acquired on the DrvFS output filesystem'
+else
+  fail 'production output lock is acquired on the DrvFS output filesystem'
+fi
+if python3 -B - "$lock_behavior_path" <<'PY'
+import fcntl
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(42)
+finally:
+    os.close(descriptor)
+PY
+then
+  lock_probe_status=0
+else
+  lock_probe_status=$?
+fi
+assert_eq 42 "$lock_probe_status" 'a second tool instance cannot enter the same output publication boundary'
+: >"$lock_behavior_go"
+if wait "$lock_behavior_holder"; then
+  pass 'production output lock releases cleanly'
+else
+  fail 'production output lock releases cleanly'
+fi
+if (
+  ACTIVE_OUTPUT_LOCK_FD=
+  ACTIVE_OUTPUT_LOCK_PATH=
+  ACTIVE_OUTPUT_LOCK_IDENTITY=
+  ACTIVE_OUTPUT_LOCK_HELD=false
+  acquire_output_lock "$lock_behavior_output" && release_output_lock
+); then
+  pass 'a later tool instance acquires the released output lock'
+else
+  fail 'a later tool instance acquires the released output lock'
+fi
 
 foreign_repair_parent="$FIXTURE_DIR/foreign-owned-repair"
 foreign_repair_dir="$foreign_repair_parent/sdist-repair"
@@ -2992,14 +3236,11 @@ assert_recorded_coordinator_workspaces_removed \
 prepare_dynamic_coordinator_case log-setup-failure SUCCESS
 export COORDINATOR_SETUP_WORKSPACE_MARKER="$DYNAMIC_CASE_DIR/setup-workspace.path"
 if (
-  mkdir() {
-    local argument
-    command mkdir "$@" || return
-    for argument in "$@"; do
-      if [[ "$argument" == /tmp/dify-plugin-coordinator.* ]]; then
-        printf '%s\n' "$argument" >"$COORDINATOR_SETUP_WORKSPACE_MARKER"
-      fi
-    done
+  tracked_temp_creation_barrier() {
+    if [[ "${1:-}" == created-before-own && "${2:-}" == ACTIVE_COORDINATOR_WORKSPACE && \
+      "${3:-}" == /tmp/dify-plugin-coordinator.* ]]; then
+      printf '%s\n' "$3" >"$COORDINATOR_SETUP_WORKSPACE_MARKER"
+    fi
   }
   mktemp() {
     return 70
@@ -3891,6 +4132,7 @@ with ZipFile(sys.argv[1], "w", ZIP_DEFLATED) as archive:
 PY
 )
 GENERATED_TEST_OUTPUT="$ROOT_DIR/source plugin-offline.difypkg"
+GENERATED_OUTPUT_LOCKS+=("$(publication_lock_path "$GENERATED_TEST_OUTPUT")")
 rm -f -- "$GENERATED_TEST_OUTPUT"
 export UV_ARGS_LOG="$FIXTURE_DIR/uv-runtime.args"
 export PACKAGER_ARGS_LOG="$FIXTURE_DIR/packager.args"
@@ -4137,7 +4379,8 @@ os.setsid()
 for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
     signal.signal(handled_signal, signal.SIG_IGN)
 with open(pid_file, "w", encoding="ascii") as stream:
-    stream.write(f"{os.getpid()}\n")
+    starttime = open("/proc/self/stat", encoding="ascii").read().split()[21]
+    stream.write(f"{os.getpid()} {starttime}\n")
 open(marker, "wb").close()
 while not os.path.exists(release):
     time.sleep(0.02)
@@ -4146,6 +4389,13 @@ os.write(descriptor, b"unverified descendant mutation\n")
 os.ftruncate(descriptor, len(b"unverified descendant mutation\n"))
 os.close(descriptor)
 PY
+  for _ in {1..200}; do
+    [[ -f "$FULL_PACKAGER_DESCENDANT_MARKER" && \
+      -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]] && break
+    sleep 0.01
+  done
+  [[ -f "$FULL_PACKAGER_DESCENDANT_MARKER" && \
+    -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]]
 fi
 EOF
 chmod +x "$fake_bin/pip-full-repackage" "$fake_bin/uv-full-repackage" "$fake_bin/dify-packager-full"
@@ -4405,11 +4655,31 @@ else
   full_packager_descendant_status=$?
 fi
 assert_eq 0 "$full_packager_descendant_status" 'packager with an abandoned descendant completes after supervised cleanup'
-if [[ -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]] && \
-  ! kill -0 "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null; then
+full_packager_descendant_pid=
+full_packager_descendant_starttime=
+full_packager_descendant_current_starttime=
+if [[ -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]]; then
+  read -r full_packager_descendant_pid full_packager_descendant_starttime \
+    <"$FULL_PACKAGER_DESCENDANT_PID_FILE" || true
+fi
+if [[ "$full_packager_descendant_pid" =~ ^[1-9][0-9]*$ && \
+  -r "/proc/$full_packager_descendant_pid/stat" ]]; then
+  full_packager_descendant_current_starttime="$(
+    awk '{print $22}' "/proc/$full_packager_descendant_pid/stat" 2>/dev/null || true
+  )"
+fi
+if [[ -n "$full_packager_descendant_pid" && \
+  "$full_packager_descendant_current_starttime" != "$full_packager_descendant_starttime" ]]; then
   pass 'packager supervisor reaps a setsid descendant before archive verification'
 else
   fail 'packager supervisor reaps a setsid descendant before archive verification'
+  if [[ "$full_packager_descendant_pid" =~ ^[1-9][0-9]*$ && \
+    -r "/proc/$full_packager_descendant_pid/stat" ]]; then
+    awk '{printf "# descendant residual: pid=%s state=%s ppid=%s sid=%s start=%s\n",$1,$3,$4,$6,$22}' \
+      "/proc/$full_packager_descendant_pid/stat"
+  else
+    printf '# descendant residual: identity record missing or unreadable\n'
+  fi
 fi
 : >"$FULL_PACKAGER_DESCENDANT_RELEASE"
 sleep 0.1
@@ -4420,9 +4690,9 @@ else
 fi
 assert_full_repackage_cleanup 'packager descendant supervision'
 # Test sanitation after recording the immediate post-return state.
-if [[ -f "$FULL_PACKAGER_DESCENDANT_PID_FILE" ]] && \
-  kill -0 "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null; then
-  kill -KILL "$(<"$FULL_PACKAGER_DESCENDANT_PID_FILE")" 2>/dev/null || true
+if [[ "$full_packager_descendant_pid" =~ ^[1-9][0-9]*$ && \
+  "$full_packager_descendant_current_starttime" == "$full_packager_descendant_starttime" ]]; then
+  kill -KILL "$full_packager_descendant_pid" 2>/dev/null || true
 fi
 
 prepare_full_repackage_case
@@ -4881,7 +5151,7 @@ collision_tracking_variables=(ACTIVE_STAGING ACTIVE_OUTPUT_TEMP_DIR ACTIVE_COORD
 collision_parents=("$ROOT_DIR" "$ROOT_DIR" /tmp)
 collision_prefixes=(.dify-repackaging. .dify-output. dify-plugin-coordinator.)
 collision_windows=(mkdir-failure clear-after-failure)
-collision_commands=('mkdir -m 700 -- "$candidate"' 'tracked_path=')
+collision_commands=('tracked_temp_creation_barrier before-create-primitive "$tracking_variable" "$candidate"' 'tracked_path=')
 for collision_signal_index in "${!debug_signals[@]}"; do
   for collision_type_index in "${!collision_tracking_variables[@]}"; do
     for collision_window_index in "${!collision_windows[@]}"; do
@@ -4953,8 +5223,8 @@ run_full_post_validation_attack_case in-place-mutation "$FULL_ARCHIVE_MUTATE_ACT
 tracked_temp_window_names=(repo-staging-register repo-staging-mkdir repo-staging-created)
 tracked_temp_window_commands=(
   'tracked_path=$candidate'
-  'mkdir -m 700 -- "$candidate"'
-  'return 0'
+  'tracked_temp_creation_barrier before-create-primitive "$tracking_variable" "$candidate"'
+  'tracked_temp_creation_barrier created-before-own "$tracking_variable" "$candidate"'
 )
 output_temp_window_names=(output-temp-register output-temp-mkdir output-temp-created)
 coordinator_temp_window_names=(coordinator-temp-register coordinator-temp-mkdir coordinator-temp-created)
@@ -5269,6 +5539,10 @@ assert_file_contains "$ROOT_DIR/README.md" 'docopt' 'README includes the generic
 assert_file_contains "$ROOT_DIR/README.md" '原子替换' 'README documents atomic final-output publication'
 assert_file_contains "$ROOT_DIR/README.md" '保留已有' 'README documents prior-output preservation on failure'
 assert_file_contains "$ROOT_DIR/README.md" '提交点' 'README defines the atomic output commit point'
+assert_file_contains "$ROOT_DIR/README.md" 'fcntl' 'README documents the per-output publication lock'
+assert_file_contains "$ROOT_DIR/README.md" '外部进程' 'README limits atomic guarantees against post-commit external writers'
+assert_file_contains "$ROOT_DIR/README.md" 'O_EXCL' 'README documents the unguessable ownership marker boundary'
+assert_file_contains "$ROOT_DIR/README.md" '目录描述符' 'README documents descriptor-relative temporary cleanup'
 assert_file_contains "$ROOT_DIR/README.md" 'Bash 4.3+' 'README documents the nameref-compatible Bash baseline'
 assert_file_contains "$ROOT_DIR/README.md" 'double-fork' 'README documents full tool-process-tree supervision'
 assert_file_contains "$ROOT_DIR/README.md" '同文件系统硬链接' 'README documents the verified-inode publication requirement'

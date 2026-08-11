@@ -13,19 +13,27 @@ PACKAGER_BINARY=
 ACTIVE_STAGING=
 ACTIVE_STAGING_OWNED=false
 ACTIVE_STAGING_IDENTITY=
+ACTIVE_STAGING_MARKER_NONCE=
 ACTIVE_OUTPUT=
 ACTIVE_OUTPUT_TEMP_DIR=
 ACTIVE_OUTPUT_TEMP_DIR_OWNED=false
 ACTIVE_OUTPUT_TEMP_DIR_IDENTITY=
+ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE=
 ACTIVE_OUTPUT_TEMP_FILE=
 ACTIVE_OUTPUT_BOUND_FILE=
 ACTIVE_OUTPUT_BOUND_SIGNATURE=
 ACTIVE_COORDINATOR_WORKSPACE=
 ACTIVE_COORDINATOR_WORKSPACE_OWNED=false
 ACTIVE_COORDINATOR_WORKSPACE_IDENTITY=
+ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE=
 ACTIVE_PACKAGER_WORKSPACE=
 ACTIVE_PACKAGER_WORKSPACE_OWNED=false
 ACTIVE_PACKAGER_WORKSPACE_IDENTITY=
+ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE=
+ACTIVE_OUTPUT_LOCK_FD=
+ACTIVE_OUTPUT_LOCK_PATH=
+ACTIVE_OUTPUT_LOCK_IDENTITY=
+ACTIVE_OUTPUT_LOCK_HELD=false
 TRACKED_TEMP_CREATION_STATE=idle
 TRACKED_TEMP_PENDING_SIGNAL=
 TRACKED_TEMP_PENDING_STATUS=
@@ -2593,13 +2601,96 @@ except (OSError, ValueError):
 PY
 }
 
+validate_owned_temp_dir() {
+  local path=$1
+  local parent=$2
+  local prefix=$3
+  local expected_identity=$4
+  local marker_nonce=$5
+
+  task3_python -B - "$path" "$parent" "$prefix" "$expected_identity" "$marker_nonce" <<'PY'
+import os
+import stat
+import sys
+
+
+path, parent, prefix, expected_identity, marker_nonce = sys.argv[1:]
+parent_descriptor = None
+directory_descriptor = None
+marker_descriptor = None
+try:
+    basename = os.path.basename(path)
+    marker_name = f".dify-owner-{marker_nonce}"
+    if (
+        not expected_identity
+        or len(marker_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in marker_nonce)
+        or os.path.dirname(path) != parent
+        or not basename.startswith(prefix)
+    ):
+        raise ValueError
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    linked = os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
+    directory_descriptor = os.open(
+        basename,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(directory_descriptor)
+    identity = f"{opened.st_dev}:{opened.st_ino}:{opened.st_uid}"
+    if (
+        identity != expected_identity
+        or not stat.S_ISDIR(linked.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise ValueError
+    marker_link = os.stat(
+        marker_name, dir_fd=directory_descriptor, follow_symlinks=False
+    )
+    marker_descriptor = os.open(
+        marker_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+    )
+    marker_opened = os.fstat(marker_descriptor)
+    if (
+        not stat.S_ISREG(marker_link.st_mode)
+        or stat.S_ISLNK(marker_link.st_mode)
+        or not stat.S_ISREG(marker_opened.st_mode)
+        or marker_opened.st_uid != os.geteuid()
+        or marker_opened.st_nlink != 1
+        or (marker_link.st_dev, marker_link.st_ino)
+        != (marker_opened.st_dev, marker_opened.st_ino)
+        or os.read(marker_descriptor, 128) != f"{marker_nonce}\n".encode()
+    ):
+        raise ValueError
+    linked_after = os.stat(
+        basename, dir_fd=parent_descriptor, follow_symlinks=False
+    )
+    if (linked_after.st_dev, linked_after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+finally:
+    if marker_descriptor is not None:
+        os.close(marker_descriptor)
+    if directory_descriptor is not None:
+        os.close(directory_descriptor)
+    if parent_descriptor is not None:
+        os.close(parent_descriptor)
+PY
+}
+
 create_tracked_temp_dir() {
   local parent=$1
   local prefix=$2
   local tracking_variable=$3
-  local token candidate identity
+  local token candidate creation_record creation_status identity marker_nonce
   local attempt
-  local owned_variable identity_variable
+  local owned_variable identity_variable marker_variable
   local -n tracked_path=$tracking_variable
 
   case "$tracking_variable:$parent:$prefix" in
@@ -2617,63 +2708,157 @@ create_tracked_temp_dir() {
     ACTIVE_STAGING)
       owned_variable=ACTIVE_STAGING_OWNED
       identity_variable=ACTIVE_STAGING_IDENTITY
+      marker_variable=ACTIVE_STAGING_MARKER_NONCE
       ;;
     ACTIVE_OUTPUT_TEMP_DIR)
       owned_variable=ACTIVE_OUTPUT_TEMP_DIR_OWNED
       identity_variable=ACTIVE_OUTPUT_TEMP_DIR_IDENTITY
+      marker_variable=ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE
       ;;
     ACTIVE_COORDINATOR_WORKSPACE)
       owned_variable=ACTIVE_COORDINATOR_WORKSPACE_OWNED
       identity_variable=ACTIVE_COORDINATOR_WORKSPACE_IDENTITY
+      marker_variable=ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE
       ;;
     ACTIVE_PACKAGER_WORKSPACE)
       owned_variable=ACTIVE_PACKAGER_WORKSPACE_OWNED
       identity_variable=ACTIVE_PACKAGER_WORKSPACE_IDENTITY
+      marker_variable=ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE
       ;;
   esac
   local -n tracked_owned=$owned_variable
   local -n tracked_identity=$identity_variable
+  local -n tracked_marker_nonce=$marker_variable
   tracked_path=
   tracked_owned=false
   tracked_identity=
+  tracked_marker_nonce=
   for attempt in {1..32}; do
     token="$(task3_python -B -c 'import secrets; print(secrets.token_hex(16))')" || return
     [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
     candidate="$parent/$prefix$token"
     tracked_path=$candidate
     TRACKED_TEMP_CREATION_STATE=creating
-    if mkdir -m 700 -- "$candidate"; then
-      identity="$(task3_python -B - "$candidate" <<'PY'
+    tracked_temp_creation_barrier before-create-primitive "$tracking_variable" "$candidate"
+    if creation_record="$(task3_python -B - "$candidate" "$parent" "$prefix" <<'PY'
 import os
+import secrets
 import stat
 import sys
 
 
-record = os.lstat(sys.argv[1])
-if stat.S_ISLNK(record.st_mode) or not stat.S_ISDIR(record.st_mode) or record.st_uid != os.geteuid():
+path, parent, prefix = sys.argv[1:]
+parent_descriptor = None
+directory_descriptor = None
+marker_descriptor = None
+created = False
+marker_name = None
+try:
+    basename = os.path.basename(path)
+    if os.path.dirname(path) != parent or not basename.startswith(prefix):
+        raise ValueError
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        os.mkdir(basename, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        raise SystemExit(17)
+    created = True
+    directory_descriptor = os.open(
+        basename,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(directory_descriptor)
+    linked = os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or not stat.S_ISDIR(linked.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise OSError
+    marker_nonce = secrets.token_hex(16)
+    marker_name = f".dify-owner-{marker_nonce}"
+    marker_descriptor = os.open(
+        marker_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    os.write(marker_descriptor, f"{marker_nonce}\n".encode())
+    os.fsync(marker_descriptor)
+    os.close(marker_descriptor)
+    marker_descriptor = None
+    os.fsync(directory_descriptor)
+    linked_after = os.stat(
+        basename, dir_fd=parent_descriptor, follow_symlinks=False
+    )
+    if (linked_after.st_dev, linked_after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise OSError
+    print(
+        f"{opened.st_dev}:{opened.st_ino}:{opened.st_uid}\t{marker_nonce}",
+        flush=True,
+    )
+except SystemExit:
+    raise
+except (OSError, ValueError):
+    if marker_descriptor is not None:
+        os.close(marker_descriptor)
+        marker_descriptor = None
+    if created and directory_descriptor is not None and parent_descriptor is not None:
+        try:
+            if marker_name is not None:
+                os.unlink(marker_name, dir_fd=directory_descriptor)
+            linked = os.stat(
+                os.path.basename(path),
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(directory_descriptor)
+            if (linked.st_dev, linked.st_ino) == (opened.st_dev, opened.st_ino):
+                os.rmdir(os.path.basename(path), dir_fd=parent_descriptor)
+        except OSError:
+            pass
     raise SystemExit(1)
-print(f"{record.st_dev}:{record.st_ino}:{record.st_uid}")
+finally:
+    if marker_descriptor is not None:
+        os.close(marker_descriptor)
+    if directory_descriptor is not None:
+        os.close(directory_descriptor)
+    if parent_descriptor is not None:
+        os.close(parent_descriptor)
 PY
-)" || {
+)"; then
+      IFS=$'\t' read -r identity marker_nonce <<<"$creation_record"
+      [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+$ && "$marker_nonce" =~ ^[0-9a-f]{32}$ ]] || {
         TRACKED_TEMP_CREATION_STATE=idle
         return 1
       }
-      [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || {
+      tracked_temp_creation_barrier created-before-own "$tracking_variable" "$candidate"
+      if ! validate_owned_temp_dir "$candidate" "$parent" "$prefix" "$identity" "$marker_nonce"; then
         TRACKED_TEMP_CREATION_STATE=idle
+        honor_tracked_temp_pending_signal
         return 1
-      }
+      fi
       tracked_identity=$identity
+      tracked_marker_nonce=$marker_nonce
       tracked_owned=true
       TRACKED_TEMP_CREATION_STATE=idle
       honor_tracked_temp_pending_signal
       return 0
+    else
+      creation_status=$?
     fi
     tracked_path=
     tracked_identity=
+    tracked_marker_nonce=
     tracked_owned=false
     TRACKED_TEMP_CREATION_STATE=idle
     honor_tracked_temp_pending_signal
-    [[ -e "$candidate" || -L "$candidate" ]] || return 1
+    ((creation_status == 17)) || return 1
   done
   printf 'unable to allocate a unique tracked temporary directory\n' >&2
   return 1
@@ -2707,9 +2892,24 @@ cleanup_coordinator_workspace() {
   local workspace=${1:-}
   local expected_identity=${2:-}
   local owned=${3:-true}
+  local marker_nonce=${4:-}
 
   [[ "$owned" == true ]] || return 0
   [[ -n "$workspace" ]] || return 0
+  if [[ -n "$marker_nonce" ]]; then
+    if ! remove_owned_temp_tree \
+      "$workspace" /tmp dify-plugin-coordinator. "$expected_identity" "$marker_nonce"; then
+      printf 'refusing to remove unsafe coordinator workspace: %s\n' "$workspace" >&2
+      return 1
+    fi
+    if [[ "$workspace" == "${ACTIVE_COORDINATOR_WORKSPACE:-}" ]]; then
+      ACTIVE_COORDINATOR_WORKSPACE=
+      ACTIVE_COORDINATOR_WORKSPACE_IDENTITY=
+      ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE=
+      ACTIVE_COORDINATOR_WORKSPACE_OWNED=false
+    fi
+    return 0
+  fi
   task3_python -B - "$workspace" "$expected_identity" <<'PY'
 import os
 import re
@@ -2868,6 +3068,7 @@ PY
   if [[ "$workspace" == "${ACTIVE_COORDINATOR_WORKSPACE:-}" ]]; then
     ACTIVE_COORDINATOR_WORKSPACE=
     ACTIVE_COORDINATOR_WORKSPACE_IDENTITY=
+    ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE=
     ACTIVE_COORDINATOR_WORKSPACE_OWNED=false
   fi
 }
@@ -3325,12 +3526,14 @@ download_wheels_impl() {
   trap 'request_repair_cancellation INT 130' INT
   trap 'request_repair_cancellation TERM 143' TERM
   trap 'request_repair_cancellation HUP 129' HUP
-  trap 'cleanup_coordinator_workspace "${ACTIVE_COORDINATOR_WORKSPACE:-}" "${ACTIVE_COORDINATOR_WORKSPACE_IDENTITY:-}" "${ACTIVE_COORDINATOR_WORKSPACE_OWNED:-false}" || true' EXIT
+  trap 'cleanup_coordinator_workspace "${ACTIVE_COORDINATOR_WORKSPACE:-}" "${ACTIVE_COORDINATOR_WORKSPACE_IDENTITY:-}" "${ACTIVE_COORDINATOR_WORKSPACE_OWNED:-false}" "${ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE:-}" || true' EXIT
   tracked_temp_creation_barrier coordinator-traps-installed
   TRACKED_TEMP_SIGNAL_DOMAIN=coordinator
   create_tracked_temp_dir /tmp dify-plugin-coordinator. ACTIVE_COORDINATOR_WORKSPACE || return
   coordinator_workspace=$ACTIVE_COORDINATOR_WORKSPACE
-  chmod 700 -- "$coordinator_workspace" || return
+  validate_owned_temp_dir "$coordinator_workspace" /tmp dify-plugin-coordinator. \
+    "$ACTIVE_COORDINATOR_WORKSPACE_IDENTITY" \
+    "$ACTIVE_COORDINATOR_WORKSPACE_MARKER_NONCE" || return
   validate_coordinator_workspace "$coordinator_workspace" || {
     printf 'failed to create a private coordinator workspace under /tmp\n' >&2
     return 1
@@ -3569,7 +3772,8 @@ isolate_output_archive() {
   local binding bound_path bound_signature
 
   if ! binding="$(python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" \
-    "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" "$temp_output" <<'PY'
+    "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" "$ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE" \
+    "$temp_output" <<'PY'
 import hashlib
 import os
 import secrets
@@ -3577,23 +3781,49 @@ import stat
 import sys
 
 
-parent, temp_dir, temp_dir_identity, source = sys.argv[1:]
+parent, temp_dir, temp_dir_identity, marker_nonce, source = sys.argv[1:]
 directory_descriptor = None
 source_descriptor = None
+marker_descriptor = None
 bound_name = f".verified-{secrets.token_hex(16)}.difypkg"
 bound = os.path.join(temp_dir, bound_name)
 try:
-    directory_record = os.lstat(temp_dir)
     if (
         os.path.dirname(temp_dir) != parent
         or not os.path.basename(temp_dir).startswith(".dify-output.")
-        or f"{directory_record.st_dev}:{directory_record.st_ino}:{directory_record.st_uid}" != temp_dir_identity
-        or stat.S_ISLNK(directory_record.st_mode)
-        or not stat.S_ISDIR(directory_record.st_mode)
+        or len(marker_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in marker_nonce)
         or source != os.path.join(temp_dir, "package.difypkg")
     ):
         raise OSError
     directory_descriptor = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory_record = os.fstat(directory_descriptor)
+    linked_directory = os.lstat(temp_dir)
+    if (
+        f"{directory_record.st_dev}:{directory_record.st_ino}:{directory_record.st_uid}" != temp_dir_identity
+        or stat.S_ISLNK(linked_directory.st_mode)
+        or not stat.S_ISDIR(directory_record.st_mode)
+        or (directory_record.st_dev, directory_record.st_ino)
+        != (linked_directory.st_dev, linked_directory.st_ino)
+    ):
+        raise OSError
+    marker_name = f".dify-owner-{marker_nonce}"
+    marker_link = os.stat(marker_name, dir_fd=directory_descriptor, follow_symlinks=False)
+    marker_descriptor = os.open(
+        marker_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+    )
+    marker_opened = os.fstat(marker_descriptor)
+    if (
+        not stat.S_ISREG(marker_link.st_mode)
+        or stat.S_ISLNK(marker_link.st_mode)
+        or not stat.S_ISREG(marker_opened.st_mode)
+        or marker_opened.st_uid != os.geteuid()
+        or marker_opened.st_nlink != 1
+        or (marker_link.st_dev, marker_link.st_ino)
+        != (marker_opened.st_dev, marker_opened.st_ino)
+        or os.read(marker_descriptor, 128) != f"{marker_nonce}\n".encode()
+    ):
+        raise OSError
     source_descriptor = os.open(
         "package.difypkg",
         os.O_RDONLY | os.O_NOFOLLOW,
@@ -3652,6 +3882,8 @@ except OSError:
         pass
     raise SystemExit(1)
 finally:
+    if marker_descriptor is not None:
+        os.close(marker_descriptor)
     if source_descriptor is not None:
         os.close(source_descriptor)
     if directory_descriptor is not None:
@@ -3700,50 +3932,203 @@ remove_owned_temp_tree() {
   local parent=$2
   local prefix=$3
   local expected_identity=$4
+  local marker_nonce=$5
 
-  python3 -B - "$path" "$parent" "$prefix" "$expected_identity" <<'PY'
+  python3 -B - "$path" "$parent" "$prefix" "$expected_identity" "$marker_nonce" <<'PY'
 import os
-import shutil
 import stat
 import sys
 
 
-path, parent, prefix, expected_identity = sys.argv[1:]
+path, parent, prefix, expected_identity, marker_nonce = sys.argv[1:]
+parent_descriptor = None
+path_descriptor = None
+directory_descriptor = None
+
+
+def identity(record):
+    return f"{record.st_dev}:{record.st_ino}:{record.st_uid}"
+
+
+def restore_mode(path_fd, expected):
+    opened = os.fstat(path_fd)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise OSError("unsafe temporary directory")
+    os.chmod(f"/proc/self/fd/{path_fd}", 0o700)
+    restored = os.fstat(path_fd)
+    if (
+        (restored.st_dev, restored.st_ino) != (expected.st_dev, expected.st_ino)
+        or not stat.S_ISDIR(restored.st_mode)
+    ):
+        raise OSError("temporary directory mode restore failed")
+
+
+def clear_directory(descriptor, protected_name=None):
+    for name in os.listdir(descriptor):
+        if name == protected_name:
+            continue
+        entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+            child_path = os.open(
+                name,
+                os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                restore_mode(child_path, entry)
+                linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if (linked.st_dev, linked.st_ino) != (entry.st_dev, entry.st_ino):
+                    raise OSError("temporary subdirectory was replaced")
+            finally:
+                os.close(child_path)
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or (opened.st_dev, opened.st_ino)
+                    != (entry.st_dev, entry.st_ino)
+                ):
+                    raise OSError("unsafe temporary subdirectory")
+                clear_directory(child)
+                linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise OSError("temporary subdirectory changed during cleanup")
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+
+
+def validate_marker(descriptor, marker_name):
+    marker_link = os.stat(marker_name, dir_fd=descriptor, follow_symlinks=False)
+    marker_descriptor = os.open(
+        marker_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor
+    )
+    try:
+        marker_opened = os.fstat(marker_descriptor)
+        if (
+            not stat.S_ISREG(marker_link.st_mode)
+            or stat.S_ISLNK(marker_link.st_mode)
+            or not stat.S_ISREG(marker_opened.st_mode)
+            or marker_opened.st_uid != os.geteuid()
+            or marker_opened.st_nlink != 1
+            or (marker_link.st_dev, marker_link.st_ino)
+            != (marker_opened.st_dev, marker_opened.st_ino)
+            or os.read(marker_descriptor, 128) != f"{marker_nonce}\n".encode()
+        ):
+            raise OSError("temporary ownership marker changed")
+    finally:
+        os.close(marker_descriptor)
+
+
 try:
+    basename = os.path.basename(path)
+    marker_name = f".dify-owner-{marker_nonce}"
     if (
         not expected_identity
+        or len(marker_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in marker_nonce)
         or os.path.dirname(path) != parent
-        or not os.path.basename(path).startswith(prefix)
+        or not basename.startswith(prefix)
     ):
         raise ValueError
-    try:
-        record = os.lstat(path)
-    except FileNotFoundError:
-        raise SystemExit(0)
-    identity = f"{record.st_dev}:{record.st_ino}:{record.st_uid}"
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    record = os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
     if (
-        identity != expected_identity
+        identity(record) != expected_identity
         or stat.S_ISLNK(record.st_mode)
         or not stat.S_ISDIR(record.st_mode)
         or record.st_uid != os.geteuid()
     ):
         raise ValueError
-    shutil.rmtree(path)
+    path_descriptor = os.open(
+        basename,
+        os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    restore_mode(path_descriptor, record)
+    linked_after_restore = os.stat(
+        basename, dir_fd=parent_descriptor, follow_symlinks=False
+    )
+    if (linked_after_restore.st_dev, linked_after_restore.st_ino) != (
+        record.st_dev,
+        record.st_ino,
+    ):
+        raise ValueError
+    directory_descriptor = os.open(
+        basename,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(directory_descriptor)
+    if (
+        identity(opened) != expected_identity
+        or (opened.st_dev, opened.st_ino) != (record.st_dev, record.st_ino)
+    ):
+        raise ValueError
+    validate_marker(directory_descriptor, marker_name)
+    # OWNED_TEMP_TREE_CLEANUP_IDENTITY_CAPTURED
+    clear_directory(directory_descriptor, marker_name)
+    validate_marker(directory_descriptor, marker_name)
+    linked_before_marker_removal = os.stat(
+        basename, dir_fd=parent_descriptor, follow_symlinks=False
+    )
+    if (linked_before_marker_removal.st_dev, linked_before_marker_removal.st_ino) != (
+        opened.st_dev,
+        opened.st_ino,
+    ):
+        raise ValueError
+    os.unlink(marker_name, dir_fd=directory_descriptor)
+    os.fsync(directory_descriptor)
+    linked_before_rmdir = os.stat(
+        basename, dir_fd=parent_descriptor, follow_symlinks=False
+    )
+    if (linked_before_rmdir.st_dev, linked_before_rmdir.st_ino) != (
+        opened.st_dev,
+        opened.st_ino,
+    ):
+        raise ValueError
+    os.close(directory_descriptor)
+    directory_descriptor = None
+    os.rmdir(basename, dir_fd=parent_descriptor)
 except (OSError, ValueError):
     raise SystemExit(1)
+finally:
+    if directory_descriptor is not None:
+        os.close(directory_descriptor)
+    if path_descriptor is not None:
+        os.close(path_descriptor)
+    if parent_descriptor is not None:
+        os.close(parent_descriptor)
 PY
 }
 
 cleanup_active_staging() {
   [[ "${ACTIVE_STAGING_OWNED:-false}" == true ]] || return 0
-  [[ -n "$ACTIVE_STAGING" && -n "${ACTIVE_STAGING_IDENTITY:-}" ]] || return 1
+  [[ -n "$ACTIVE_STAGING" && -n "${ACTIVE_STAGING_IDENTITY:-}" && \
+    -n "${ACTIVE_STAGING_MARKER_NONCE:-}" ]] || return 1
 
   case "$ACTIVE_STAGING" in
     "$SCRIPT_DIR"/.dify-repackaging.*)
       remove_owned_temp_tree \
-        "$ACTIVE_STAGING" "$SCRIPT_DIR" .dify-repackaging. "$ACTIVE_STAGING_IDENTITY" || return
+        "$ACTIVE_STAGING" "$SCRIPT_DIR" .dify-repackaging. "$ACTIVE_STAGING_IDENTITY" \
+        "$ACTIVE_STAGING_MARKER_NONCE" || return
       ACTIVE_STAGING=
       ACTIVE_STAGING_IDENTITY=
+      ACTIVE_STAGING_MARKER_NONCE=
       ACTIVE_STAGING_OWNED=false
       ;;
     *)
@@ -3806,33 +4191,8 @@ prepare_atomic_output() {
   OUTPUT_PUBLICATION_STATE=preparing
   create_tracked_temp_dir "$SCRIPT_DIR" .dify-output. ACTIVE_OUTPUT_TEMP_DIR || return
   temp_dir=$ACTIVE_OUTPUT_TEMP_DIR
-  if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
-import os
-import stat
-import sys
-
-
-parent, temp_dir = sys.argv[1:]
-try:
-    if (
-        os.path.dirname(temp_dir) != parent
-        or not os.path.basename(temp_dir).startswith(".dify-output.")
-    ):
-        raise ValueError
-    record = os.lstat(temp_dir)
-    if (
-        stat.S_ISLNK(record.st_mode)
-        or not stat.S_ISDIR(record.st_mode)
-        or record.st_uid != os.geteuid()
-    ):
-        raise ValueError
-except (OSError, ValueError):
-    raise SystemExit(1)
-PY
-  then
-    rmdir -- "$temp_dir" 2>/dev/null || true
-    return 1
-  fi
+  validate_owned_temp_dir "$temp_dir" "$SCRIPT_DIR" .dify-output. \
+    "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" "$ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE" || return
   ACTIVE_OUTPUT_TEMP_FILE="$temp_dir/package.difypkg"
 }
 
@@ -3840,14 +4200,17 @@ cleanup_active_output_temp() {
   local temp_dir=${ACTIVE_OUTPUT_TEMP_DIR:-}
 
   [[ "${ACTIVE_OUTPUT_TEMP_DIR_OWNED:-false}" == true ]] || return 0
-  [[ -n "$temp_dir" && -n "${ACTIVE_OUTPUT_TEMP_DIR_IDENTITY:-}" ]] || return 1
+  [[ -n "$temp_dir" && -n "${ACTIVE_OUTPUT_TEMP_DIR_IDENTITY:-}" && \
+    -n "${ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE:-}" ]] || return 1
   if ! remove_owned_temp_tree \
-    "$temp_dir" "$SCRIPT_DIR" .dify-output. "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY"; then
+    "$temp_dir" "$SCRIPT_DIR" .dify-output. "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" \
+    "$ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE"; then
     printf 'refusing to clean unsafe atomic output staging: %s\n' "$temp_dir" >&2
     return 1
   fi
   ACTIVE_OUTPUT_TEMP_DIR=
   ACTIVE_OUTPUT_TEMP_DIR_IDENTITY=
+  ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE=
   ACTIVE_OUTPUT_TEMP_DIR_OWNED=false
   ACTIVE_OUTPUT_TEMP_FILE=
   ACTIVE_OUTPUT_BOUND_FILE=
@@ -3856,16 +4219,190 @@ cleanup_active_output_temp() {
 
 cleanup_active_packager_workspace() {
   [[ "${ACTIVE_PACKAGER_WORKSPACE_OWNED:-false}" == true ]] || return 0
-  [[ -n "$ACTIVE_PACKAGER_WORKSPACE" && -n "${ACTIVE_PACKAGER_WORKSPACE_IDENTITY:-}" ]] || return 1
+  [[ -n "$ACTIVE_PACKAGER_WORKSPACE" && -n "${ACTIVE_PACKAGER_WORKSPACE_IDENTITY:-}" && \
+    -n "${ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE:-}" ]] || return 1
   if ! remove_owned_temp_tree \
     "$ACTIVE_PACKAGER_WORKSPACE" /tmp dify-plugin-packager. \
-    "$ACTIVE_PACKAGER_WORKSPACE_IDENTITY"; then
+    "$ACTIVE_PACKAGER_WORKSPACE_IDENTITY" "$ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE"; then
     printf 'refusing to clean unsafe packager workspace: %s\n' "$ACTIVE_PACKAGER_WORKSPACE" >&2
     return 1
   fi
   ACTIVE_PACKAGER_WORKSPACE=
   ACTIVE_PACKAGER_WORKSPACE_IDENTITY=
+  ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE=
   ACTIVE_PACKAGER_WORKSPACE_OWNED=false
+}
+
+publication_lock_path() {
+  local output=$1
+
+  python3 -B - "$SCRIPT_DIR" "$output" <<'PY'
+import hashlib
+import os
+import sys
+
+
+parent, output = sys.argv[1:]
+if os.path.dirname(output) != parent:
+    raise SystemExit(1)
+lock_name = ".dify-publication-lock-" + hashlib.sha256(
+    os.fsencode(os.path.abspath(output))
+).hexdigest() + ".lock"
+print(os.path.join(parent, lock_name))
+PY
+}
+
+acquire_output_lock() {
+  local output=$1
+  local lock_record lock_path lock_identity lock_fd
+
+  [[ "${ACTIVE_OUTPUT_LOCK_HELD:-false}" == false && -z "${ACTIVE_OUTPUT_LOCK_FD:-}" ]] || {
+    printf 'output publication lock is already active\n' >&2
+    return 1
+  }
+  validate_output_parent_and_final "$output" || return
+  lock_path="$(publication_lock_path "$output")" || return
+  lock_record="$(python3 -B - "$SCRIPT_DIR" "$output" "$lock_path" <<'PY'
+import os
+import stat
+import sys
+
+
+parent, output, lock_path = sys.argv[1:]
+parent_descriptor = None
+lock_descriptor = None
+try:
+    if os.path.dirname(output) != parent:
+        raise ValueError
+    lock_name = os.path.basename(lock_path)
+    if (
+        os.path.dirname(lock_path) != parent
+        or not lock_name.startswith(".dify-publication-lock-")
+        or not lock_name.endswith(".lock")
+    ):
+        raise ValueError
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    lock_descriptor = os.open(
+        lock_name,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(lock_descriptor)
+    linked = os.stat(lock_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_ISLNK(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError
+    os.fsync(lock_descriptor)
+    print(f"{lock_path}\t{opened.st_dev}:{opened.st_ino}:{opened.st_uid}")
+except (OSError, ValueError):
+    raise SystemExit(1)
+finally:
+    if lock_descriptor is not None:
+        os.close(lock_descriptor)
+    if parent_descriptor is not None:
+        os.close(parent_descriptor)
+PY
+)" || {
+    printf 'unable to prepare the output publication lock\n' >&2
+    return 1
+  }
+  IFS=$'\t' read -r lock_path lock_identity <<<"$lock_record"
+  [[ "$lock_path" == "$SCRIPT_DIR"/.dify-publication-lock-*.lock && \
+    "$lock_identity" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || return 1
+  if ! exec {lock_fd}<>"$lock_path"; then
+    printf 'unable to open the output publication lock\n' >&2
+    return 1
+  fi
+  if ! python3 -B - "$lock_fd" "$lock_path" "$lock_identity" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+
+descriptor = int(sys.argv[1])
+path = sys.argv[2]
+expected_identity = sys.argv[3]
+try:
+    opened = os.fstat(descriptor)
+    linked = os.lstat(path)
+    if (
+        f"{opened.st_dev}:{opened.st_ino}:{opened.st_uid}" != expected_identity
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_ISLNK(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    opened_after = os.fstat(descriptor)
+    linked_after = os.lstat(path)
+    if (
+        (opened_after.st_dev, opened_after.st_ino) != (opened.st_dev, opened.st_ino)
+        or (linked_after.st_dev, linked_after.st_ino)
+        != (opened.st_dev, opened.st_ino)
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  then
+    exec {lock_fd}>&-
+    printf 'unable to acquire a safe output publication lock\n' >&2
+    return 1
+  fi
+  ACTIVE_OUTPUT_LOCK_FD=$lock_fd
+  ACTIVE_OUTPUT_LOCK_PATH=$lock_path
+  ACTIVE_OUTPUT_LOCK_IDENTITY=$lock_identity
+  ACTIVE_OUTPUT_LOCK_HELD=true
+}
+
+release_output_lock() {
+  local lock_status=0
+
+  [[ "${ACTIVE_OUTPUT_LOCK_HELD:-false}" == true ]] || return 0
+  [[ "${ACTIVE_OUTPUT_LOCK_FD:-}" =~ ^[0-9]+$ && \
+    -n "${ACTIVE_OUTPUT_LOCK_PATH:-}" && -n "${ACTIVE_OUTPUT_LOCK_IDENTITY:-}" ]] || return 1
+  python3 -B - "$ACTIVE_OUTPUT_LOCK_FD" "$ACTIVE_OUTPUT_LOCK_PATH" \
+    "$ACTIVE_OUTPUT_LOCK_IDENTITY" <<'PY' || lock_status=$?
+import fcntl
+import os
+import stat
+import sys
+
+
+descriptor = int(sys.argv[1])
+path = sys.argv[2]
+expected_identity = sys.argv[3]
+try:
+    opened = os.fstat(descriptor)
+    linked = os.lstat(path)
+    if (
+        f"{opened.st_dev}:{opened.st_ino}:{opened.st_uid}" != expected_identity
+        or not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  exec {ACTIVE_OUTPUT_LOCK_FD}>&-
+  ACTIVE_OUTPUT_LOCK_FD=
+  ACTIVE_OUTPUT_LOCK_PATH=
+  ACTIVE_OUTPUT_LOCK_IDENTITY=
+  ACTIVE_OUTPUT_LOCK_HELD=false
+  return "$lock_status"
 }
 
 publish_output_archive() {
@@ -3874,7 +4411,9 @@ publish_output_archive() {
   local expected_signature=$3
 
   python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" "$ACTIVE_OUTPUT_TEMP_DIR_IDENTITY" \
-    "$bound_output" "$output" "$expected_signature" <<'PY'
+    "$ACTIVE_OUTPUT_TEMP_DIR_MARKER_NONCE" "$bound_output" "$output" "$expected_signature" \
+    "$ACTIVE_OUTPUT_LOCK_FD" "$ACTIVE_OUTPUT_LOCK_PATH" "$ACTIVE_OUTPUT_LOCK_IDENTITY" <<'PY'
+import fcntl
 import hashlib
 import os
 import secrets
@@ -3882,10 +4421,24 @@ import stat
 import sys
 
 
-parent, temp_dir, temp_dir_identity, bound_output, output, expected_signature = sys.argv[1:]
+(
+    parent,
+    temp_dir,
+    temp_dir_identity,
+    marker_nonce,
+    bound_output,
+    output,
+    expected_signature,
+    lock_fd_text,
+    lock_path,
+    lock_identity,
+) = sys.argv[1:]
 backup = os.path.join(temp_dir, f".previous-{secrets.token_hex(16)}.difypkg")
 backup_created = False
 replaced = False
+published_identity = None
+temp_descriptor = None
+marker_descriptor = None
 
 
 def signature(path, require_one_link):
@@ -3921,11 +4474,25 @@ def signature(path, require_one_link):
 
 
 try:
-    temp_record = os.lstat(temp_dir)
+    lock_fd = int(lock_fd_text)
+    lock_opened = os.fstat(lock_fd)
+    lock_linked = os.lstat(lock_path)
+    if (
+        f"{lock_opened.st_dev}:{lock_opened.st_ino}:{lock_opened.st_uid}" != lock_identity
+        or not stat.S_ISREG(lock_opened.st_mode)
+        or lock_opened.st_uid != os.geteuid()
+        or lock_opened.st_nlink != 1
+        or stat.S_ISLNK(lock_linked.st_mode)
+        or (lock_opened.st_dev, lock_opened.st_ino)
+        != (lock_linked.st_dev, lock_linked.st_ino)
+    ):
+        raise ValueError
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if (
         os.path.dirname(temp_dir) != parent
         or not os.path.basename(temp_dir).startswith(".dify-output.")
-        or f"{temp_record.st_dev}:{temp_record.st_ino}:{temp_record.st_uid}" != temp_dir_identity
+        or len(marker_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in marker_nonce)
         or os.path.dirname(bound_output) != temp_dir
         or not os.path.basename(bound_output).startswith(".verified-")
         or not os.path.basename(bound_output).endswith(".difypkg")
@@ -3933,7 +4500,35 @@ try:
         or not os.path.basename(output).endswith("-offline.difypkg")
     ):
         raise ValueError
-    for path, expected_type in ((parent, "directory"), (temp_dir, "directory"), (bound_output, "file")):
+    temp_descriptor = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temp_record = os.fstat(temp_descriptor)
+    temp_linked = os.lstat(temp_dir)
+    if (
+        f"{temp_record.st_dev}:{temp_record.st_ino}:{temp_record.st_uid}" != temp_dir_identity
+        or not stat.S_ISDIR(temp_record.st_mode)
+        or stat.S_ISLNK(temp_linked.st_mode)
+        or (temp_record.st_dev, temp_record.st_ino)
+        != (temp_linked.st_dev, temp_linked.st_ino)
+    ):
+        raise ValueError
+    marker_name = f".dify-owner-{marker_nonce}"
+    marker_link = os.stat(marker_name, dir_fd=temp_descriptor, follow_symlinks=False)
+    marker_descriptor = os.open(
+        marker_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=temp_descriptor
+    )
+    marker_opened = os.fstat(marker_descriptor)
+    if (
+        not stat.S_ISREG(marker_link.st_mode)
+        or stat.S_ISLNK(marker_link.st_mode)
+        or not stat.S_ISREG(marker_opened.st_mode)
+        or marker_opened.st_uid != os.geteuid()
+        or marker_opened.st_nlink != 1
+        or (marker_link.st_dev, marker_link.st_ino)
+        != (marker_opened.st_dev, marker_opened.st_ino)
+        or os.read(marker_descriptor, 128) != f"{marker_nonce}\n".encode()
+    ):
+        raise ValueError
+    for path, expected_type in ((parent, "directory"), (bound_output, "file")):
         record = os.lstat(path)
         if stat.S_ISLNK(record.st_mode) or record.st_uid != os.geteuid():
             raise ValueError
@@ -3953,8 +4548,13 @@ try:
         backup_created = True
     if signature(bound_output, True) != expected_signature:
         raise ValueError
+    expected_parts = expected_signature.split(":", 2)
+    published_identity = (int(expected_parts[0]), int(expected_parts[1]))
     os.replace(bound_output, output)
     replaced = True
+    published = os.lstat(output)
+    if (published.st_dev, published.st_ino) != published_identity:
+        raise ValueError
     if signature(output, True) != expected_signature:
         raise ValueError
     if backup_created:
@@ -3963,11 +4563,22 @@ try:
 except (OSError, ValueError):
     if replaced:
         try:
-            if backup_created:
-                os.replace(backup, output)
-                backup_created = False
-            else:
-                os.unlink(output)
+            current = os.lstat(output)
+            lock_opened = os.fstat(lock_fd)
+            lock_linked = os.lstat(lock_path)
+            lock_is_current = (
+                f"{lock_opened.st_dev}:{lock_opened.st_ino}:{lock_opened.st_uid}"
+                == lock_identity
+                and (lock_opened.st_dev, lock_opened.st_ino)
+                == (lock_linked.st_dev, lock_linked.st_ino)
+            )
+            if lock_is_current and (current.st_dev, current.st_ino) == published_identity:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if backup_created:
+                    os.replace(backup, output)
+                    backup_created = False
+                else:
+                    os.unlink(output)
         except OSError:
             pass
     if backup_created:
@@ -3976,6 +4587,11 @@ except (OSError, ValueError):
         except OSError:
             pass
     raise SystemExit(1)
+finally:
+    if marker_descriptor is not None:
+        os.close(marker_descriptor)
+    if temp_descriptor is not None:
+        os.close(temp_descriptor)
 PY
 }
 
@@ -3987,11 +4603,13 @@ cleanup_runtime() {
   local status=$?
 
   if [[ "${OUTPUT_PUBLICATION_STATE:-idle}" == committed ]]; then
+    release_output_lock || true
     cleanup_active_packager_workspace || true
     cleanup_active_output_temp || true
     cleanup_active_staging || true
     return 0
   fi
+  release_output_lock || status=$?
   cleanup_active_packager_workspace || status=$?
   cleanup_active_output_temp || status=$?
   cleanup_active_staging || status=$?
@@ -4051,6 +4669,8 @@ repackage() {
 
   create_tracked_temp_dir "$SCRIPT_DIR" .dify-repackaging. ACTIVE_STAGING || return
   staging=$ACTIVE_STAGING
+  validate_owned_temp_dir "$staging" "$SCRIPT_DIR" .dify-repackaging. \
+    "$ACTIVE_STAGING_IDENTITY" "$ACTIVE_STAGING_MARKER_NONCE" || return
   plugin_dir="$staging/plugin"
   mkdir -p "$plugin_dir"
 
@@ -4110,6 +4730,9 @@ repackage() {
   prepare_atomic_output "$output" || return 1
   temp_output=$ACTIVE_OUTPUT_TEMP_FILE
   create_tracked_temp_dir /tmp dify-plugin-packager. ACTIVE_PACKAGER_WORKSPACE || return 1
+  validate_owned_temp_dir "$ACTIVE_PACKAGER_WORKSPACE" /tmp dify-plugin-packager. \
+    "$ACTIVE_PACKAGER_WORKSPACE_IDENTITY" \
+    "$ACTIVE_PACKAGER_WORKSPACE_MARKER_NONCE" || return 1
   packager_log="$ACTIVE_PACKAGER_WORKSPACE/packager.log"
   reset_private_command_log "$packager_log" || return 1
   packager_timeout=${DIFY_PACKAGER_TIMEOUT_SECONDS:-600}
@@ -4146,6 +4769,7 @@ repackage() {
   rm -f -- "$packager_log" || return 1
   cleanup_active_packager_workspace || return 1
   output_non_publication_barrier after-packager
+  acquire_output_lock "$output" || return 1
   isolate_output_archive "$temp_output" || return 1
   verify_output_archive "$ACTIVE_OUTPUT_BOUND_FILE" "$requires_wheel" \
     "$requires_pyproject" "$TARGET_ARCH" "$ACTIVE_OUTPUT_BOUND_SIGNATURE" || return 1
@@ -4167,6 +4791,7 @@ repackage() {
     fi
     ((publish_status == 0)) || return 1
   fi
+  release_output_lock || true
   cleanup_active_output_temp || true
 
   BUILD_SUCCEEDED=true
