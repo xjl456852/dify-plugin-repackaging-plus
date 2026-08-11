@@ -474,6 +474,142 @@ resolve_pip_command() {
   fi
 }
 
+pip_has_pysocks() {
+  local pip_command_name=$1
+  local -n selected_pip_command=$pip_command_name
+
+  "${selected_pip_command[@]}" show PySocks >/dev/null 2>&1
+}
+
+resolve_pysocks_wheel() {
+  local simple_page=$1
+  local simple_url=$2
+
+  python3 - "$simple_page" "$simple_url" <<'PY'
+from html.parser import HTMLParser
+from pathlib import Path
+import re
+import sys
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
+
+
+class LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                self.links.append(value)
+
+
+parser = LinkParser()
+parser.feed(Path(sys.argv[1]).read_text(encoding="utf-8"))
+target = "pysocks-1.7.1-py3-none-any.whl"
+for href in parser.links:
+    absolute = urljoin(sys.argv[2], href)
+    parsed = urlsplit(absolute)
+    filename = unquote(parsed.path.rsplit("/", 1)[-1]).lower()
+    if filename != target:
+        continue
+    hashes = parse_qs(parsed.fragment).get("sha256", [])
+    if hashes and not re.fullmatch(r"[0-9a-fA-F]{64}", hashes[0]):
+        raise SystemExit("invalid sha256 fragment for PySocks wheel")
+    wheel_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+    print(f"{wheel_url}\t{hashes[0].lower() if hashes else '-'}")
+    raise SystemExit(0)
+raise SystemExit("PySocks 1.7.1 universal wheel not found in simple index")
+PY
+}
+
+file_sha256() {
+  python3 - "$1" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+digest = sha256()
+with Path(sys.argv[1]).open("rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+prepare_pip_socks_support() {
+  local pip_command_name=$1
+  local bootstrap_dir=$2
+  local result_name=$3
+  local -n selected_pip_command=$pip_command_name
+  local -n result=$result_name
+  local proxy_url simple_url simple_page wheel_record wheel_url expected_sha256
+  local wheel_file site_dir actual_sha256
+
+  result=
+  if ! proxy_url="$(detect_socks_proxy)"; then
+    return 0
+  fi
+  if pip_has_pysocks "$pip_command_name"; then
+    return 0
+  fi
+  case "${DIFY_AUTO_FIX_SOCKS:-1}" in
+    0 | false | FALSE | no | NO)
+      printf 'pip requires PySocks for proxy %s; automatic repair is disabled by DIFY_AUTO_FIX_SOCKS\n' "$proxy_url" >&2
+      return 1
+      ;;
+  esac
+  command -v curl >/dev/null 2>&1 || {
+    printf 'curl is required to repair missing pip SOCKS support without modifying the Python environment\n' >&2
+    return 1
+  }
+
+  simple_url="${PIP_MIRROR_URL%/}/pysocks/"
+  simple_page="$bootstrap_dir/pysocks-simple.html"
+  wheel_file="$bootstrap_dir/PySocks-1.7.1-py3-none-any.whl"
+  site_dir="$bootstrap_dir/site-packages"
+  mkdir -p "$bootstrap_dir" "$site_dir"
+  printf 'Preparing temporary pip SOCKS support for %s ...\n' "$proxy_url"
+  if ! curl --fail --location --show-error --output "$simple_page" "$simple_url"; then
+    printf 'failed to download the PySocks simple index from %s\n' "$simple_url" >&2
+    return 1
+  fi
+  if ! wheel_record="$(resolve_pysocks_wheel "$simple_page" "$simple_url")"; then
+    printf 'failed to locate PySocks 1.7.1 universal wheel in %s\n' "$simple_url" >&2
+    return 1
+  fi
+  wheel_url=${wheel_record%%$'\t'*}
+  expected_sha256=${wheel_record#*$'\t'}
+  if ! curl --fail --location --show-error --output "$wheel_file" "$wheel_url"; then
+    printf 'failed to download temporary PySocks wheel from %s\n' "$wheel_url" >&2
+    return 1
+  fi
+  if [[ "$expected_sha256" != - ]]; then
+    actual_sha256="$(file_sha256 "$wheel_file")"
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+      printf 'temporary PySocks wheel checksum mismatch: expected %s, got %s\n' \
+        "$expected_sha256" "$actual_sha256" >&2
+      return 1
+    fi
+  fi
+  if ! env \
+    -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "${selected_pip_command[@]}" install \
+      --disable-pip-version-check \
+      --no-index \
+      --no-deps \
+      --target "$site_dir" \
+      "$wheel_file"; then
+    printf 'failed to install temporary PySocks support into %s\n' "$site_dir" >&2
+    return 1
+  fi
+  result=$site_dir
+}
+
 reset_wheels_dir() {
   local wheels_dir=$1
   local parent
@@ -493,30 +629,45 @@ download_wheels() {
   local wheels_dir=$2
   local target_arch=$3
   local python_version=$4
-  local abi platform
+  local bootstrap_dir=${5:-"$(dirname "$wheels_dir")/.pip-bootstrap"}
+  local abi platform socks_site_dir=
   local -a pip_command=()
   local -a platform_args=()
 
-  reset_wheels_dir "$wheels_dir"
+  reset_wheels_dir "$wheels_dir" || return
   if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$requirements"; then
     return 0
   fi
 
-  resolve_pip_command pip_command
-  abi="$(python_abi "$python_version")"
+  resolve_pip_command pip_command || return
+  prepare_pip_socks_support pip_command "$bootstrap_dir" socks_site_dir || return
+  abi="$(python_abi "$python_version")" || return
   while IFS= read -r platform; do
     [[ -n "$platform" ]] && platform_args+=(--platform "$platform")
   done < <(default_platforms "$target_arch")
 
-  "${pip_command[@]}" download \
-    --index-url "$PIP_MIRROR_URL" \
-    --python-version "$python_version" \
-    --implementation cp \
-    --abi "$abi" \
-    "${platform_args[@]}" \
-    --only-binary=:all: \
-    --requirement "$requirements" \
-    --dest "$wheels_dir"
+  if [[ -n "$socks_site_dir" ]]; then
+    PYTHONPATH="$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}" \
+      "${pip_command[@]}" download \
+        --index-url "$PIP_MIRROR_URL" \
+        --python-version "$python_version" \
+        --implementation cp \
+        --abi "$abi" \
+        "${platform_args[@]}" \
+        --only-binary=:all: \
+        --requirement "$requirements" \
+        --dest "$wheels_dir"
+  else
+    "${pip_command[@]}" download \
+      --index-url "$PIP_MIRROR_URL" \
+      --python-version "$python_version" \
+      --implementation cp \
+      --abi "$abi" \
+      "${platform_args[@]}" \
+      --only-binary=:all: \
+      --requirement "$requirements" \
+      --dest "$wheels_dir"
+  fi
 }
 
 target_triple() {
@@ -688,7 +839,8 @@ repackage() {
     "$staging/download-requirements.txt" \
     "$plugin_dir/wheels" \
     "$TARGET_ARCH" \
-    "$python_version"
+    "$python_version" \
+    "$staging/pip-bootstrap"
   write_offline_metadata \
     "$plugin_dir" \
     "$staging/download-requirements.txt" \

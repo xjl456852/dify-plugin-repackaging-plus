@@ -91,6 +91,13 @@ detect_proxy_fixture() {
   )
 }
 
+without_proxy_environment() {
+  (
+    unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+    "$@"
+  )
+}
+
 for proxy_scheme in socks4 socks4a socks5 socks5h; do
   proxy_url="$proxy_scheme://10.10.10.10:28802"
   assert_eq \
@@ -279,7 +286,8 @@ wheel_dir="$FIXTURE_DIR/wheels"
 mkdir -p "$wheel_dir"
 touch "$wheel_dir/stale-1.0-cp312-cp312-manylinux_2_28_x86_64.whl"
 export PIP_ARGS_LOG="$FIXTURE_DIR/pip-download.args"
-DIFY_PIP_COMMAND="$fake_bin/pip-download" download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12
+DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+  without_proxy_environment download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12
 assert_file_contains "$PIP_ARGS_LOG" '--python-version' 'pip receives target Python option'
 assert_file_contains "$PIP_ARGS_LOG" '3.12' 'pip targets Python 3.12'
 assert_file_contains "$PIP_ARGS_LOG" 'cp312' 'pip receives CPython ABI'
@@ -296,7 +304,8 @@ cat >"$fake_bin/pip-fail" <<'EOF'
 exit 23
 EOF
 chmod +x "$fake_bin/pip-fail"
-if DIFY_PIP_COMMAND="$fake_bin/pip-fail" download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12; then
+if DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
+  without_proxy_environment download_wheels "$metadata_dir/download.txt" "$wheel_dir" aarch64 3.12; then
   fail 'pip failure stops wheel download'
 else
   pass 'pip failure stops wheel download'
@@ -304,11 +313,319 @@ fi
 
 empty_requirements="$FIXTURE_DIR/empty-requirements.txt"
 : >"$empty_requirements"
-if DIFY_PIP_COMMAND="$fake_bin/pip-fail" download_wheels "$empty_requirements" "$wheel_dir" aarch64 3.12; then
+if DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
+  without_proxy_environment download_wheels "$empty_requirements" "$wheel_dir" aarch64 3.12; then
   pass 'empty requirements do not invoke pip'
 else
   fail 'empty requirements do not invoke pip'
 fi
+
+socks_fake_bin="$FIXTURE_DIR/socks-fake-bin"
+mkdir -p "$socks_fake_bin"
+cat >"$socks_fake_bin/pip-socks" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SOCKS_PIP_LOG"
+case "${1:-}" in
+  show)
+    [[ "${FAKE_PIP_HAS_PYSOCKS:-0}" == 1 ]]
+    ;;
+  install)
+    if (( ${FAKE_PIP_INSTALL_EXIT:-0} != 0 )); then
+      exit "$FAKE_PIP_INSTALL_EXIT"
+    fi
+    printf 'install-proxy=%s|%s|%s|%s|%s|%s\n' \
+      "${http_proxy:-}" \
+      "${https_proxy:-}" \
+      "${all_proxy:-}" \
+      "${HTTP_PROXY:-}" \
+      "${HTTPS_PROXY:-}" \
+      "${ALL_PROXY:-}" >>"$SOCKS_PIP_LOG"
+    target=
+    while (($#)); do
+      if [[ "$1" == --target ]]; then
+        shift
+        target=${1:-}
+      fi
+      shift
+    done
+    [[ -n "$target" ]]
+    mkdir -p "$target"
+    printf '# temporary test module\n' >"$target/socks.py"
+    ;;
+  download)
+    printf '%s\n' "${PYTHONPATH:-}" >"$SOCKS_PYTHONPATH_LOG"
+    while (($#)); do
+      if [[ "$1" == --dest ]]; then
+        shift
+        mkdir -p "$1"
+        touch "$1/example-1.0-py3-none-any.whl"
+      fi
+      shift
+    done
+    ;;
+esac
+EOF
+cat >"$socks_fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+output=
+url=
+printf '%s\n' "$*" >>"$SOCKS_CURL_LOG"
+if (( ${FAKE_CURL_EXIT:-0} != 0 )); then
+  exit "$FAKE_CURL_EXIT"
+fi
+while (($#)); do
+  case "$1" in
+    --output)
+      shift
+      output=${1:-}
+      ;;
+    http://* | https://*)
+      url=$1
+      ;;
+  esac
+  shift
+done
+[[ -n "$output" && -n "$url" ]]
+case "$url" in
+  */pysocks/)
+    cp "$SOCKS_SIMPLE_PAGE" "$output"
+    ;;
+  *PySocks-1.7.1-py3-none-any.whl)
+    cp "$SOCKS_WHEEL_FIXTURE" "$output"
+    ;;
+  *)
+    exit 71
+    ;;
+esac
+EOF
+chmod +x "$socks_fake_bin/pip-socks" "$socks_fake_bin/curl"
+
+export SOCKS_PIP_LOG="$FIXTURE_DIR/socks-pip.log"
+export SOCKS_CURL_LOG="$FIXTURE_DIR/socks-curl.log"
+export SOCKS_PYTHONPATH_LOG="$FIXTURE_DIR/socks-pythonpath.log"
+export SOCKS_SIMPLE_PAGE="$FIXTURE_DIR/pysocks-simple.html"
+export SOCKS_WHEEL_FIXTURE="$FIXTURE_DIR/PySocks-1.7.1-py3-none-any.whl"
+printf 'fake universal wheel payload\n' >"$SOCKS_WHEEL_FIXTURE"
+socks_wheel_sha256="$(sha256sum "$SOCKS_WHEEL_FIXTURE" | cut -d' ' -f1)"
+printf '%s\n' \
+  '<!doctype html>' \
+  "<a href=\"https://files.example/PySocks-1.7.1-py3-none-any.whl#sha256=$socks_wheel_sha256\">PySocks</a>" \
+  >"$SOCKS_SIMPLE_PAGE"
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+rm -f -- "$SOCKS_PYTHONPATH_LOG"
+socks_case_dir="$FIXTURE_DIR/socks-case"
+socks_wheel_dir="$socks_case_dir/wheels"
+socks_bootstrap_dir="$FIXTURE_DIR/pip-bootstrap"
+mkdir -p "$socks_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$socks_wheel_dir" \
+    aarch64 \
+    3.12 \
+    "$socks_bootstrap_dir"; then
+  pass 'missing PySocks is repaired inside build staging'
+else
+  fail 'missing PySocks is repaired inside build staging'
+fi
+assert_file_contains "$SOCKS_PIP_LOG" 'show PySocks' 'pip SOCKS capability is checked without network'
+assert_file_contains "$SOCKS_PIP_LOG" 'install --disable-pip-version-check --no-index --no-deps --target' 'PySocks wheel is installed into temporary target'
+assert_file_contains "$SOCKS_PIP_LOG" 'install-proxy=|||||' 'temporary local install cannot inherit proxy settings'
+assert_file_contains "$SOCKS_CURL_LOG" 'https://mirror.example/simple/pysocks/' 'PySocks simple index uses configured mirror'
+assert_file_contains "$SOCKS_CURL_LOG" 'PySocks-1.7.1-py3-none-any.whl' 'universal PySocks wheel is downloaded'
+if [[ -f "$SOCKS_PYTHONPATH_LOG" ]]; then
+  assert_eq \
+    "$socks_bootstrap_dir/site-packages" \
+    "$(head -n1 "$SOCKS_PYTHONPATH_LOG")" \
+    'dependency download receives temporary PySocks PYTHONPATH'
+else
+  fail 'dependency download receives temporary PySocks PYTHONPATH'
+fi
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+no_proxy_case_dir="$FIXTURE_DIR/no-proxy-case"
+mkdir -p "$no_proxy_case_dir"
+if PATH="$socks_fake_bin:$PATH" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  without_proxy_environment download_wheels \
+    "$metadata_dir/download.txt" \
+    "$no_proxy_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$no_proxy_case_dir/pip-bootstrap"; then
+  pass 'no SOCKS proxy keeps the normal pip path'
+else
+  fail 'no SOCKS proxy keeps the normal pip path'
+fi
+assert_file_not_contains "$SOCKS_PIP_LOG" 'show PySocks' 'no SOCKS proxy skips PySocks capability check'
+if [[ ! -s "$SOCKS_CURL_LOG" ]]; then
+  pass 'no SOCKS proxy skips bootstrap downloads'
+else
+  fail 'no SOCKS proxy skips bootstrap downloads'
+fi
+assert_file_missing "$no_proxy_case_dir/pip-bootstrap" 'no SOCKS proxy creates no bootstrap directory'
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+installed_case_dir="$FIXTURE_DIR/pysocks-installed-case"
+mkdir -p "$installed_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_PIP_HAS_PYSOCKS=1 \
+  PATH="$socks_fake_bin:$PATH" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$installed_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$installed_case_dir/pip-bootstrap"; then
+  pass 'existing PySocks keeps the normal pip path'
+else
+  fail 'existing PySocks keeps the normal pip path'
+fi
+assert_file_contains "$SOCKS_PIP_LOG" 'show PySocks' 'existing PySocks is detected'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'install ' 'existing PySocks is not reinstalled'
+if [[ ! -s "$SOCKS_CURL_LOG" ]]; then
+  pass 'existing PySocks skips bootstrap downloads'
+else
+  fail 'existing PySocks skips bootstrap downloads'
+fi
+assert_file_missing "$installed_case_dir/pip-bootstrap" 'existing PySocks creates no bootstrap directory'
+
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+disabled_case_dir="$FIXTURE_DIR/socks-disabled-case"
+mkdir -p "$disabled_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  DIFY_AUTO_FIX_SOCKS=0 \
+  PATH="$socks_fake_bin:$PATH" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$disabled_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$disabled_case_dir/pip-bootstrap" \
+    >"$disabled_case_dir/output.log" 2>&1; then
+  fail 'disabled SOCKS repair fails before dependency download'
+else
+  pass 'disabled SOCKS repair fails before dependency download'
+fi
+assert_file_contains "$disabled_case_dir/output.log" 'automatic repair is disabled' 'disabled repair explains how it was disabled'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'disabled repair does not invoke dependency download'
+if [[ ! -s "$SOCKS_CURL_LOG" ]]; then
+  pass 'disabled SOCKS repair performs no network request'
+else
+  fail 'disabled SOCKS repair performs no network request'
+fi
+
+missing_link_page="$FIXTURE_DIR/pysocks-missing-link.html"
+printf '%s\n' '<a href="other-1.0-py3-none-any.whl">Other</a>' >"$missing_link_page"
+: >"$SOCKS_PIP_LOG"
+: >"$SOCKS_CURL_LOG"
+missing_link_case_dir="$FIXTURE_DIR/socks-missing-link-case"
+mkdir -p "$missing_link_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$missing_link_page" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$missing_link_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$missing_link_case_dir/pip-bootstrap" \
+    >"$missing_link_case_dir/output.log" 2>&1; then
+  fail 'missing PySocks wheel fails safely'
+else
+  pass 'missing PySocks wheel fails safely'
+fi
+assert_file_contains "$missing_link_case_dir/output.log" 'failed to locate PySocks 1.7.1 universal wheel' 'missing wheel reports configured bootstrap requirement'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'missing bootstrap wheel prevents dependency download'
+
+wrong_checksum_page="$FIXTURE_DIR/pysocks-wrong-checksum.html"
+printf '%s\n' \
+  '<a href="https://files.example/PySocks-1.7.1-py3-none-any.whl#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">PySocks</a>' \
+  >"$wrong_checksum_page"
+: >"$SOCKS_PIP_LOG"
+checksum_case_dir="$FIXTURE_DIR/socks-checksum-case"
+mkdir -p "$checksum_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$wrong_checksum_page" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$checksum_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$checksum_case_dir/pip-bootstrap" \
+    >"$checksum_case_dir/output.log" 2>&1; then
+  fail 'PySocks checksum mismatch fails safely'
+else
+  pass 'PySocks checksum mismatch fails safely'
+fi
+assert_file_contains "$checksum_case_dir/output.log" 'checksum mismatch' 'checksum mismatch is explicit'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'install ' 'checksum mismatch prevents local install'
+
+: >"$SOCKS_PIP_LOG"
+install_failure_case_dir="$FIXTURE_DIR/socks-install-failure-case"
+mkdir -p "$install_failure_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_PIP_INSTALL_EXIT=91 \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  SOCKS_SIMPLE_PAGE="$FIXTURE_DIR/pysocks-simple.html" \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$install_failure_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$install_failure_case_dir/pip-bootstrap" \
+    >"$install_failure_case_dir/output.log" 2>&1; then
+  fail 'temporary PySocks install failure stops download'
+else
+  pass 'temporary PySocks install failure stops download'
+fi
+assert_file_contains "$install_failure_case_dir/output.log" 'failed to install temporary PySocks support' 'temporary install failure is explicit'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'temporary install failure prevents dependency download'
+
+: >"$SOCKS_PIP_LOG"
+curl_failure_case_dir="$FIXTURE_DIR/socks-curl-failure-case"
+mkdir -p "$curl_failure_case_dir"
+if https_proxy='socks5h://10.10.10.10:28802' \
+  HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
+  FAKE_CURL_EXIT=92 \
+  PATH="$socks_fake_bin:$PATH" \
+  PIP_MIRROR_URL='https://mirror.example/simple' \
+  DIFY_PIP_COMMAND="$socks_fake_bin/pip-socks" \
+  download_wheels \
+    "$metadata_dir/download.txt" \
+    "$curl_failure_case_dir/wheels" \
+    aarch64 \
+    3.12 \
+    "$curl_failure_case_dir/pip-bootstrap" \
+    >"$curl_failure_case_dir/output.log" 2>&1; then
+  fail 'PySocks index download failure stops dependency download'
+else
+  pass 'PySocks index download failure stops dependency download'
+fi
+assert_file_contains "$curl_failure_case_dir/output.log" 'failed to download the PySocks simple index' 'bootstrap curl failure is explicit'
+assert_file_not_contains "$SOCKS_PIP_LOG" 'download ' 'bootstrap curl failure prevents dependency download'
 
 cat >"$fake_bin/uv-runtime" <<'EOF'
 #!/usr/bin/env bash
@@ -477,7 +794,9 @@ export UV_ARGS_LOG="$FIXTURE_DIR/uv-runtime.args"
 export PACKAGER_ARGS_LOG="$FIXTURE_DIR/packager.args"
 
 run_log="$FIXTURE_DIR/repackage.log"
-if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+if env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  DIFY_PIP_COMMAND="$fake_bin/pip-download" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
   DIFY_TARGET_ARCH=aarch64 \
@@ -512,7 +831,9 @@ staging_count="$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*
 assert_eq 0 "$staging_count" 'successful build cleans its staging directory'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
-if DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
+if env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  DIFY_PIP_COMMAND="$fake_bin/pip-fail" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
   DIFY_TARGET_ARCH=aarch64 \
@@ -524,7 +845,9 @@ fi
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'pip failure leaves no stale output'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
-if FAKE_UV_EXIT=31 \
+if env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  FAKE_UV_EXIT=31 \
   DIFY_PIP_COMMAND="$fake_bin/pip-download" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
@@ -537,7 +860,9 @@ fi
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'uv failure leaves no stale output'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
-if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
+if env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  DIFY_PIP_COMMAND="$fake_bin/pip-download" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/packager-fail" \
   DIFY_TARGET_ARCH=aarch64 \
