@@ -915,6 +915,7 @@ TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
 path = sys.argv[1]
 try:
     existing = os.lstat(path)
+    # COORDINATOR_LOG_PREOPEN_IDENTITY_CAPTURED
 except FileNotFoundError:
     existing = None
 if existing is not None and (
@@ -925,11 +926,10 @@ if existing is not None and (
     or stat.S_IMODE(existing.st_mode) != 0o600
 ):
     raise SystemExit(1)
-descriptor = os.open(
-    path,
-    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-    0o600,
-)
+open_flags = os.O_WRONLY | os.O_NOFOLLOW
+if existing is None:
+    open_flags |= os.O_CREAT | os.O_EXCL
+descriptor = os.open(path, open_flags, 0o600)
 written = 0
 truncated = False
 
@@ -947,15 +947,26 @@ try:
         not stat.S_ISREG(opened.st_mode)
         or opened.st_uid != os.geteuid()
         or opened.st_nlink != 1
+        or (existing is not None and stat.S_IMODE(opened.st_mode) != 0o600)
         or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
         or stat.S_ISLNK(linked.st_mode)
         or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
         or linked.st_nlink != 1
+        or stat.S_IMODE(linked.st_mode) != 0o600
+        or (
+            existing is not None
+            and (existing.st_dev, existing.st_ino) != (opened.st_dev, opened.st_ino)
+        )
     ):
         raise OSError("diagnostic log is not a regular file")
     os.fchmod(descriptor, 0o600)
     if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
         raise OSError("diagnostic log is not private")
+    os.ftruncate(descriptor, 0)
+    after_truncate = os.lstat(path)
+    if (after_truncate.st_dev, after_truncate.st_ino) != (opened.st_dev, opened.st_ino):
+        raise OSError("diagnostic log identity changed")
     while True:
         chunk = sys.stdin.buffer.read(64 * 1024)
         if not chunk:
@@ -1484,6 +1495,15 @@ try:
             raise ValueError
     if not os.path.isdir(parent) or os.path.islink(parent):
         raise ValueError
+    if os.path.lexists(path):
+        repair = os.lstat(path)
+        if (
+            stat.S_ISLNK(repair.st_mode)
+            or not stat.S_ISDIR(repair.st_mode)
+            or repair.st_uid != os.geteuid()
+            or stat.S_IMODE(repair.st_mode) != 0o700
+        ):
+            raise ValueError
 except (OSError, ValueError):
     raise SystemExit(1)
 PY
@@ -1584,8 +1604,14 @@ import stat
 import sys
 
 
-mode = os.lstat(sys.argv[1]).st_mode
-if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+record = os.lstat(sys.argv[1])
+if (
+    stat.S_ISLNK(record.st_mode)
+    or not stat.S_ISREG(record.st_mode)
+    or record.st_uid != os.geteuid()
+    or record.st_nlink != 1
+    or stat.S_IMODE(record.st_mode) != 0o600
+):
     raise SystemExit(1)
 PY
 }
@@ -1719,14 +1745,25 @@ try:
     ):
         raise ValueError
     for path in (repair_dir, candidate_dir, source_dir):
-        mode = os.lstat(path).st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        record = os.lstat(path)
+        if (
+            stat.S_ISLNK(record.st_mode)
+            or not stat.S_ISDIR(record.st_mode)
+            or record.st_uid != os.geteuid()
+            or stat.S_IMODE(record.st_mode) != 0o700
+        ):
             raise ValueError
     if any(os.scandir(source_dir)):
         raise ValueError
     if os.path.lexists(error_log):
-        mode = os.lstat(error_log).st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        record = os.lstat(error_log)
+        if (
+            stat.S_ISLNK(record.st_mode)
+            or not stat.S_ISREG(record.st_mode)
+            or record.st_uid != os.geteuid()
+            or record.st_nlink != 1
+            or stat.S_IMODE(record.st_mode) != 0o600
+        ):
             raise ValueError
 except (OSError, ValueError):
     raise SystemExit(1)
@@ -1872,6 +1909,17 @@ import tempfile
 
 
 directory, candidate_dir = sys.argv[1:]
+if os.path.dirname(directory) != candidate_dir or os.path.basename(directory) != "wheel":
+    raise SystemExit(1)
+for managed_directory in (candidate_dir, directory):
+    managed = os.lstat(managed_directory)
+    if (
+        stat.S_ISLNK(managed.st_mode)
+        or not stat.S_ISDIR(managed.st_mode)
+        or managed.st_uid != os.geteuid()
+        or stat.S_IMODE(managed.st_mode) != 0o700
+    ):
+        raise SystemExit(1)
 entries = []
 with os.scandir(directory) as iterator:
     for entry in iterator:
@@ -1887,15 +1935,24 @@ if (
     or entry.is_symlink()
 ):
     raise SystemExit(1)
-mode = entry.stat(follow_symlinks=False).st_mode
-if not stat.S_ISREG(mode):
+entry_record = entry.stat(follow_symlinks=False)
+if (
+    not stat.S_ISREG(entry_record.st_mode)
+    or entry_record.st_uid != os.geteuid()
+    or entry_record.st_nlink != 1
+):
     raise SystemExit(1)
 source_path = os.path.join(directory, entry.name)
 snapshot_dir = tempfile.mkdtemp(prefix=".admission.", dir=candidate_dir)
 snapshot_path = os.path.join(snapshot_dir, entry.name)
 descriptor = None
 try:
-    if stat.S_IMODE(os.lstat(snapshot_dir).st_mode) != 0o700:
+    snapshot_record = os.lstat(snapshot_dir)
+    if (
+        not stat.S_ISDIR(snapshot_record.st_mode)
+        or snapshot_record.st_uid != os.geteuid()
+        or stat.S_IMODE(snapshot_record.st_mode) != 0o700
+    ):
         raise OSError("snapshot directory is not private")
     descriptor = os.open(source_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     before = os.fstat(descriptor)
@@ -2009,11 +2066,11 @@ ensure_private_repair_directory() {
   local directory=$1
 
   if [[ -e "$directory" || -L "$directory" ]]; then
-    [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%a' "$directory")" == 700 ]] || return 1
+    validate_private_repair_layout "$directory" || return
   else
     mkdir -m 700 -- "$directory" || return
   fi
-  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%a' "$directory")" == 700 ]]
+  validate_private_repair_layout "$directory"
 }
 
 validate_private_repair_layout() {
@@ -2025,10 +2082,15 @@ import sys
 
 for path in sys.argv[1:]:
     try:
-        mode = os.lstat(path).st_mode
+        record = os.lstat(path)
     except OSError:
         raise SystemExit(1)
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+    if (
+        stat.S_ISLNK(record.st_mode)
+        or not stat.S_ISDIR(record.st_mode)
+        or record.st_uid != os.geteuid()
+        or stat.S_IMODE(record.st_mode) != 0o700
+    ):
         raise SystemExit(1)
 PY
 }
@@ -2112,7 +2174,10 @@ repair_one_pure_sdist_locked() {
     printf 'pure Python sdist repair candidate staging is unsafe or already exists\n' >&2
     return 1
   fi
+  validate_private_repair_layout \
+    "$repair_dir" "$repair_dir/.repair-lock" "$candidate_dir" || return
   mkdir -m 700 -- "$source_dir" "$wheel_dir" || return
+  validate_private_repair_layout "$source_dir" "$wheel_dir" || return
   ensure_private_repair_directory "$built_wheels_dir" || return
   ensure_private_repair_directory "$uv_cache_dir" || return
   ensure_private_repair_directory "$uv_python_dir" || return
@@ -2300,6 +2365,7 @@ repair_one_pure_sdist() (
   fi
   REPAIR_LOCK_TO_RELEASE=$repair_lock_dir
   REPAIR_DIR_FOR_CLEANUP=$repair_dir
+  validate_private_repair_layout "$repair_dir" "$repair_lock_dir" || return
   validate_sdist_repair_dir "$repair_dir" || return
   repair_one_pure_sdist_locked \
     "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" \
@@ -2423,13 +2489,53 @@ trusted_root = "/tmp"
 basename = os.path.basename(workspace)
 root_descriptor = None
 workspace_descriptor = None
+workspace_path_descriptor = None
+
+
+def validate_path_directory(descriptor, expected):
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise OSError("unsafe coordinator directory identity")
+
+
+def restore_directory_mode(descriptor, expected):
+    validate_path_directory(descriptor, expected)
+    os.chmod(f"/proc/self/fd/{descriptor}", 0o700)
+    restored = os.fstat(descriptor)
+    if (
+        (restored.st_dev, restored.st_ino) != (expected.st_dev, expected.st_ino)
+        or stat.S_IMODE(restored.st_mode) != 0o700
+    ):
+        raise OSError("unable to restore coordinator directory mode")
 
 
 def clear_directory(descriptor):
     for name in os.listdir(descriptor):
         entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
-            os.chmod(name, 0o700, dir_fd=descriptor, follow_symlinks=False)
+            child_path = os.open(
+                name,
+                os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                restore_directory_mode(child_path, entry)
+                linked_after_restore = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (linked_after_restore.st_dev, linked_after_restore.st_ino) != (
+                    entry.st_dev,
+                    entry.st_ino,
+                ):
+                    raise OSError("coordinator subdirectory was replaced")
+            finally:
+                os.close(child_path)
             child = os.open(
                 name,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2468,6 +2574,25 @@ try:
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     linked = os.stat(basename, dir_fd=root_descriptor, follow_symlinks=False)
+    # COORDINATOR_WORKSPACE_CLEANUP_IDENTITY_CAPTURED
+    workspace_path_descriptor = os.open(
+        basename,
+        os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=root_descriptor,
+    )
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+        raise ValueError("unsafe coordinator workspace identity")
+    restore_directory_mode(workspace_path_descriptor, linked)
+    linked_after_restore = os.stat(
+        basename,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    if (linked_after_restore.st_dev, linked_after_restore.st_ino) != (
+        linked.st_dev,
+        linked.st_ino,
+    ):
+        raise ValueError("coordinator workspace was replaced")
     workspace_descriptor = os.open(
         basename,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2482,7 +2607,6 @@ try:
         or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
     ):
         raise ValueError("unsafe coordinator workspace identity")
-    os.fchmod(workspace_descriptor, 0o700)
     clear_directory(workspace_descriptor)
     os.close(workspace_descriptor)
     workspace_descriptor = None
@@ -2492,6 +2616,8 @@ except (OSError, ValueError):
 finally:
     if workspace_descriptor is not None:
         os.close(workspace_descriptor)
+    if workspace_path_descriptor is not None:
+        os.close(workspace_path_descriptor)
     if root_descriptor is not None:
         os.close(root_descriptor)
 PY
@@ -2534,28 +2660,202 @@ except (OSError, ValueError):
 PY
 }
 
+snapshot_coordinator_log() {
+  local source_log=$1
+  local workspace=$2
+  local result_name=$3
+  local snapshot_path
+
+  validate_coordinator_workspace "$workspace" || return
+  if ! snapshot_path="$(task3_python -B - "$source_log" "$workspace" <<'PY'
+import os
+import secrets
+import stat
+import sys
+
+
+source_path, workspace = sys.argv[1:]
+source_basename = os.path.basename(source_path)
+workspace_descriptor = None
+source_descriptor = None
+snapshot_descriptor = None
+snapshot_basename = None
+MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
+
+
+def private_regular(record):
+    return (
+        stat.S_ISREG(record.st_mode)
+        and not stat.S_ISLNK(record.st_mode)
+        and record.st_uid == os.geteuid()
+        and record.st_nlink == 1
+        and stat.S_IMODE(record.st_mode) == 0o600
+    )
+
+
+def same_identity(left, right):
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+try:
+    if os.path.dirname(source_path) != workspace or source_basename in {"", ".", ".."}:
+        raise ValueError("unsafe coordinator log path")
+    workspace_before = os.lstat(workspace)
+    if (
+        stat.S_ISLNK(workspace_before.st_mode)
+        or not stat.S_ISDIR(workspace_before.st_mode)
+        or workspace_before.st_uid != os.geteuid()
+        or stat.S_IMODE(workspace_before.st_mode) != 0o700
+    ):
+        raise ValueError("unsafe coordinator workspace")
+    workspace_descriptor = os.open(
+        workspace,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    workspace_opened = os.fstat(workspace_descriptor)
+    workspace_after = os.lstat(workspace)
+    if (
+        not same_identity(workspace_before, workspace_opened)
+        or not same_identity(workspace_opened, workspace_after)
+        or workspace_opened.st_uid != os.geteuid()
+        or stat.S_IMODE(workspace_opened.st_mode) != 0o700
+    ):
+        raise OSError("coordinator workspace identity changed")
+
+    source_before = os.stat(
+        source_basename,
+        dir_fd=workspace_descriptor,
+        follow_symlinks=False,
+    )
+    # COORDINATOR_LOG_SNAPSHOT_PREOPEN
+    if not private_regular(source_before):
+        raise ValueError("unsafe coordinator diagnostic log")
+    source_descriptor = os.open(
+        source_basename,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=workspace_descriptor,
+    )
+    source_opened = os.fstat(source_descriptor)
+    source_after_open = os.stat(
+        source_basename,
+        dir_fd=workspace_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not private_regular(source_opened)
+        or not private_regular(source_after_open)
+        or not same_identity(source_before, source_opened)
+        or not same_identity(source_opened, source_after_open)
+    ):
+        raise OSError("coordinator diagnostic log identity changed")
+
+    for _ in range(128):
+        candidate = f".diagnostic-snapshot.{secrets.token_hex(12)}.log"
+        try:
+            snapshot_descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=workspace_descriptor,
+            )
+            snapshot_basename = candidate
+            break
+        except FileExistsError:
+            continue
+    if snapshot_descriptor is None or snapshot_basename is None:
+        raise OSError("unable to allocate coordinator diagnostic snapshot")
+    snapshot_opened = os.fstat(snapshot_descriptor)
+    if not private_regular(snapshot_opened):
+        raise OSError("unsafe coordinator diagnostic snapshot")
+
+    copied = 0
+    while True:
+        chunk = os.read(source_descriptor, 64 * 1024)
+        if not chunk:
+            break
+        copied += len(chunk)
+        if copied > MAX_SNAPSHOT_BYTES:
+            raise OSError("coordinator diagnostic snapshot exceeds limit")
+        position = 0
+        while position < len(chunk):
+            position += os.write(snapshot_descriptor, chunk[position:])
+
+    source_after_read = os.fstat(source_descriptor)
+    source_after_path = os.stat(
+        source_basename,
+        dir_fd=workspace_descriptor,
+        follow_symlinks=False,
+    )
+    stable_fields = ("st_size", "st_mtime_ns", "st_ctime_ns")
+    if (
+        not same_identity(source_opened, source_after_read)
+        or not same_identity(source_after_read, source_after_path)
+        or any(getattr(source_opened, field) != getattr(source_after_read, field) for field in stable_fields)
+        or any(getattr(source_after_read, field) != getattr(source_after_path, field) for field in stable_fields)
+        or copied != source_opened.st_size
+    ):
+        raise OSError("coordinator diagnostic log changed during snapshot")
+    os.fsync(snapshot_descriptor)
+    os.close(snapshot_descriptor)
+    snapshot_descriptor = None
+    snapshot_linked = os.stat(
+        snapshot_basename,
+        dir_fd=workspace_descriptor,
+        follow_symlinks=False,
+    )
+    if not private_regular(snapshot_linked):
+        raise OSError("unsafe coordinator diagnostic snapshot")
+    print(os.path.join(workspace, snapshot_basename))
+except (OSError, ValueError):
+    if snapshot_descriptor is not None:
+        os.close(snapshot_descriptor)
+        snapshot_descriptor = None
+    if snapshot_basename is not None:
+        try:
+            os.unlink(snapshot_basename, dir_fd=workspace_descriptor)
+        except OSError:
+            pass
+    raise SystemExit(1)
+finally:
+    if snapshot_descriptor is not None:
+        os.close(snapshot_descriptor)
+    if source_descriptor is not None:
+        os.close(source_descriptor)
+    if workspace_descriptor is not None:
+        os.close(workspace_descriptor)
+PY
+)"; then
+    return 1
+  fi
+  validate_coordinator_log_file "$snapshot_path" "$workspace" || return
+  local -n snapshot_result=$result_name
+  snapshot_result=$snapshot_path
+}
+
 display_distinct_coordinator_logs() {
   local initial_log=$1
   local current_log=$2
   local workspace=$3
+  local initial_snapshot= current_snapshot=
 
-  if ! validate_coordinator_log_file "$initial_log" "$workspace"; then
-    printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
+  if ! snapshot_coordinator_log "$initial_log" "$workspace" initial_snapshot; then
+    printf 'coordinator diagnostics could not be snapshotted safely\n' >&2
     return 1
   fi
-  if [[ -z "$current_log" ]] || cmp -s -- "$initial_log" "$current_log"; then
+  if [[ -n "$current_log" ]] && \
+    ! snapshot_coordinator_log "$current_log" "$workspace" current_snapshot; then
+    printf 'coordinator diagnostics could not be snapshotted safely\n' >&2
+    return 1
+  fi
+  if [[ -z "$current_snapshot" ]] || cmp -s -- "$initial_snapshot" "$current_snapshot"; then
     printf 'Strict wheel-resolution diagnostics:\n' >&2
-    redact_pip_log <"$initial_log" >&2 || printf 'pip output could not be displayed safely\n' >&2
+    redact_pip_log <"$initial_snapshot" >&2 || printf 'pip output could not be displayed safely\n' >&2
     return 0
   fi
-  if ! validate_coordinator_log_file "$current_log" "$workspace"; then
-    printf 'strict wheel-resolution diagnostics could not be displayed safely\n' >&2
-    return 1
-  fi
   printf 'Initial strict wheel-resolution diagnostics:\n' >&2
-  redact_pip_log <"$initial_log" >&2 || printf 'initial pip output could not be displayed safely\n' >&2
+  redact_pip_log <"$initial_snapshot" >&2 || printf 'initial pip output could not be displayed safely\n' >&2
   printf 'Final strict wheel-resolution diagnostics:\n' >&2
-  redact_pip_log <"$current_log" >&2 || printf 'final pip output could not be displayed safely\n' >&2
+  redact_pip_log <"$current_snapshot" >&2 || printf 'final pip output could not be displayed safely\n' >&2
 }
 
 validate_repair_built_wheels_dir() {
@@ -2576,8 +2876,13 @@ try:
     ):
         raise ValueError
     for path in (repair_dir, built_wheels_dir):
-        mode = os.lstat(path).st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+        record = os.lstat(path)
+        if (
+            stat.S_ISLNK(record.st_mode)
+            or not stat.S_ISDIR(record.st_mode)
+            or record.st_uid != os.geteuid()
+            or stat.S_IMODE(record.st_mode) != 0o700
+        ):
             raise ValueError
 except (OSError, ValueError):
     raise SystemExit(1)

@@ -177,6 +177,309 @@ cleanup_test_files() {
 
 trap cleanup_test_files EXIT
 
+bounded_log_new="$FIXTURE_DIR/bounded-new.log"
+if run_bounded_command_log "$bounded_log_new" printf 'new bounded output\n'; then
+  pass 'bounded coordinator capture safely creates a new private log'
+else
+  fail 'bounded coordinator capture safely creates a new private log'
+fi
+assert_eq 600 "$(stat -c '%a' "$bounded_log_new")" 'new bounded coordinator log is mode 0600'
+assert_eq 'new bounded output' "$(<"$bounded_log_new")" 'new bounded coordinator log contains command output'
+
+printf 'old bounded output\n' >"$bounded_log_new"
+chmod 600 -- "$bounded_log_new"
+if run_bounded_command_log "$bounded_log_new" printf 'replacement bounded output\n'; then
+  pass 'bounded coordinator capture safely replaces an existing private log'
+else
+  fail 'bounded coordinator capture safely replaces an existing private log'
+fi
+assert_eq 'replacement bounded output' "$(<"$bounded_log_new")" 'existing bounded coordinator log is truncated only after validation'
+
+bounded_capture_python="$FIXTURE_DIR/bounded-capture-race.py"
+awk '
+  /^run_bounded_command_log\(\) \{/ { in_function = 1 }
+  in_function && /3<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /^[[:space:]]*existing = os\.lstat\(path\)$/) {
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$bounded_capture_python"
+
+run_bounded_capture_race() {
+  local race_name=$1 replacement_kind=$2
+  local race_dir="$FIXTURE_DIR/bounded-race-$race_name"
+  local log_path="$race_dir/current.log"
+  local victim_path="$race_dir/victim.log"
+  local ready_path="$race_dir/ready"
+  local go_path="$race_dir/go"
+  local status_path="$race_dir/status"
+  local runner_pid race_status
+
+  mkdir -p -- "$race_dir"
+  printf 'prechecked log\n' >"$log_path"
+  printf 'victim sentinel\n' >"$victim_path"
+  chmod 600 -- "$log_path" "$victim_path"
+  (
+    if printf 'attacker controlled replacement\n' | \
+      DIFY_TEST_RACE_READY="$ready_path" DIFY_TEST_RACE_GO="$go_path" \
+      python3 -B "$bounded_capture_python" "$log_path"; then
+      capture_status=0
+    else
+      capture_status=$?
+    fi
+    printf '%s\n' "$capture_status" >"$status_path"
+  ) &
+  runner_pid=$!
+  for _ in $(seq 1 200); do
+    [[ -e "$ready_path" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$ready_path" ]]; then
+    kill "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    fail "bounded capture reaches deterministic pre-open race hook: $race_name"
+    return
+  fi
+  rm -f -- "$log_path"
+  if [[ "$replacement_kind" == hardlink ]]; then
+    ln -- "$victim_path" "$log_path"
+  else
+    mv -- "$victim_path" "$log_path"
+  fi
+  : >"$go_path"
+  wait "$runner_pid"
+  race_status="$(<"$status_path")"
+  if [[ "$race_status" != 0 ]]; then
+    pass "bounded capture rejects a pre-open identity swap: $race_name"
+  else
+    fail "bounded capture rejects a pre-open identity swap: $race_name"
+  fi
+  if [[ "$(<"$log_path")" == 'victim sentinel' ]]; then
+    pass "bounded capture does not truncate the swapped victim: $race_name"
+  else
+    fail "bounded capture does not truncate the swapped victim: $race_name"
+  fi
+}
+
+run_bounded_capture_race hardlink hardlink
+run_bounded_capture_race independent-file independent
+
+mode_zero_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)"
+mkdir -p -- "$mode_zero_workspace/nested/deeper"
+printf 'cleanup sentinel\n' >"$mode_zero_workspace/nested/deeper/file"
+chmod 000 -- "$mode_zero_workspace/nested" "$mode_zero_workspace"
+if cleanup_coordinator_workspace "$mode_zero_workspace"; then
+  pass 'coordinator cleanup recovers an owned mode-000 top workspace and nested directory'
+else
+  fail 'coordinator cleanup recovers an owned mode-000 top workspace and nested directory'
+fi
+assert_file_missing "$mode_zero_workspace" 'mode-000 coordinator workspace leaves no residue'
+if [[ -d "$mode_zero_workspace" && ! -L "$mode_zero_workspace" ]]; then
+  chmod 700 -- "$mode_zero_workspace" 2>/dev/null || true
+  chmod -R u+rwx -- "$mode_zero_workspace" 2>/dev/null || true
+  rm -rf -- "$mode_zero_workspace"
+fi
+
+cleanup_python="$FIXTURE_DIR/coordinator-cleanup-race.py"
+awk '
+  /^cleanup_coordinator_workspace\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /COORDINATOR_WORKSPACE_CLEANUP_IDENTITY_CAPTURED/) {
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$cleanup_python"
+cleanup_race_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)"
+cleanup_race_held="$cleanup_race_workspace.held"
+cleanup_race_victim="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)"
+cleanup_race_ready="$FIXTURE_DIR/cleanup-race.ready"
+cleanup_race_go="$FIXTURE_DIR/cleanup-race.go"
+cleanup_race_status="$FIXTURE_DIR/cleanup-race.status"
+chmod 000 -- "$cleanup_race_workspace" "$cleanup_race_victim"
+(
+  if DIFY_TEST_RACE_READY="$cleanup_race_ready" DIFY_TEST_RACE_GO="$cleanup_race_go" \
+    python3 -B "$cleanup_python" "$cleanup_race_workspace"; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+  fi
+  printf '%s\n' "$cleanup_status" >"$cleanup_race_status"
+) &
+cleanup_runner_pid=$!
+for _ in $(seq 1 200); do
+  [[ -e "$cleanup_race_ready" ]] && break
+  sleep 0.01
+done
+mv -- "$cleanup_race_workspace" "$cleanup_race_held"
+mv -- "$cleanup_race_victim" "$cleanup_race_workspace"
+: >"$cleanup_race_go"
+wait "$cleanup_runner_pid"
+if [[ "$(<"$cleanup_race_status")" != 0 ]]; then
+  pass 'coordinator cleanup fails closed when its top workspace is replaced'
+else
+  fail 'coordinator cleanup fails closed when its top workspace is replaced'
+fi
+assert_eq 0 "$(stat -c '%a' "$cleanup_race_workspace")" 'coordinator cleanup never chmods an attacker replacement'
+chmod 700 -- "$cleanup_race_workspace" "$cleanup_race_held"
+rm -rf -- "$cleanup_race_workspace" "$cleanup_race_held"
+
+foreign_repair_parent="$FIXTURE_DIR/foreign-owned-repair"
+foreign_repair_dir="$foreign_repair_parent/sdist-repair"
+mkdir -p -- "$foreign_repair_dir"
+chmod 700 -- "$foreign_repair_dir"
+if sudo -n chown 0:0 -- "$foreign_repair_dir" 2>/dev/null; then
+  if validate_sdist_repair_dir "$foreign_repair_dir" >/dev/null 2>&1; then
+    fail 'foreign-owned explicit repair root is rejected before use'
+  else
+    pass 'foreign-owned explicit repair root is rejected before use'
+  fi
+  sudo -n chown "$(id -u):$(id -g)" -- "$foreign_repair_dir"
+else
+  if grep -A45 '^validate_sdist_repair_dir()' "$ROOT_DIR/plugin_repackaging.sh" | grep -q 'os.geteuid'; then
+    pass 'explicit repair ownership check is present when root chown is unavailable'
+  else
+    fail 'explicit repair ownership check is present when root chown is unavailable'
+  fi
+fi
+
+diagnostic_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)"
+chmod 700 -- "$diagnostic_workspace"
+diagnostic_initial="$diagnostic_workspace/initial.test.log"
+diagnostic_current="$diagnostic_workspace/current.test.log"
+diagnostic_victim="$diagnostic_workspace/victim"
+diagnostic_output="$FIXTURE_DIR/unsafe-diagnostic-output.log"
+printf 'initial diagnostic\n' >"$diagnostic_initial"
+printf 'diagnostic victim sentinel\n' >"$diagnostic_victim"
+chmod 600 -- "$diagnostic_initial" "$diagnostic_victim"
+diagnostic_snapshot=
+if snapshot_coordinator_log "$diagnostic_initial" "$diagnostic_workspace" diagnostic_snapshot; then
+  pass 'coordinator diagnostic snapshot accepts a private regular log'
+else
+  fail 'coordinator diagnostic snapshot accepts a private regular log'
+fi
+assert_eq 600 "$(stat -c '%a' "$diagnostic_snapshot")" 'coordinator diagnostic snapshot is created mode 0600'
+assert_eq 'initial diagnostic' "$(<"$diagnostic_snapshot")" 'coordinator diagnostic snapshot preserves bounded contents'
+
+run_unsafe_diagnostic_display() {
+  local kind=$1 status
+
+  rm -f -- "$diagnostic_current"
+  case "$kind" in
+    fifo)
+      mkfifo -- "$diagnostic_current"
+      chmod 600 -- "$diagnostic_current"
+      ;;
+    socket)
+      python3 -B - "$diagnostic_current" <<'PY'
+import socket
+import sys
+
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(sys.argv[1])
+listener.close()
+PY
+      chmod 600 -- "$diagnostic_current"
+      ;;
+    symlink)
+      ln -s -- "$diagnostic_victim" "$diagnostic_current"
+      ;;
+    hardlink)
+      ln -- "$diagnostic_victim" "$diagnostic_current"
+      ;;
+    device)
+      sudo -n mknod "$diagnostic_current" c 1 3
+      sudo -n chown "$(id -u):$(id -g)" "$diagnostic_current"
+      sudo -n chmod 600 "$diagnostic_current"
+      ;;
+  esac
+  if timeout 3 bash -c \
+    'source "$1"; display_distinct_coordinator_logs "$2" "$3" "$4"' \
+    _ "$ROOT_DIR/plugin_repackaging.sh" "$diagnostic_initial" "$diagnostic_current" \
+    "$diagnostic_workspace" >"$diagnostic_output" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" != 0 && "$status" != 124 ]]; then
+    pass "unsafe coordinator diagnostic is rejected without blocking: $kind"
+  else
+    fail "unsafe coordinator diagnostic is rejected without blocking: $kind"
+  fi
+  assert_file_contains \
+    "$diagnostic_output" \
+    'coordinator diagnostics could not be snapshotted safely' \
+    "unsafe coordinator diagnostic emits a fixed safe message: $kind"
+  rm -f -- "$diagnostic_current"
+}
+
+for diagnostic_kind in fifo socket symlink hardlink; do
+  run_unsafe_diagnostic_display "$diagnostic_kind"
+done
+if sudo -n true 2>/dev/null; then
+  run_unsafe_diagnostic_display device
+else
+  pass 'device diagnostic fixture requires passwordless sudo; other special files cover non-regular rejection'
+  pass 'device diagnostic fixed-message check requires passwordless sudo; other special files cover safe reporting'
+fi
+assert_eq 'diagnostic victim sentinel' "$(<"$diagnostic_victim")" 'unsafe diagnostic paths never alter their victim'
+
+snapshot_python="$FIXTURE_DIR/coordinator-snapshot-race.py"
+awk '
+  /^snapshot_coordinator_log\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /COORDINATOR_LOG_SNAPSHOT_PREOPEN/) {
+      print "    open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "    while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$snapshot_python"
+snapshot_source="$diagnostic_workspace/snapshot-source.log"
+snapshot_replacement="$diagnostic_workspace/snapshot-replacement.log"
+snapshot_ready="$FIXTURE_DIR/snapshot-race.ready"
+snapshot_go="$FIXTURE_DIR/snapshot-race.go"
+snapshot_status_file="$FIXTURE_DIR/snapshot-race.status"
+printf 'snapshot original\n' >"$snapshot_source"
+printf 'snapshot replacement sentinel\n' >"$snapshot_replacement"
+chmod 600 -- "$snapshot_source" "$snapshot_replacement"
+(
+  if DIFY_TEST_RACE_READY="$snapshot_ready" DIFY_TEST_RACE_GO="$snapshot_go" \
+    python3 -B "$snapshot_python" "$snapshot_source" "$diagnostic_workspace" \
+    >"$FIXTURE_DIR/snapshot-race.stdout"; then
+    snapshot_status=0
+  else
+    snapshot_status=$?
+  fi
+  printf '%s\n' "$snapshot_status" >"$snapshot_status_file"
+) &
+snapshot_runner_pid=$!
+for _ in $(seq 1 200); do
+  [[ -e "$snapshot_ready" ]] && break
+  sleep 0.01
+done
+rm -f -- "$snapshot_source"
+mv -- "$snapshot_replacement" "$snapshot_source"
+: >"$snapshot_go"
+wait "$snapshot_runner_pid"
+if [[ "$(<"$snapshot_status_file")" != 0 ]]; then
+  pass 'coordinator diagnostic snapshot rejects a deterministic pre-open path swap'
+else
+  fail 'coordinator diagnostic snapshot rejects a deterministic pre-open path swap'
+fi
+assert_eq 'snapshot replacement sentinel' "$(<"$snapshot_source")" 'diagnostic snapshot path swap leaves replacement unchanged'
+rm -f -- "$snapshot_source" "$diagnostic_victim" "$diagnostic_initial"
+cleanup_coordinator_workspace "$diagnostic_workspace" >/dev/null 2>&1 || true
+
 write_missing_wheel_log() {
   local file=$1
   local first_requirement=$2
@@ -2122,7 +2425,8 @@ if [[ "$is_strict" == true ]]; then
         printf 'BUILT:%s\n' "$(basename -- "$wheel")"
       done < <(find "$find_links" -maxdepth 1 -type f -name '*.whl' -print | sort)
     fi
-    coordinator_workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" -name 'dify-plugin-coordinator.*' -print -quit)"
+    coordinator_workspace="$(find /tmp -maxdepth 1 -type d -user "$(id -u)" \
+      -name 'dify-plugin-coordinator.*' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
     if [[ -n "$coordinator_workspace" ]]; then
       printf 'WORKSPACE:%s\n' "$coordinator_workspace"
       printf 'LOGPARENTMODE:%s\n' "$(stat -c '%a' "$coordinator_workspace")"
@@ -2137,6 +2441,11 @@ if [[ "$is_strict" == true ]]; then
       cp -- "$find_links"/*.whl "$dest/"
     fi
     touch -- "$dest/runtime-1.0-py3-none-any.whl"
+    if [[ "${COORDINATOR_MUTATE_WORKSPACE_MODE:-}" == 000 && -n "$coordinator_workspace" ]]; then
+      mkdir -p -- "$coordinator_workspace/unreadable/nested"
+      printf 'cleanup sentinel\n' >"$coordinator_workspace/unreadable/nested/file"
+      chmod 000 -- "$coordinator_workspace/unreadable" "$coordinator_workspace"
+    fi
     exit 0
   fi
   touch -- "$dest/partial-attempt-$attempt.whl"
@@ -2155,6 +2464,11 @@ if [[ "$is_strict" == true ]]; then
     'Looking in indexes: https://strict-user:strict-password@mirror.example/simple?token=strict-query#strict-fragment' \
     "ERROR: Could not find a version that satisfies the requirement $sequence (from dependency) (from versions: none)" \
     "ERROR: No matching distribution found for $sequence"
+  if [[ "${COORDINATOR_MUTATE_WORKSPACE_MODE:-}" == 000 && -n "$coordinator_workspace" ]]; then
+    mkdir -p -- "$coordinator_workspace/unreadable/nested"
+    printf 'cleanup sentinel\n' >"$coordinator_workspace/unreadable/nested/file"
+    chmod 000 -- "$coordinator_workspace/unreadable" "$coordinator_workspace"
+  fi
   exit 1
 fi
 
@@ -2328,6 +2642,43 @@ assert_recorded_coordinator_workspaces_removed() {
   fi
 }
 
+prepare_dynamic_coordinator_case foreign-explicit-repair docopt SUCCESS
+mkdir -p -- "$DYNAMIC_REPAIR_DIR"
+chmod 700 -- "$DYNAMIC_REPAIR_DIR"
+if sudo -n chown 0:0 -- "$DYNAMIC_REPAIR_DIR" 2>/dev/null; then
+  if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
+    fail 'coordinator rejects a foreign-owned explicit repair root'
+  else
+    pass 'coordinator rejects a foreign-owned explicit repair root'
+  fi
+  assert_eq 1 "$(grep -c '^CALL:' "$COORDINATOR_STRICT_ARGS_LOG")" 'foreign repair root stops after initial strict classification'
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_SOURCE_ARGS_LOG")" 'foreign repair root is rejected before source pip'
+  assert_eq 0 "$(grep -c '^CALL$' "$COORDINATOR_UV_ARGS_LOG")" 'foreign repair root is rejected before uv'
+  assert_file_missing "$DYNAMIC_REPAIR_DIR/candidate-1" 'foreign repair root is rejected before managed-tree writes'
+  sudo -n chown "$(id -u):$(id -g)" -- "$DYNAMIC_REPAIR_DIR"
+else
+  pass 'foreign repair coordinator fixture requires passwordless sudo; direct ownership check covers rejection'
+  pass 'foreign repair source-pip side-effect fixture requires passwordless sudo'
+  pass 'foreign repair uv side-effect fixture requires passwordless sudo'
+  pass 'foreign repair write side-effect fixture requires passwordless sudo'
+  pass 'foreign repair strict-attempt fixture requires passwordless sudo'
+fi
+
+foreign_built_repair="$FIXTURE_DIR/foreign-built/sdist-repair"
+foreign_built_dir="$foreign_built_repair/built-wheels"
+mkdir -p -- "$foreign_built_dir"
+chmod 700 -- "$foreign_built_repair" "$foreign_built_dir"
+if sudo -n chown 0:0 -- "$foreign_built_dir" 2>/dev/null; then
+  if validate_repair_built_wheels_dir "$foreign_built_repair" "$foreign_built_dir"; then
+    fail 'foreign-owned built-wheels directory is rejected before find-links'
+  else
+    pass 'foreign-owned built-wheels directory is rejected before find-links'
+  fi
+  sudo -n chown "$(id -u):$(id -g)" -- "$foreign_built_dir"
+else
+  pass 'foreign built-wheels ownership fixture requires passwordless sudo; production ownership check is covered statically'
+fi
+
 prepare_dynamic_coordinator_case two-candidates alpha beta SUCCESS
 if run_dynamic_coordinator >"$DYNAMIC_OUTPUT" 2>&1; then
   pass 'coordinator repairs two distinct pure Python candidates'
@@ -2405,6 +2756,28 @@ assert_file_missing "$DYNAMIC_REPAIR_DIR" 'normal success creates no repair dire
 assert_recorded_coordinator_workspaces_removed \
   "$COORDINATOR_STRICT_ARGS_LOG" \
   'normal success removes its secure coordinator workspace'
+
+prepare_dynamic_coordinator_case mode-zero-success SUCCESS
+if COORDINATOR_MUTATE_WORKSPACE_MODE=000 \
+  run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
+  pass 'successful resolution survives cleanup of a top-and-nested mode-000 workspace'
+else
+  fail 'successful resolution survives cleanup of a top-and-nested mode-000 workspace'
+fi
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'success cleanup removes a top-and-nested mode-000 workspace'
+
+prepare_dynamic_coordinator_case mode-zero-failure docopt
+if COORDINATOR_MUTATE_WORKSPACE_MODE=000 \
+  run_dynamic_coordinator_default >"$DYNAMIC_OUTPUT" 2>&1; then
+  fail 'failed resolution with a top-and-nested mode-000 workspace fails closed'
+else
+  pass 'failed resolution with a top-and-nested mode-000 workspace fails closed'
+fi
+assert_recorded_coordinator_workspaces_removed \
+  "$COORDINATOR_STRICT_ARGS_LOG" \
+  'failure cleanup removes a top-and-nested mode-000 workspace'
 
 prepare_dynamic_coordinator_case default-repair-dir docopt SUCCESS
 uv_space_dir="$FIXTURE_DIR/coordinator tools with spaces"
@@ -2673,8 +3046,7 @@ if (
     mutated_workspace="$(dirname -- "$6")"
     mkdir -p -- "$mutated_workspace/unreadable/nested"
     printf 'cleanup sentinel\n' >"$mutated_workspace/unreadable/nested/file"
-    chmod 000 -- "$mutated_workspace/unreadable"
-    chmod 755 -- "$mutated_workspace"
+    chmod 000 -- "$mutated_workspace/unreadable" "$mutated_workspace"
     return 129
   }
   run_dynamic_coordinator_default
