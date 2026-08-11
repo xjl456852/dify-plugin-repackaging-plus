@@ -69,6 +69,12 @@ assert_toml_valid() {
   fi
 }
 
+if python3 -m unittest -v "$ROOT_DIR/tests/test_validate_python_distribution.py"; then
+  pass 'Python distribution archive validator suite passes'
+else
+  fail 'Python distribution archive validator suite passes'
+fi
+
 source "$ROOT_DIR/plugin_repackaging.sh"
 
 assert_eq x86_64 "$(normalize_arch amd64)" 'amd64 normalizes to x86_64'
