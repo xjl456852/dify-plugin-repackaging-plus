@@ -34,7 +34,7 @@ Expected: FAIL because `langgenius-openai_api_compatible_0.0.57.difypkg` is abse
 
 - [ ] **Step 2: Replace the missing package dependency with a generated fixture**
 
-Create a minimal valid plugin tree under `$FIXTURE_DIR/input-plugin`, including `manifest.yaml`, `main.py`, `requirements.txt`, and `pyproject.toml`. Package it with Python's standard `zipfile` module into the existing path-with-spaces fixture:
+Create a plugin tree under `$FIXTURE_DIR/input-plugin`, including `manifest.yaml`, `main.py`, `requirements.txt`, and `pyproject.toml`. Package it with Python's standard `zipfile` module into the existing path-with-spaces fixture. Use a deterministic fake Dify packager in the unit suite: it records the `plugin package <dir> -o <output>` arguments and writes the staging directory to the requested ZIP with relative archive paths. The real Dify CLI remains covered by Task 6's complete vLLM acceptance test, avoiding coupling unit tests to unrelated manifest schema and asset rules.
 
 ```bash
 input_plugin_dir="$FIXTURE_DIR/input-plugin"

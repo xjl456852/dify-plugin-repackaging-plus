@@ -270,7 +270,33 @@ EOF
 cat >"$fake_bin/dify-packager" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$PACKAGER_ARGS_LOG"
-exec "$REAL_PACKAGER" "$@"
+plugin_dir=
+output=
+while (($#)); do
+  case "$1" in
+    package)
+      shift
+      plugin_dir=${1:-}
+      ;;
+    -o)
+      shift
+      output=${1:-}
+      ;;
+  esac
+  shift
+done
+[[ -n "$plugin_dir" && -n "$output" ]]
+python3 - "$plugin_dir" "$output" <<'PY'
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+import sys
+
+root = Path(sys.argv[1])
+with ZipFile(sys.argv[2], "w", ZIP_DEFLATED) as archive:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(root))
+PY
 EOF
 cat >"$fake_bin/packager-fail" <<'EOF'
 #!/usr/bin/env bash
@@ -289,14 +315,110 @@ else
 fi
 assert_file_contains "$FIXTURE_DIR/uv-old.log" '0.7.21 or newer' 'old uv error reports the required version'
 
+input_plugin_dir="$FIXTURE_DIR/input-plugin"
 input_package="$FIXTURE_DIR/source plugin.difypkg"
-cp "$ROOT_DIR/langgenius-openai_api_compatible_0.0.57.difypkg" "$input_package"
+mkdir -p "$input_plugin_dir/provider" "$input_plugin_dir/models/llm"
+printf '%s\n' \
+  'version: 0.0.1' \
+  'type: plugin' \
+  'author: tests' \
+  'name: offline_fixture' \
+  'label:' \
+  '  en_US: Offline fixture' \
+  'description:' \
+  '  en_US: Offline packaging fixture' \
+  'icon: icon.svg' \
+  'resource:' \
+  '  memory: 1048576' \
+  '  permission:' \
+  '    model:' \
+  '      enabled: true' \
+  '      llm: true' \
+  '      text_embedding: false' \
+  '      rerank: false' \
+  '      tts: false' \
+  '      speech2text: false' \
+  '      moderation: false' \
+  'plugins:' \
+  '  models:' \
+  '    - provider/offline_fixture.yaml' \
+  'meta:' \
+  '  version: 0.0.1' \
+  '  arch: [amd64, arm64]' \
+  '  runner:' \
+  '    language: python' \
+  '    version: "3.12"' \
+  '    entrypoint: main' \
+  'created_at: 2026-08-11' >"$input_plugin_dir/manifest.yaml"
+printf '%s\n' \
+  'from dify_plugin import Plugin, DifyPluginEnv' \
+  'Plugin(DifyPluginEnv()).run()' >"$input_plugin_dir/main.py"
+printf '%s\n' 'dify-plugin==0.7.4' >"$input_plugin_dir/requirements.txt"
+printf '%s\n' \
+  '[project]' \
+  'name = "offline-fixture"' \
+  'version = "0.0.1"' \
+  'requires-python = ">=3.12"' \
+  'dependencies = ["dify-plugin==0.7.4"]' >"$input_plugin_dir/pyproject.toml"
+printf '%s\n' \
+  '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>' >"$input_plugin_dir/icon.svg"
+printf '%s\n' \
+  'provider: offline_fixture' \
+  'label:' \
+  '  en_US: Offline fixture' \
+  'description:' \
+  '  en_US: Offline packaging fixture' \
+  'icon_small:' \
+  '  en_US: icon.svg' \
+  'icon_large:' \
+  '  en_US: icon.svg' \
+  'background: "#FFFFFF"' \
+  'supported_model_types:' \
+  '  - llm' \
+  'configurate_methods:' \
+  '  - customizable-model' \
+  'model_credential_schema:' \
+  '  model:' \
+  '    label:' \
+  '      en_US: Model name' \
+  '    placeholder:' \
+  '      en_US: Enter model name' \
+  '  credential_form_schemas: []' \
+  'extra:' \
+  '  python:' \
+  '    provider_source: provider/offline_fixture.py' \
+  '    model_sources:' \
+  '      - models/llm/llm.py' >"$input_plugin_dir/provider/offline_fixture.yaml"
+printf '%s\n' \
+  'from collections.abc import Mapping' \
+  'from dify_plugin import ModelProvider' \
+  '' \
+  'class OfflineFixtureProvider(ModelProvider):' \
+  '    def validate_provider_credentials(self, credentials: Mapping) -> None:' \
+  '        pass' >"$input_plugin_dir/provider/offline_fixture.py"
+printf '%s\n' \
+  'from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel' \
+  '' \
+  'class OfflineFixtureLargeLanguageModel(OAICompatLargeLanguageModel):' \
+  '    pass' >"$input_plugin_dir/models/llm/llm.py"
+(
+  cd "$input_plugin_dir"
+  python3 - "$input_package" <<'PY'
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+import sys
+
+root = Path.cwd()
+with ZipFile(sys.argv[1], "w", ZIP_DEFLATED) as archive:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(root))
+PY
+)
 GENERATED_TEST_OUTPUT="$ROOT_DIR/source plugin-offline.difypkg"
 rm -f -- "$GENERATED_TEST_OUTPUT"
 export UV_ARGS_LOG="$FIXTURE_DIR/uv-runtime.args"
 export PACKAGER_ARGS_LOG="$FIXTURE_DIR/packager.args"
-export REAL_PACKAGER="$ROOT_DIR/dify-plugin-linux-amd64-5g"
-chmod +x "$REAL_PACKAGER"
 
 run_log="$FIXTURE_DIR/repackage.log"
 if DIFY_PIP_COMMAND="$fake_bin/pip-download" \
