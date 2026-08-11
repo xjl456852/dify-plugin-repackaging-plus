@@ -2991,14 +2991,17 @@ assert_recorded_coordinator_workspaces_removed \
 prepare_dynamic_coordinator_case log-setup-failure SUCCESS
 export COORDINATOR_SETUP_WORKSPACE_MARKER="$DYNAMIC_CASE_DIR/setup-workspace.path"
 if (
+  mkdir() {
+    local argument
+    command mkdir "$@" || return
+    for argument in "$@"; do
+      if [[ "$argument" == /tmp/dify-plugin-coordinator.* ]]; then
+        printf '%s\n' "$argument" >"$COORDINATOR_SETUP_WORKSPACE_MARKER"
+      fi
+    done
+  }
   mktemp() {
-    if [[ "${1:-}" == -d ]]; then
-      coordinator_setup_workspace="$(command mktemp "$@")" || return
-      printf '%s\n' "$coordinator_setup_workspace" >"$COORDINATOR_SETUP_WORKSPACE_MARKER"
-      printf '%s\n' "$coordinator_setup_workspace"
-    else
-      return 70
-    fi
+    return 70
   }
   run_dynamic_coordinator
 ) >"$DYNAMIC_OUTPUT" 2>&1; then
@@ -4452,11 +4455,19 @@ export FULL_DEBUG_LOG FULL_DEBUG_MARKER
 cat >"$FULL_DEBUG_ENV" <<'EOF'
 set -T
 trap '
-  if [[ "${FULL_DEBUG_FIRED:-0}" != 1 && -n "${FULL_DEBUG_COMMAND:-}" && "$BASH_COMMAND" == "$FULL_DEBUG_COMMAND" ]]; then
+  if [[ "${FULL_DEBUG_FIRED:-0}" != 1 && -n "${FULL_DEBUG_COMMAND:-}" && \
+    "$BASH_COMMAND" == "$FULL_DEBUG_COMMAND" && \
+    ( -z "${FULL_DEBUG_EXPECT_KIND:-}" || "${RUNTIME_CHILD_KIND:-}" == "$FULL_DEBUG_EXPECT_KIND" ) && \
+    ( -z "${FULL_DEBUG_EXPECT_STATE:-}" || "${RUNTIME_CHILD_STATE:-}" == "$FULL_DEBUG_EXPECT_STATE" ) && \
+    ( "${FULL_DEBUG_REQUIRE_STAGING:-0}" != 1 || -n "${ACTIVE_STAGING:-}" ) && \
+    ( -z "${FULL_DEBUG_TRACKING_VARIABLE:-}" || "${tracking_variable:-}" == "$FULL_DEBUG_TRACKING_VARIABLE" ) ]]; then
     FULL_DEBUG_FIRED=1
     printf "TARGET:%s\nCOMMAND:%s\n" "$BASHPID" "$BASH_COMMAND" >>"$FULL_DEBUG_LOG"
     if [[ "$BASH_COMMAND" == *"\$!"* ]]; then
       printf "CHILD:%s\n" "$!" >>"$FULL_DEBUG_LOG"
+    fi
+    if [[ -n "${candidate:-}" ]]; then
+      printf "CANDIDATE:%s\n" "$candidate" >>"$FULL_DEBUG_LOG"
     fi
     : >"$FULL_DEBUG_MARKER"
     trap - DEBUG
@@ -4472,7 +4483,41 @@ run_full_debug_signal_case() {
   local expected_status=$4
   local repair_mode=${5:-success}
   local debug_log="$FIXTURE_DIR/full-debug-$window_name-$signal_name.log"
-  local debug_status debug_child_pid=
+  local debug_status debug_child_pid= debug_candidate_path=
+  local debug_expected_kind= debug_expected_state= debug_require_staging=0 debug_tracking_variable=
+
+  case "$window_name" in
+    download-clear-kind | download-reset-*)
+      debug_expected_state=idle
+      debug_require_staging=1
+      ;;
+    download-starting)
+      debug_expected_kind=download
+      debug_require_staging=1
+      ;;
+    packager-clear-kind | packager-reset-*)
+      debug_expected_state=reaped
+      debug_require_staging=1
+      ;;
+    packager-starting)
+      debug_expected_kind=packager
+      debug_require_staging=1
+      ;;
+    download-* | packager-*)
+      debug_require_staging=1
+      ;;
+    repo-staging-*)
+      debug_tracking_variable=ACTIVE_STAGING
+      ;;
+    output-temp-*)
+      debug_tracking_variable=ACTIVE_OUTPUT_TEMP_DIR
+      ;;
+    coordinator-temp-trap)
+      ;;
+    coordinator-temp-*)
+      debug_tracking_variable=ACTIVE_COORDINATOR_WORKSPACE
+      ;;
+  esac
 
   prepare_full_repackage_case
   seed_prior_full_output
@@ -4483,6 +4528,10 @@ run_full_debug_signal_case() {
     BASH_ENV="$FULL_DEBUG_ENV" \
     FULL_DEBUG_WINDOW="$window_name" \
     FULL_DEBUG_COMMAND="$debug_command" \
+    FULL_DEBUG_EXPECT_KIND="$debug_expected_kind" \
+    FULL_DEBUG_EXPECT_STATE="$debug_expected_state" \
+    FULL_DEBUG_REQUIRE_STAGING="$debug_require_staging" \
+    FULL_DEBUG_TRACKING_VARIABLE="$debug_tracking_variable" \
     FULL_DEBUG_SIGNAL="$signal_name" \
     FULL_REPAIR_MODE="$repair_mode" \
     DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
@@ -4515,6 +4564,12 @@ run_full_debug_signal_case() {
       sleep 0.05
     done
   fi
+  debug_candidate_path="$(sed -n 's/^CANDIDATE://p' "$FULL_DEBUG_LOG" | tail -1)"
+  if [[ -z "$debug_candidate_path" || ! -e "$debug_candidate_path" && ! -L "$debug_candidate_path" ]]; then
+    pass "$window_name $signal_name leaves no tracked temporary candidate"
+  else
+    fail "$window_name $signal_name leaves no tracked temporary candidate"
+  fi
   if ps -eo args | grep -E '[p]ip-full-repackage|[u]v-full-repackage|[d]ify-packager-full' | grep -Fq "$FIXTURE_DIR"; then
     fail "$window_name $signal_name leaves no fixture bash, uv, packager, or sleep process"
   else
@@ -4524,16 +4579,97 @@ run_full_debug_signal_case() {
 
 debug_signals=(HUP INT TERM)
 debug_statuses=(129 130 143)
+download_launch_window_names=(
+  download-clear-kind
+  download-reset-signal
+  download-reset-status
+  download-kind
+  download-starting
+  download-fork
+  download-pid
+)
+download_launch_window_commands=(
+  'RUNTIME_CHILD_KIND='
+  'RUNTIME_PENDING_SIGNAL='
+  'RUNTIME_PENDING_STATUS='
+  'RUNTIME_CHILD_KIND=download'
+  'RUNTIME_CHILD_STATE=starting'
+  'DOWNLOAD_WHEELS_RUN_IN_PLACE=true download_wheels "$staging/download-requirements.txt" "$plugin_dir/wheels" "$TARGET_ARCH" "$python_version" "$staging/pip-bootstrap"'
+  'ACTIVE_DOWNLOAD_PID=$!'
+)
+repair_launch_window_names=(repair-starting repair-fork repair-pid)
+repair_launch_window_commands=(
+  'repair_child_state=starting'
+  'repair_one_pure_sdist_impl pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" "$repair_dir" "$socks_site_dir" "$repair_count"'
+  'active_repair_pid=$!'
+)
+packager_launch_window_names=(
+  packager-clear-kind
+  packager-reset-signal
+  packager-reset-status
+  packager-kind
+  packager-starting
+  packager-fork
+  packager-pid
+)
+packager_launch_window_commands=(
+  'RUNTIME_CHILD_KIND='
+  'RUNTIME_PENDING_SIGNAL='
+  'RUNTIME_PENDING_STATUS='
+  'RUNTIME_CHILD_KIND=packager'
+  'RUNTIME_CHILD_STATE=starting'
+  '"$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output"'
+  'ACTIVE_PACKAGER_PID=$!'
+)
 for debug_index in "${!debug_signals[@]}"; do
+  for window_index in "${!download_launch_window_names[@]}"; do
+    run_full_debug_signal_case \
+      "${download_launch_window_names[$window_index]}" \
+      "${download_launch_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
+  done
+  for window_index in "${!repair_launch_window_names[@]}"; do
+    run_full_debug_signal_case \
+      "${repair_launch_window_names[$window_index]}" \
+      "${repair_launch_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
+  done
+  for window_index in "${!packager_launch_window_names[@]}"; do
+    run_full_debug_signal_case \
+      "${packager_launch_window_names[$window_index]}" \
+      "${packager_launch_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" wheel-only
+  done
+done
+
+tracked_temp_window_names=(repo-staging-register repo-staging-mkdir repo-staging-created)
+tracked_temp_window_commands=(
+  'printf -v "$tracking_variable" '\''%s'\'' "$candidate"'
+  'mkdir -m 700 -- "$candidate"'
+  'return 0'
+)
+output_temp_window_names=(output-temp-register output-temp-mkdir output-temp-created)
+coordinator_temp_window_names=(coordinator-temp-register coordinator-temp-mkdir coordinator-temp-created)
+for debug_index in "${!debug_signals[@]}"; do
+  for window_index in "${!tracked_temp_window_names[@]}"; do
+    run_full_debug_signal_case \
+      "${tracked_temp_window_names[$window_index]}" \
+      "${tracked_temp_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" wheel-only
+    run_full_debug_signal_case \
+      "${output_temp_window_names[$window_index]}" \
+      "${tracked_temp_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" wheel-only
+    run_full_debug_signal_case \
+      "${coordinator_temp_window_names[$window_index]}" \
+      "${tracked_temp_window_commands[$window_index]}" \
+      "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
+  done
   run_full_debug_signal_case \
-    download-pid 'ACTIVE_DOWNLOAD_PID=$!' \
-    "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
-  run_full_debug_signal_case \
-    repair-pid 'active_repair_pid=$!' \
+    coordinator-temp-trap 'tracked_temp_creation_barrier coordinator-traps-installed' \
     "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
 done
 
-run_full_debug_signal_case packager-pid 'ACTIVE_PACKAGER_PID=$!' TERM 143 wheel-only
 run_full_debug_signal_case before-packager 'output_non_publication_barrier before-packager' TERM 143 wheel-only
 run_full_debug_signal_case after-packager 'output_non_publication_barrier after-packager' TERM 143 wheel-only
 run_full_debug_signal_case before-publish 'output_non_publication_barrier before-publish' TERM 143 wheel-only

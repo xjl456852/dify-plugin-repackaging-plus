@@ -14,6 +14,7 @@ ACTIVE_STAGING=
 ACTIVE_OUTPUT=
 ACTIVE_OUTPUT_TEMP_DIR=
 ACTIVE_OUTPUT_TEMP_FILE=
+ACTIVE_COORDINATOR_WORKSPACE=
 ACTIVE_DOWNLOAD_PID=
 ACTIVE_PACKAGER_PID=
 RUNTIME_CHILD_STATE=idle
@@ -2489,6 +2490,42 @@ except (OSError, ValueError):
 PY
 }
 
+create_tracked_temp_dir() {
+  local parent=$1
+  local prefix=$2
+  local tracking_variable=$3
+  local token candidate
+  local attempt
+
+  case "$tracking_variable:$parent:$prefix" in
+    "ACTIVE_STAGING:$SCRIPT_DIR:.dify-repackaging." | \
+      "ACTIVE_OUTPUT_TEMP_DIR:$SCRIPT_DIR:.dify-output." | \
+      "ACTIVE_COORDINATOR_WORKSPACE:/tmp:dify-plugin-coordinator.")
+      ;;
+    *)
+      printf 'invalid tracked temporary-directory request\n' >&2
+      return 1
+      ;;
+  esac
+  for attempt in {1..32}; do
+    token="$(task3_python -B -c 'import secrets; print(secrets.token_hex(16))')" || return
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    candidate="$parent/$prefix$token"
+    printf -v "$tracking_variable" '%s' "$candidate"
+    if mkdir -m 700 -- "$candidate"; then
+      return 0
+    fi
+    printf -v "$tracking_variable" '%s' ''
+    [[ -e "$candidate" || -L "$candidate" ]] || return 1
+  done
+  printf 'unable to allocate a unique tracked temporary directory\n' >&2
+  return 1
+}
+
+tracked_temp_creation_barrier() {
+  :
+}
+
 cleanup_coordinator_workspace() {
   local workspace=${1:-}
 
@@ -2589,7 +2626,10 @@ try:
         trusted_root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    linked = os.stat(basename, dir_fd=root_descriptor, follow_symlinks=False)
+    try:
+        linked = os.stat(basename, dir_fd=root_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SystemExit(0)
     # COORDINATOR_WORKSPACE_CLEANUP_IDENTITY_CAPTURED
     workspace_path_descriptor = os.open(
         basename,
@@ -3050,11 +3090,13 @@ download_wheels_impl() {
       platform_names+=("$platform")
     fi
   done < <(default_platforms "$target_arch")
-  coordinator_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)" || return
-  trap "cleanup_coordinator_workspace '$coordinator_workspace' || true" EXIT
   trap 'request_repair_cancellation INT 130' INT
   trap 'request_repair_cancellation TERM 143' TERM
   trap 'request_repair_cancellation HUP 129' HUP
+  trap 'cleanup_coordinator_workspace "${ACTIVE_COORDINATOR_WORKSPACE:-}" || true' EXIT
+  tracked_temp_creation_barrier coordinator-traps-installed
+  create_tracked_temp_dir /tmp dify-plugin-coordinator. ACTIVE_COORDINATOR_WORKSPACE || return
+  coordinator_workspace=$ACTIVE_COORDINATOR_WORKSPACE
   chmod 700 -- "$coordinator_workspace" || return
   validate_coordinator_workspace "$coordinator_workspace" || {
     printf 'failed to create a private coordinator workspace under /tmp\n' >&2
@@ -3320,7 +3362,8 @@ prepare_atomic_output() {
     printf 'unsafe final output path: %s\n' "$output" >&2
     return 1
   }
-  temp_dir="$(mktemp -d -- "$SCRIPT_DIR/.dify-output.XXXXXXXX")" || return
+  create_tracked_temp_dir "$SCRIPT_DIR" .dify-output. ACTIVE_OUTPUT_TEMP_DIR || return
+  temp_dir=$ACTIVE_OUTPUT_TEMP_DIR
   if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
 import os
 import stat
@@ -3348,7 +3391,6 @@ PY
     rmdir -- "$temp_dir" 2>/dev/null || true
     return 1
   fi
-  ACTIVE_OUTPUT_TEMP_DIR=$temp_dir
   ACTIVE_OUTPUT_TEMP_FILE="$temp_dir/package.difypkg"
 }
 
@@ -3491,8 +3533,8 @@ repackage() {
   register_output_for_package "$package_path"
   output=$ACTIVE_OUTPUT
 
-  staging="$(mktemp -d "$SCRIPT_DIR/.dify-repackaging.XXXXXX")"
-  ACTIVE_STAGING=$staging
+  create_tracked_temp_dir "$SCRIPT_DIR" .dify-repackaging. ACTIVE_STAGING || return
+  staging=$ACTIVE_STAGING
   plugin_dir="$staging/plugin"
   mkdir -p "$plugin_dir"
 
@@ -3507,10 +3549,11 @@ repackage() {
   fi
   [[ -f "$plugin_dir/pyproject.toml" ]] && requires_pyproject=true
 
-  RUNTIME_CHILD_KIND=download
-  RUNTIME_CHILD_STATE=starting
+  RUNTIME_CHILD_KIND=
   RUNTIME_PENDING_SIGNAL=
   RUNTIME_PENDING_STATUS=
+  RUNTIME_CHILD_KIND=download
+  RUNTIME_CHILD_STATE=starting
   DOWNLOAD_WHEELS_RUN_IN_PLACE=true download_wheels \
     "$staging/download-requirements.txt" \
     "$plugin_dir/wheels" \
@@ -3551,10 +3594,11 @@ repackage() {
   prepare_atomic_output "$output" || return 1
   temp_output=$ACTIVE_OUTPUT_TEMP_FILE
   output_non_publication_barrier before-packager
-  RUNTIME_CHILD_KIND=packager
-  RUNTIME_CHILD_STATE=starting
+  RUNTIME_CHILD_KIND=
   RUNTIME_PENDING_SIGNAL=
   RUNTIME_PENDING_STATUS=
+  RUNTIME_CHILD_KIND=packager
+  RUNTIME_CHILD_STATE=starting
   "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output" &
   ACTIVE_PACKAGER_PID=$!
   activate_runtime_child packager "$ACTIVE_PACKAGER_PID" || return 1
