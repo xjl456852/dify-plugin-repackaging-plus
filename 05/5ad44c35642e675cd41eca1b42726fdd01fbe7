@@ -1,0 +1,24 @@
+README.md
+  s_c1a60985b94e3d::t_6e64a003d77951 151
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_e5a896e4d9255d 4676-4743,4963
+  s_c1a60985b94e3d::t_8ada3dbc4de173 4675
+plugin_repackaging.sh
+  s_c1a60985b94e3d::t_6e64a003d77951 24-26,2963-2974,3380,3500-3504,3517-3519,3552-3553,3639,3641-3655,3658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "055ad44c35642e675cd41eca1b42726fdd01fbe7",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
