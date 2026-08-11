@@ -1,0 +1,26 @@
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_e331ceb8fca312 72-77
+tools/validate_python_distribution.py
+  s_c1a60985b94e3d::t_51c1afce1db0a7 213-214,223-224
+  s_c1a60985b94e3d::t_89cd0c0f7ac5c2 1-78,80-88,90-212,215-222,225-258
+  s_c1a60985b94e3d::t_d0d2620a218ba8 79,89
+tests/test_validate_python_distribution.py
+  s_c1a60985b94e3d::t_26776f69484798 1-127,129-186
+  s_c1a60985b94e3d::t_51c1afce1db0a7 128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "7657716d6038ac8c5a26a748176dede2e0eeedf8",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
