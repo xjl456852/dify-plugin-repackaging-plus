@@ -102,16 +102,34 @@ chmod +x plugin_repackaging.sh plugin_repackaging_amd64_to_arm64.sh
 Python 版本按以下顺序确定：
 
 1. `DIFY_PYTHON_VERSION` 环境变量。
-2. 插件包内 `.python-version`。
-3. `pyproject.toml` 的 `requires-python` 下限。
-4. 默认 Python 3.12。
+2. `manifest.yaml` 的 `meta.runner.version`。
+3. 插件包内 `.python-version`。
+4. `pyproject.toml` 的 `requires-python` 下限。
+5. 默认 Python 3.12。
 
-`.python-version` 或覆盖变量可以写 `3.12` 或 `3.12.7`；脚本会统一按 CPython 主次版本 `3.12` 选择 ABI 和平台依赖。
+manifest、`.python-version` 或覆盖变量可以写 `3.12` 或 `3.12.7`；脚本会统一按 CPython 主次版本 `3.12` 选择 ABI 和平台依赖。manifest 是 Dify 实际选择插件运行器的依据，因此优先于开发环境文件；缺少或无法识别时才继续回退。
 
 默认 wheel 平台为：
 
 - ARM64：`manylinux_2_28_aarch64`、`manylinux2014_aarch64`
 - AMD64：`manylinux_2_28_x86_64`、`manylinux2014_x86_64`
+
+## SOCKS 代理自动修复
+
+脚本会识别 `http_proxy`、`https_proxy`、`all_proxy` 及对应大写变量中的 `socks4`、`socks4a`、`socks5` 和 `socks5h` 地址。如果选中的 pip 缺少 PySocks，脚本会自动：
+
+1. 使用 curl 从当前 `PIP_MIRROR_URL` 读取 PySocks simple 索引。
+2. 下载通用的 `PySocks==1.7.1` wheel，并在索引提供 SHA-256 时校验文件。
+3. 只安装到本次构建的临时 staging 目录。
+4. 仅为本次 `pip download` 注入临时 `PYTHONPATH`，构建完成后自动清理。
+
+这个过程不会修改系统 Python、虚拟环境或 Conda 环境。没有 SOCKS 代理，或者 pip 已经支持 SOCKS 时，继续原来的下载路径，不创建 bootstrap 目录。
+
+如需禁止自动补齐并在缺少 PySocks 时直接失败：
+
+```bash
+export DIFY_AUTO_FIX_SOCKS=0
+```
 
 ## 高级配置
 
@@ -132,6 +150,9 @@ export PIP_MIRROR_URL=https://mirrors.aliyun.com/pypi/simple
 
 # pip 不在 PATH 中时指定完整命令
 export DIFY_PIP_COMMAND=/path/to/venv/bin/pip
+
+# 禁止临时补齐 pip 的 SOCKS 支持
+export DIFY_AUTO_FIX_SOCKS=0
 ```
 
 ## 安全失败原则
@@ -140,6 +161,8 @@ export DIFY_PIP_COMMAND=/path/to/venv/bin/pip
 
 - 目标 Python/架构没有二进制 wheel，只有源码包。
 - requirements 依赖闭包不完整或版本不匹配。
+- 依赖只发布在未配置的私有或专用索引中。
+- 插件依赖 CUDA、GPU 驱动、编译器或操作系统动态库；这些不属于 Python wheelhouse。
 - requirements 或 pyproject 任一适用路径无法完全离线解析。
 - Dify CLI 打包失败。
 - 最终包缺少 `requirements.txt`、`uv.toml` 或 wheel。
