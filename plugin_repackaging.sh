@@ -117,6 +117,23 @@ default_platforms() {
   printf 'manylinux_2_28_%s\nmanylinux2014_%s\n' "$suffix" "$suffix"
 }
 
+detect_socks_proxy() {
+  local variable_name proxy_url scheme
+
+  for variable_name in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do
+    proxy_url=${!variable_name:-}
+    [[ -n "$proxy_url" && "$proxy_url" == *://* ]] || continue
+    scheme=${proxy_url%%://*}
+    case "${scheme,,}" in
+      socks4 | socks4a | socks5 | socks5h)
+        printf '%s\n' "$proxy_url"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 detect_manifest_python_version() {
   local manifest_file=$1
   local detected

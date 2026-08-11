@@ -79,6 +79,39 @@ assert_eq cp312 "$(python_abi 3.12)" 'Python 3.12 ABI'
 assert_eq cp312 "$(python_abi 3.12.7)" 'Python patch version normalizes to CPython 3.12 ABI'
 assert_eq $'manylinux_2_28_aarch64\nmanylinux2014_aarch64' "$(default_platforms aarch64)" 'ARM64 platform set'
 assert_eq custom_aarch64 "$(DIFY_MANYLINUX_PLATFORMS=custom_aarch64 default_platforms aarch64)" 'platform override'
+
+detect_proxy_fixture() {
+  local variable_name=$1
+  local proxy_url=$2
+
+  (
+    unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+    export "$variable_name=$proxy_url"
+    detect_socks_proxy
+  )
+}
+
+for proxy_scheme in socks4 socks4a socks5 socks5h; do
+  proxy_url="$proxy_scheme://10.10.10.10:28802"
+  assert_eq \
+    "$proxy_url" \
+    "$(detect_proxy_fixture https_proxy "$proxy_url")" \
+    "$proxy_scheme proxy requires SOCKS support"
+done
+assert_eq \
+  'SoCkS5H://10.10.10.10:28802' \
+  "$(detect_proxy_fixture ALL_PROXY 'SoCkS5H://10.10.10.10:28802')" \
+  'proxy scheme matching is case-insensitive'
+if detect_proxy_fixture HTTP_PROXY 'http://10.10.10.10:28802' >/dev/null; then
+  fail 'HTTP proxy does not require SOCKS support'
+else
+  pass 'HTTP proxy does not require SOCKS support'
+fi
+if detect_proxy_fixture HTTPS_PROXY '' >/dev/null; then
+  fail 'empty proxy environment does not require SOCKS support'
+else
+  pass 'empty proxy environment does not require SOCKS support'
+fi
 if uv_version_at_least 0.7.21 0.7.21 && uv_version_at_least 0.11.24 0.7.21; then
   pass 'supported uv versions satisfy the minimum'
 else
