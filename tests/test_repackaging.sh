@@ -4672,7 +4672,75 @@ done
 
 run_full_debug_signal_case before-packager 'output_non_publication_barrier before-packager' TERM 143 wheel-only
 run_full_debug_signal_case after-packager 'output_non_publication_barrier after-packager' TERM 143 wheel-only
-run_full_debug_signal_case before-publish 'output_non_publication_barrier before-publish' TERM 143 wheel-only
+
+run_full_commit_signal_case() {
+  local window_name=$1
+  local debug_command=$2
+  local signal_name=$3
+  local debug_log="$FIXTURE_DIR/full-debug-$window_name-$signal_name.log"
+  local debug_status
+
+  prepare_full_repackage_case
+  seed_prior_full_output
+  : >"$FULL_DEBUG_LOG"
+  rm -f -- "$FULL_DEBUG_MARKER"
+  if setsid env -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    BASH_ENV="$FULL_DEBUG_ENV" \
+    FULL_DEBUG_WINDOW="$window_name" \
+    FULL_DEBUG_COMMAND="$debug_command" \
+    FULL_DEBUG_EXPECT_KIND= \
+    FULL_DEBUG_EXPECT_STATE= \
+    FULL_DEBUG_REQUIRE_STAGING=0 \
+    FULL_DEBUG_TRACKING_VARIABLE= \
+    FULL_DEBUG_SIGNAL="$signal_name" \
+    FULL_REPAIR_MODE=wheel-only \
+    DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+    DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+    DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+    DIFY_TARGET_ARCH=aarch64 \
+    bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$debug_log" 2>&1; then
+    debug_status=0
+  else
+    debug_status=$?
+  fi
+  if [[ -f "$FULL_DEBUG_MARKER" ]]; then
+    pass "$window_name DEBUG injection reaches the atomic commit window: $signal_name"
+  else
+    fail "$window_name DEBUG injection reaches the atomic commit window: $signal_name"
+  fi
+  assert_eq 0 "$debug_status" "$window_name treats $signal_name after the commit barrier as success"
+  if [[ -f "$GENERATED_TEST_OUTPUT" && \
+    "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" != "$PRIOR_FULL_OUTPUT_SHA256" ]] && \
+    unzip -tq "$GENERATED_TEST_OUTPUT" >/dev/null; then
+    pass "$window_name $signal_name publishes a new valid archive"
+  else
+    fail "$window_name $signal_name publishes a new valid archive"
+  fi
+  assert_file_contains "$debug_log" 'Repackage success.' "$window_name $signal_name reports successful commit"
+  assert_initial_strict_secrets_redacted "$debug_log" "$window_name $signal_name output"
+  assert_full_repackage_cleanup "$window_name $signal_name"
+  if ps -eo args | grep -E '[p]ip-full-repackage|[u]v-full-repackage|[d]ify-packager-full' | grep -Fq "$FIXTURE_DIR"; then
+    fail "$window_name $signal_name leaves no fixture process"
+  else
+    pass "$window_name $signal_name leaves no fixture process"
+  fi
+}
+
+for debug_index in "${!debug_signals[@]}"; do
+  run_full_debug_signal_case \
+    before-publish 'output_non_publication_barrier before-publish' \
+    "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" wheel-only
+  run_full_commit_signal_case \
+    committing-before-replace 'publish_output_archive "$temp_output" "$output"' \
+    "${debug_signals[$debug_index]}"
+  run_full_commit_signal_case \
+    replace-return-before-committed 'OUTPUT_PUBLICATION_STATE=committed' \
+    "${debug_signals[$debug_index]}"
+  run_full_commit_signal_case \
+    committed-before-cleanup 'cleanup_active_output_temp' \
+    "${debug_signals[$debug_index]}"
+done
 
 repackage_function_source="$(sed -n '/^repackage() {/,/^}/p' "$ROOT_DIR/plugin_repackaging.sh")"
 if grep -Fq '"$staging/sdist-repair"' <<<"$repackage_function_source"; then
@@ -4892,6 +4960,7 @@ assert_file_contains "$ROOT_DIR/README.md" 'records[all]' 'README uses records/d
 assert_file_contains "$ROOT_DIR/README.md" 'docopt' 'README includes the generic missing-wheel example'
 assert_file_contains "$ROOT_DIR/README.md" '原子替换' 'README documents atomic final-output publication'
 assert_file_contains "$ROOT_DIR/README.md" '保留已有' 'README documents prior-output preservation on failure'
+assert_file_contains "$ROOT_DIR/README.md" '提交点' 'README defines the atomic output commit point'
 
 printf '%s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

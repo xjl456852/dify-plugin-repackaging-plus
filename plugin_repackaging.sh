@@ -21,6 +21,9 @@ RUNTIME_CHILD_STATE=idle
 RUNTIME_CHILD_KIND=
 RUNTIME_PENDING_SIGNAL=
 RUNTIME_PENDING_STATUS=
+OUTPUT_PUBLICATION_STATE=idle
+OUTPUT_PUBLICATION_PENDING_SIGNAL=
+OUTPUT_PUBLICATION_PENDING_STATUS=
 BUILD_SUCCEEDED=false
 
 normalize_arch() {
@@ -2957,6 +2960,18 @@ request_runtime_cancellation() {
       exit 125
       ;;
   esac
+  case "${OUTPUT_PUBLICATION_STATE:-idle}" in
+    committing | committed)
+      OUTPUT_PUBLICATION_PENDING_SIGNAL=$signal_name
+      OUTPUT_PUBLICATION_PENDING_STATUS=$exit_status
+      return 0
+      ;;
+    idle | preparing | ready)
+      ;;
+    *)
+      exit 125
+      ;;
+  esac
   RUNTIME_PENDING_SIGNAL=$signal_name
   RUNTIME_PENDING_STATUS=$exit_status
   if [[ "${RUNTIME_CHILD_STATE:-idle}" == starting ]]; then
@@ -3362,6 +3377,7 @@ prepare_atomic_output() {
     printf 'unsafe final output path: %s\n' "$output" >&2
     return 1
   }
+  OUTPUT_PUBLICATION_STATE=preparing
   create_tracked_temp_dir "$SCRIPT_DIR" .dify-output. ACTIVE_OUTPUT_TEMP_DIR || return
   temp_dir=$ACTIVE_OUTPUT_TEMP_DIR
   if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
@@ -3481,6 +3497,11 @@ output_non_publication_barrier() {
 cleanup_runtime() {
   local status=$?
 
+  if [[ "${OUTPUT_PUBLICATION_STATE:-idle}" == committed ]]; then
+    cleanup_active_output_temp || true
+    cleanup_active_staging || true
+    return 0
+  fi
   cleanup_active_output_temp || status=$?
   cleanup_active_staging || status=$?
   return "$status"
@@ -3493,6 +3514,9 @@ register_output_for_package() {
   package_filename="$(basename "$package_path")"
   package_name="${package_filename%.*}"
   ACTIVE_OUTPUT="$SCRIPT_DIR/${package_name}-offline.difypkg"
+  OUTPUT_PUBLICATION_STATE=idle
+  OUTPUT_PUBLICATION_PENDING_SIGNAL=
+  OUTPUT_PUBLICATION_PENDING_STATUS=
   BUILD_SUCCEEDED=false
 }
 
@@ -3525,7 +3549,8 @@ initialize_runtime() {
 
 repackage() {
   local package_path=$1
-  local package_filename staging plugin_dir output python_version download_status packager_status temp_output
+  local package_filename staging plugin_dir output python_version download_status packager_status
+  local publish_status publication_pending_status temp_output
   local requires_wheel=false
   local requires_pyproject=false
 
@@ -3611,12 +3636,26 @@ repackage() {
   ((packager_status == 0)) || return 1
   output_non_publication_barrier after-packager
   verify_output_archive "$temp_output" "$requires_wheel" "$requires_pyproject" "$TARGET_ARCH" || return 1
+  OUTPUT_PUBLICATION_STATE=ready
   output_non_publication_barrier before-publish
-  publish_output_archive "$temp_output" "$output" || return 1
-  cleanup_active_output_temp || return 1
+  OUTPUT_PUBLICATION_PENDING_SIGNAL=
+  OUTPUT_PUBLICATION_PENDING_STATUS=
+  OUTPUT_PUBLICATION_STATE=committing
+  if publish_output_archive "$temp_output" "$output"; then
+    OUTPUT_PUBLICATION_STATE=committed
+  else
+    publish_status=$?
+    OUTPUT_PUBLICATION_STATE=ready
+    if [[ -n "$OUTPUT_PUBLICATION_PENDING_SIGNAL" ]]; then
+      publication_pending_status=$OUTPUT_PUBLICATION_PENDING_STATUS
+      return "$publication_pending_status"
+    fi
+    ((publish_status == 0)) || return 1
+  fi
+  cleanup_active_output_temp || true
 
   BUILD_SUCCEEDED=true
-  cleanup_active_staging
+  cleanup_active_staging || true
   printf 'Repackage success.\nOutput: %s\n' "$output"
 }
 
