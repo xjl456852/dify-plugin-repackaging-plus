@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-08-11-self-healing-offline-packaging-design.md
+  s_c1a60985b94e3d::t_723110f3cf81a7 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "60920407d5b0a82ad24ff561217994ed69f924fe",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
