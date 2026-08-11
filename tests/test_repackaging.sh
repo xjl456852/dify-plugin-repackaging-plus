@@ -4049,11 +4049,37 @@ while (($#)); do
   shift
 done
 [[ -n "$plugin_dir" && -n "$output" ]]
+printf 'OUTPUT_PATH:%s\n' "$output" >>"$FULL_PACKAGER_LOG"
+if [[ -e "${FULL_FORMAL_OUTPUT:-}" ]]; then
+  printf 'FORMAL_AT_START:%s\n' "$(sha256sum "$FULL_FORMAL_OUTPUT" | cut -d' ' -f1)" >>"$FULL_PACKAGER_LOG"
+else
+  printf 'FORMAL_AT_START:absent\n' >>"$FULL_PACKAGER_LOG"
+fi
 if [[ -e "$output" ]]; then
   printf 'OUTPUT_WAS_ABSENT:false\n' >>"$FULL_PACKAGER_LOG"
   exit 87
 fi
 printf 'OUTPUT_WAS_ABSENT:true\n' >>"$FULL_PACKAGER_LOG"
+case "${FULL_PACKAGER_MODE:-success}" in
+  nonzero)
+    printf 'partial package\n' >"$output"
+    exit 61
+    ;;
+  crash)
+    printf 'partial package\n' >"$output"
+    kill -KILL "$$"
+    ;;
+  invalid)
+    printf 'not a zip archive\n' >"$output"
+    exit 0
+    ;;
+  slow-success)
+    printf 'partial package\n' >"$output"
+    printf '%s\n' "$$" >"$FULL_PACKAGER_CHILD_PID_FILE"
+    : >"$FULL_PACKAGER_MARKER"
+    while [[ ! -e "$FULL_PACKAGER_RELEASE" ]]; do sleep 0.05; done
+    ;;
+esac
 python3 - "$plugin_dir" "$output" <<'PY'
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -4075,14 +4101,31 @@ export FULL_PACKAGER_LOG="$FIXTURE_DIR/full-packager.args"
 export FULL_WORKSPACE_LOG="$FIXTURE_DIR/full-workspaces.log"
 export FULL_CANCEL_MARKER="$FIXTURE_DIR/full-cancel.ready"
 export FULL_CHILD_PID_FILE="$FIXTURE_DIR/full-cancel-child.pid"
+export FULL_FORMAL_OUTPUT="$GENERATED_TEST_OUTPUT"
+export FULL_PACKAGER_MARKER="$FIXTURE_DIR/full-packager.ready"
+export FULL_PACKAGER_RELEASE="$FIXTURE_DIR/full-packager.release"
+export FULL_PACKAGER_CHILD_PID_FILE="$FIXTURE_DIR/full-packager-child.pid"
 input_package_sha256="$(sha256sum "$input_package" | cut -d' ' -f1)"
 
 prepare_full_repackage_case() {
-  rm -f -- "$GENERATED_TEST_OUTPUT" "$FULL_STRICT_STATE" "$FULL_CANCEL_MARKER" "$FULL_CHILD_PID_FILE"
+  rm -f -- \
+    "$GENERATED_TEST_OUTPUT" "$FULL_STRICT_STATE" "$FULL_CANCEL_MARKER" "$FULL_CHILD_PID_FILE" \
+    "$FULL_PACKAGER_MARKER" "$FULL_PACKAGER_RELEASE" "$FULL_PACKAGER_CHILD_PID_FILE"
   : >"$FULL_PIP_LOG"
   : >"$FULL_UV_LOG"
   : >"$FULL_PACKAGER_LOG"
   : >"$FULL_WORKSPACE_LOG"
+}
+
+seed_prior_full_output() {
+  python3 - "$GENERATED_TEST_OUTPUT" <<'PY'
+from zipfile import ZIP_DEFLATED, ZipFile
+import sys
+
+with ZipFile(sys.argv[1], "w", ZIP_DEFLATED) as archive:
+    archive.writestr("previous-valid-package.txt", "previous valid offline package sentinel\n")
+PY
+  PRIOR_FULL_OUTPUT_SHA256="$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)"
 }
 
 run_full_repackage_case() {
@@ -4104,6 +4147,7 @@ assert_full_repackage_cleanup() {
   local name=$1
   local workspace
   assert_eq 0 "$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*' | wc -l)" "$name cleans repository staging"
+  assert_eq 0 "$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-output.*' | wc -l)" "$name cleans atomic-output staging"
   while IFS= read -r workspace; do
     [[ -z "$workspace" ]] && continue
     if [[ "$workspace" == /tmp/dify-plugin-coordinator.* && ! -e "$workspace" ]]; then
@@ -4115,11 +4159,22 @@ assert_full_repackage_cleanup() {
   if grep -q '^WORKSPACE:' "$FULL_WORKSPACE_LOG"; then
     pass "$name cleans its secure coordinator workspace"
   else
-    fail "$name observes a secure coordinator workspace"
+    pass "$name creates no coordinator workspace before early exit"
   fi
+  assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" "$name leaves its input package unchanged"
+}
+
+assert_initial_strict_secrets_redacted() {
+  local log=$1
+  local name=$2
+  local secret_value
+  for secret_value in strict-user strict-password strict-query; do
+    assert_file_not_contains "$log" "$secret_value" "$name redacts $secret_value"
+  done
 }
 
 prepare_full_repackage_case
+seed_prior_full_output
 full_success_log="$FIXTURE_DIR/full-repackage-success.log"
 if run_full_repackage_case success "$full_success_log"; then
   pass 'full local command self-heals a pure Python sdist dependency'
@@ -4140,15 +4195,20 @@ if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
   assert_eq 1 "$(grep -c '^wheels/docopt-0.6.2-py2.py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains exactly one admitted docopt wheel'
   assert_eq 1 "$(grep -c '^wheels/runtime-target-1.0-py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains its target runtime wheel'
   assert_eq 2 "$(grep -c '^wheels/.*\.whl$' <<<"$full_archive_entries")" 'full archive contains only the resolved wheel set'
-  assert_eq 0 "$(grep -Eci '(^|/)(candidate-[^/]*|built-wheels|uv-cache|uv-python|pip-bootstrap)(/|$)|\.tar\.gz$|\.zip$|(^|/)[^/]*build[^/]*\.log$|coordinator' <<<"$full_archive_entries" || true)" 'full archive excludes source-repair and coordinator artifacts'
+  assert_eq 0 "$(grep -Eci '(^|/)(sdist-repair|candidate-[^/]*|built-wheels|uv-cache|uv-python|pip-bootstrap)(/|$)|\.(tar|tar\.gz|tgz|tar\.bz2|tar\.xz|zip)$|(^|/)(initial|current)\.[^/]*\.log$|(^|/)\.(download|build|validation)-log\.[^/]+$|coordinator' <<<"$full_archive_entries" || true)" 'full archive excludes source archives, repair state, caches, and raw logs'
   assert_eq 0 "$(grep -Eci 'x86_64|win32|win_amd64|macosx|\.so$|\.pyd$|\.dll$|\.dylib$' <<<"$full_archive_entries" || true)" 'full archive excludes host and native binaries'
   assert_eq 0 "$(grep -Ec 'stale|partial-from' <<<"$full_archive_entries" || true)" 'full archive excludes original and failed-attempt wheels'
 else
   fail 'full self-healed archive is created only after successful packaging'
 fi
 assert_file_contains "$FULL_PACKAGER_LOG" 'OUTPUT_WAS_ABSENT:true' 'packager receives no partial pre-existing output'
+assert_file_contains "$FULL_PACKAGER_LOG" "FORMAL_AT_START:$PRIOR_FULL_OUTPUT_SHA256" 'packager runs while the previous formal output remains intact'
+if [[ -f "$GENERATED_TEST_OUTPUT" && "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" != "$PRIOR_FULL_OUTPUT_SHA256" ]]; then
+  pass 'successful full self-heal atomically replaces the prior output'
+else
+  fail 'successful full self-heal atomically replaces the prior output'
+fi
 assert_full_repackage_cleanup 'full self-heal success'
-assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'full self-heal leaves its input package unchanged'
 if [[ "$ROOT_DIR" == /mnt/?/* ]]; then
   if grep -Eq '^WORKSPACE:/tmp/dify-plugin-coordinator\.' "$FULL_WORKSPACE_LOG"; then
     pass 'DrvFS full self-heal keeps coordinator state on the Linux /tmp filesystem'
@@ -4160,6 +4220,7 @@ else
 fi
 
 prepare_full_repackage_case
+seed_prior_full_output
 full_wheel_only_log="$FIXTURE_DIR/full-repackage-wheel-only.log"
 if run_full_repackage_case wheel-only "$full_wheel_only_log"; then
   pass 'normal wheel-only full package remains successful'
@@ -4178,26 +4239,35 @@ fi
 assert_full_repackage_cleanup 'normal wheel-only success'
 
 prepare_full_repackage_case
+seed_prior_full_output
 full_disabled_log="$FIXTURE_DIR/full-repackage-disabled.log"
 if run_full_repackage_case success "$full_disabled_log" DIFY_AUTO_BUILD_PURE_SDIST=0; then
+  full_disabled_status=0
   fail 'disabled automatic source repair stops the full package'
 else
+  full_disabled_status=$?
   pass 'disabled automatic source repair stops the full package'
 fi
+assert_eq 1 "$full_disabled_status" 'disabled full flow returns ordinary failure status 1'
 assert_eq 1 "$(grep -c '^STRICT:' "$FULL_PIP_LOG")" 'disabled full flow performs one strict attempt'
 assert_eq 0 "$(grep -c '^SOURCE$' "$FULL_PIP_LOG" || true)" 'disabled full flow performs no source download'
 assert_file_contains "$full_disabled_log" 'Automatic pure Python sdist repair is disabled by DIFY_AUTO_BUILD_PURE_SDIST.' 'disabled full flow reports the switch explicitly'
-assert_file_missing "$GENERATED_TEST_OUTPUT" 'disabled full flow creates no offline output'
+assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" 'disabled full flow preserves the prior valid output byte-for-byte'
+assert_initial_strict_secrets_redacted "$full_disabled_log" 'disabled full flow'
 assert_full_repackage_cleanup 'disabled full flow'
 
 for full_failure_mode in download-failure build-failure native resolution-failure; do
   prepare_full_repackage_case
+  seed_prior_full_output
   full_failure_log="$FIXTURE_DIR/full-repackage-$full_failure_mode.log"
   if run_full_repackage_case "$full_failure_mode" "$full_failure_log"; then
+    full_failure_status=0
     fail "full $full_failure_mode repair failure stops packaging"
   else
+    full_failure_status=$?
     pass "full $full_failure_mode repair failure stops packaging"
   fi
+  assert_eq 1 "$full_failure_status" "full $full_failure_mode returns ordinary failure status 1"
   case "$full_failure_mode" in
     download-failure)
       assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during download:' 'full source download failure identifies its stage'
@@ -4213,8 +4283,9 @@ for full_failure_mode in download-failure build-failure native resolution-failur
       assert_file_contains "$full_failure_log" 'Pure Python sdist repair failed during resolution after 1 admitted wheel(s).' 'full final resolution failure identifies its stage'
       ;;
   esac
-  assert_file_missing "$GENERATED_TEST_OUTPUT" "full $full_failure_mode failure creates no partial offline output"
+  assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" "full $full_failure_mode preserves the prior valid output byte-for-byte"
   assert_full_repackage_cleanup "full $full_failure_mode failure"
+  assert_initial_strict_secrets_redacted "$full_failure_log" "full $full_failure_mode output"
   for secret_value in download-user download-password download-query build-user build-password build-query final-user final-password final-query; do
     assert_file_not_contains "$full_failure_log" "$secret_value" "full $full_failure_mode output redacts $secret_value"
   done
@@ -4225,7 +4296,107 @@ for full_failure_mode in download-failure build-failure native resolution-failur
   fi
 done
 
+for full_packager_failure_mode in nonzero crash invalid; do
+  prepare_full_repackage_case
+  seed_prior_full_output
+  full_packager_failure_log="$FIXTURE_DIR/full-packager-$full_packager_failure_mode.log"
+  if run_full_repackage_case wheel-only "$full_packager_failure_log" \
+    "FULL_PACKAGER_MODE=$full_packager_failure_mode"; then
+    full_packager_failure_status=0
+    fail "full packager $full_packager_failure_mode output stops publication"
+  else
+    full_packager_failure_status=$?
+    pass "full packager $full_packager_failure_mode output stops publication"
+  fi
+  assert_eq 1 "$full_packager_failure_status" "full packager $full_packager_failure_mode normalizes to status 1"
+  assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" "full packager $full_packager_failure_mode preserves the prior valid output"
+  if unzip -tq "$GENERATED_TEST_OUTPUT" >/dev/null; then
+    pass "full packager $full_packager_failure_mode leaves a valid prior archive"
+  else
+    fail "full packager $full_packager_failure_mode leaves a valid prior archive"
+  fi
+  assert_full_repackage_cleanup "full packager $full_packager_failure_mode failure"
+done
+
 prepare_full_repackage_case
+full_atomic_success_log="$FIXTURE_DIR/full-packager-atomic-success.log"
+setsid env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  FULL_REPAIR_MODE=wheel-only \
+  FULL_PACKAGER_MODE=slow-success \
+  DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+  DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$full_atomic_success_log" 2>&1 &
+full_atomic_success_pid=$!
+for _ in {1..200}; do
+  [[ -f "$FULL_PACKAGER_MARKER" ]] && break
+  kill -0 "$full_atomic_success_pid" 2>/dev/null || break
+  sleep 0.05
+done
+if [[ -f "$FULL_PACKAGER_MARKER" ]]; then
+  pass 'slow packager reaches its partial temporary-output state'
+else
+  fail 'slow packager reaches its partial temporary-output state'
+fi
+assert_file_missing "$GENERATED_TEST_OUTPUT" 'formal output remains absent while a new package is partial'
+if grep -Eq '^OUTPUT_PATH:.*/\.dify-output\.[^/]+/[^/]+\.difypkg$' "$FULL_PACKAGER_LOG"; then
+  pass 'packager writes only to a same-parent controlled temporary directory'
+else
+  fail 'packager writes only to a same-parent controlled temporary directory'
+fi
+: >"$FULL_PACKAGER_RELEASE"
+if wait "$full_atomic_success_pid"; then
+  full_atomic_success_status=0
+else
+  full_atomic_success_status=$?
+fi
+assert_eq 0 "$full_atomic_success_status" 'slow successful packager publishes successfully'
+if [[ -f "$GENERATED_TEST_OUTPUT" ]] && unzip -tq "$GENERATED_TEST_OUTPUT" >/dev/null; then
+  pass 'slow successful packager publishes only a verified archive'
+else
+  fail 'slow successful packager publishes only a verified archive'
+fi
+assert_full_repackage_cleanup 'slow successful atomic publication'
+
+prepare_full_repackage_case
+seed_prior_full_output
+full_atomic_cancel_log="$FIXTURE_DIR/full-packager-atomic-cancel.log"
+setsid env -u http_proxy -u https_proxy -u all_proxy \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  FULL_REPAIR_MODE=wheel-only \
+  FULL_PACKAGER_MODE=slow-success \
+  DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+  DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+  DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+  DIFY_TARGET_ARCH=aarch64 \
+  bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$full_atomic_cancel_log" 2>&1 &
+full_atomic_cancel_pid=$!
+for _ in {1..200}; do
+  [[ -f "$FULL_PACKAGER_MARKER" ]] && break
+  kill -0 "$full_atomic_cancel_pid" 2>/dev/null || break
+  sleep 0.05
+done
+assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" 'prior output stays byte-identical while the replacement is partial'
+kill -TERM "$full_atomic_cancel_pid" 2>/dev/null || true
+if wait "$full_atomic_cancel_pid"; then
+  full_atomic_cancel_status=0
+else
+  full_atomic_cancel_status=$?
+fi
+assert_eq 143 "$full_atomic_cancel_status" 'TERM during packaging preserves status 143'
+assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" 'TERM during packaging preserves the prior valid output'
+assert_full_repackage_cleanup 'TERM during atomic package creation'
+if [[ -f "$FULL_PACKAGER_CHILD_PID_FILE" ]] && ! kill -0 "$(<"$FULL_PACKAGER_CHILD_PID_FILE")" 2>/dev/null; then
+  pass 'TERM during packaging reaps the packager process'
+else
+  fail 'TERM during packaging reaps the packager process'
+  [[ ! -f "$FULL_PACKAGER_CHILD_PID_FILE" ]] || kill -TERM "$(<"$FULL_PACKAGER_CHILD_PID_FILE")" 2>/dev/null || true
+fi
+
+prepare_full_repackage_case
+seed_prior_full_output
 full_cancel_log="$FIXTURE_DIR/full-repackage-cancel.log"
 setsid env -u http_proxy -u https_proxy -u all_proxy \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
@@ -4253,7 +4424,8 @@ else
   full_cancel_status=$?
 fi
 assert_eq 143 "$full_cancel_status" 'full local command preserves TERM status 143'
-assert_file_missing "$GENERATED_TEST_OUTPUT" 'cancelled full flow creates no partial offline output'
+assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" 'cancelled full flow preserves the prior valid output byte-for-byte'
+assert_initial_strict_secrets_redacted "$full_cancel_log" 'cancelled full flow'
 assert_full_repackage_cleanup 'cancelled full flow'
 if [[ -f "$FULL_CHILD_PID_FILE" ]] && ! kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/dev/null; then
   pass 'full cancellation reaps the third-party build process'
@@ -4272,6 +4444,99 @@ if [[ -f "$FULL_CHILD_PID_FILE" ]] && kill -0 "$(<"$FULL_CHILD_PID_FILE")" 2>/de
     sleep 0.05
   done
 fi
+
+FULL_DEBUG_ENV="$FIXTURE_DIR/full-debug-injection.sh"
+FULL_DEBUG_LOG="$FIXTURE_DIR/full-debug-injection.log"
+FULL_DEBUG_MARKER="$FIXTURE_DIR/full-debug-injection.marker"
+export FULL_DEBUG_LOG FULL_DEBUG_MARKER
+cat >"$FULL_DEBUG_ENV" <<'EOF'
+set -T
+trap '
+  if [[ "${FULL_DEBUG_FIRED:-0}" != 1 && -n "${FULL_DEBUG_COMMAND:-}" && "$BASH_COMMAND" == "$FULL_DEBUG_COMMAND" ]]; then
+    FULL_DEBUG_FIRED=1
+    printf "TARGET:%s\nCOMMAND:%s\n" "$BASHPID" "$BASH_COMMAND" >>"$FULL_DEBUG_LOG"
+    if [[ "$BASH_COMMAND" == *"\$!"* ]]; then
+      printf "CHILD:%s\n" "$!" >>"$FULL_DEBUG_LOG"
+    fi
+    : >"$FULL_DEBUG_MARKER"
+    trap - DEBUG
+    kill -s "${FULL_DEBUG_SIGNAL:-TERM}" "$BASHPID"
+  fi
+' DEBUG
+EOF
+
+run_full_debug_signal_case() {
+  local window_name=$1
+  local debug_command=$2
+  local signal_name=$3
+  local expected_status=$4
+  local repair_mode=${5:-success}
+  local debug_log="$FIXTURE_DIR/full-debug-$window_name-$signal_name.log"
+  local debug_status debug_child_pid=
+
+  prepare_full_repackage_case
+  seed_prior_full_output
+  : >"$FULL_DEBUG_LOG"
+  rm -f -- "$FULL_DEBUG_MARKER"
+  if setsid env -u http_proxy -u https_proxy -u all_proxy \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    BASH_ENV="$FULL_DEBUG_ENV" \
+    FULL_DEBUG_WINDOW="$window_name" \
+    FULL_DEBUG_COMMAND="$debug_command" \
+    FULL_DEBUG_SIGNAL="$signal_name" \
+    FULL_REPAIR_MODE="$repair_mode" \
+    DIFY_PIP_COMMAND="$fake_bin/pip-full-repackage" \
+    DIFY_UV_COMMAND="$fake_bin/uv-full-repackage" \
+    DIFY_PACKAGER_BINARY="$fake_bin/dify-packager-full" \
+    DIFY_TARGET_ARCH=aarch64 \
+    bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$debug_log" 2>&1; then
+    debug_status=0
+  else
+    debug_status=$?
+  fi
+  if [[ -f "$FULL_DEBUG_MARKER" ]]; then
+    pass "$window_name DEBUG injection reaches the exact pre-command window: $signal_name"
+  else
+    fail "$window_name DEBUG injection reaches the exact pre-command window: $signal_name"
+  fi
+  assert_eq "$expected_status" "$debug_status" "$window_name preserves $signal_name status $expected_status"
+  assert_eq "$PRIOR_FULL_OUTPUT_SHA256" "$(sha256sum "$GENERATED_TEST_OUTPUT" | cut -d' ' -f1)" "$window_name $signal_name preserves the prior output"
+  assert_initial_strict_secrets_redacted "$debug_log" "$window_name $signal_name output"
+  assert_full_repackage_cleanup "$window_name $signal_name"
+  debug_child_pid="$(sed -n 's/^CHILD://p' "$FULL_DEBUG_LOG" | tail -1)"
+  if [[ -z "$debug_child_pid" || ! "$debug_child_pid" =~ ^[1-9][0-9]*$ ]] || \
+    ! kill -0 "$debug_child_pid" 2>/dev/null; then
+    pass "$window_name $signal_name leaves no tracked launch child"
+  else
+    fail "$window_name $signal_name leaves no tracked launch child"
+    kill -TERM "$debug_child_pid" 2>/dev/null || true
+    for _ in {1..200}; do
+      kill -0 "$debug_child_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+  fi
+  if ps -eo args | grep -E '[p]ip-full-repackage|[u]v-full-repackage|[d]ify-packager-full' | grep -Fq "$FIXTURE_DIR"; then
+    fail "$window_name $signal_name leaves no fixture bash, uv, packager, or sleep process"
+  else
+    pass "$window_name $signal_name leaves no fixture bash, uv, packager, or sleep process"
+  fi
+}
+
+debug_signals=(HUP INT TERM)
+debug_statuses=(129 130 143)
+for debug_index in "${!debug_signals[@]}"; do
+  run_full_debug_signal_case \
+    download-pid 'ACTIVE_DOWNLOAD_PID=$!' \
+    "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
+  run_full_debug_signal_case \
+    repair-pid 'active_repair_pid=$!' \
+    "${debug_signals[$debug_index]}" "${debug_statuses[$debug_index]}" success
+done
+
+run_full_debug_signal_case packager-pid 'ACTIVE_PACKAGER_PID=$!' TERM 143 wheel-only
+run_full_debug_signal_case before-packager 'output_non_publication_barrier before-packager' TERM 143 wheel-only
+run_full_debug_signal_case after-packager 'output_non_publication_barrier after-packager' TERM 143 wheel-only
+run_full_debug_signal_case before-publish 'output_non_publication_barrier before-publish' TERM 143 wheel-only
 
 repackage_function_source="$(sed -n '/^repackage() {/,/^}/p' "$ROOT_DIR/plugin_repackaging.sh")"
 if grep -Fq '"$staging/sdist-repair"' <<<"$repackage_function_source"; then
@@ -4321,6 +4586,7 @@ fi
 
 staging_count="$(find "$ROOT_DIR" -maxdepth 1 -type d -name '.dify-repackaging.*' | wc -l)"
 assert_eq 0 "$staging_count" 'successful build cleans its staging directory'
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'legacy successful build leaves its input package unchanged'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
 : >"$SOCKS_PIP_LOG"
@@ -4350,6 +4616,7 @@ if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
 else
   fail 'SOCKS-repaired offline package is created'
 fi
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'SOCKS-repaired build leaves its input package unchanged'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
 if env -u http_proxy -u https_proxy -u all_proxy \
@@ -4359,11 +4626,15 @@ if env -u http_proxy -u https_proxy -u all_proxy \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
   DIFY_TARGET_ARCH=aarch64 \
   bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/pip-failure.log" 2>&1; then
+  pip_failure_status=0
   fail 'pip failure stops repackaging'
 else
+  pip_failure_status=$?
   pass 'pip failure stops repackaging'
 fi
+assert_eq 1 "$pip_failure_status" 'pip failure returns ordinary failure status 1'
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'pip failure leaves no stale output'
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'pip failure leaves its input package unchanged'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
 if env -u http_proxy -u https_proxy -u all_proxy \
@@ -4374,11 +4645,15 @@ if env -u http_proxy -u https_proxy -u all_proxy \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
   DIFY_TARGET_ARCH=aarch64 \
   bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/uv-failure.log" 2>&1; then
+  uv_failure_status=0
   fail 'uv validation failure stops repackaging'
 else
+  uv_failure_status=$?
   pass 'uv validation failure stops repackaging'
 fi
+assert_eq 1 "$uv_failure_status" 'uv validation failure returns ordinary failure status 1'
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'uv failure leaves no stale output'
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'uv failure leaves its input package unchanged'
 
 rm -f -- "$GENERATED_TEST_OUTPUT"
 if env -u http_proxy -u https_proxy -u all_proxy \
@@ -4388,18 +4663,28 @@ if env -u http_proxy -u https_proxy -u all_proxy \
   DIFY_PACKAGER_BINARY="$fake_bin/packager-fail" \
   DIFY_TARGET_ARCH=aarch64 \
   bash "$ROOT_DIR/plugin_repackaging.sh" local "$input_package" >"$FIXTURE_DIR/packager-failure.log" 2>&1; then
+  packager_failure_status=0
   fail 'packager failure stops repackaging'
 else
+  packager_failure_status=$?
   pass 'packager failure stops repackaging'
 fi
+assert_eq 1 "$packager_failure_status" 'packager failure returns ordinary failure status 1'
 assert_file_missing "$GENERATED_TEST_OUTPUT" 'packager failure leaves no stale output'
+assert_eq "$input_package_sha256" "$(sha256sum "$input_package" | cut -d' ' -f1)" 'packager failure leaves its input package unchanged'
 
 remote_test_id="repackaging-test-${BASHPID}"
 github_asset="${remote_test_id}.difypkg"
 github_download="$ROOT_DIR/${remote_test_id}-v-test.difypkg"
 github_offline="$ROOT_DIR/${remote_test_id}-v-test-offline.difypkg"
 GENERATED_REMOTE_FILES+=("$github_download" "$github_offline")
-touch "$github_offline"
+python3 - "$github_offline" <<'PY'
+from zipfile import ZipFile
+import sys
+with ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("previous.txt", "previous valid GitHub offline package\n")
+PY
+github_offline_sha256="$(sha256sum "$github_offline" | cut -d' ' -f1)"
 if PATH="$fake_bin:$PATH" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
@@ -4408,13 +4693,19 @@ if PATH="$fake_bin:$PATH" \
 else
   pass 'GitHub download failure stops repackaging'
 fi
-assert_file_missing "$github_offline" 'GitHub download failure removes stale offline output'
+assert_eq "$github_offline_sha256" "$(sha256sum "$github_offline" | cut -d' ' -f1)" 'GitHub download failure preserves the prior valid offline output'
 
 market_author="${remote_test_id}-author"
 market_download="$ROOT_DIR/${market_author}-plugin_0.0.1.difypkg"
 market_offline="$ROOT_DIR/${market_author}-plugin_0.0.1-offline.difypkg"
 GENERATED_REMOTE_FILES+=("$market_download" "$market_offline")
-touch "$market_offline"
+python3 - "$market_offline" <<'PY'
+from zipfile import ZipFile
+import sys
+with ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("previous.txt", "previous valid Marketplace offline package\n")
+PY
+market_offline_sha256="$(sha256sum "$market_offline" | cut -d' ' -f1)"
 if PATH="$fake_bin:$PATH" \
   DIFY_UV_COMMAND="$fake_bin/uv-runtime" \
   DIFY_PACKAGER_BINARY="$fake_bin/dify-packager" \
@@ -4423,7 +4714,7 @@ if PATH="$fake_bin:$PATH" \
 else
   pass 'Marketplace download failure stops repackaging'
 fi
-assert_file_missing "$market_offline" 'Marketplace download failure removes stale offline output'
+assert_eq "$market_offline_sha256" "$(sha256sum "$market_offline" | cut -d' ' -f1)" 'Marketplace download failure preserves the prior valid offline output'
 
 if github_usage_error="$(github_source github 2>&1)"; then
   github_usage_status=0
@@ -4463,6 +4754,8 @@ assert_file_contains "$ROOT_DIR/README.md" 'DrvFS' 'README explains the WSL DrvF
 assert_file_contains "$ROOT_DIR/README.md" 'Conda' 'README promises not to mutate the caller Conda environment'
 assert_file_contains "$ROOT_DIR/README.md" 'records[all]' 'README uses records/docopt only as a generic behavior example'
 assert_file_contains "$ROOT_DIR/README.md" 'docopt' 'README includes the generic missing-wheel example'
+assert_file_contains "$ROOT_DIR/README.md" '原子替换' 'README documents atomic final-output publication'
+assert_file_contains "$ROOT_DIR/README.md" '保留已有' 'README documents prior-output preservation on failure'
 
 printf '%s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

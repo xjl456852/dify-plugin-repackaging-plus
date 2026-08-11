@@ -12,7 +12,14 @@ TARGET_ARCH=
 PACKAGER_BINARY=
 ACTIVE_STAGING=
 ACTIVE_OUTPUT=
+ACTIVE_OUTPUT_TEMP_DIR=
+ACTIVE_OUTPUT_TEMP_FILE=
 ACTIVE_DOWNLOAD_PID=
+ACTIVE_PACKAGER_PID=
+RUNTIME_CHILD_STATE=idle
+RUNTIME_CHILD_KIND=
+RUNTIME_PENDING_SIGNAL=
+RUNTIME_PENDING_STATUS=
 BUILD_SUCCEEDED=false
 
 normalize_arch() {
@@ -2898,12 +2905,11 @@ except (OSError, ValueError):
 PY
 }
 
-cancel_managed_child_and_exit() {
+request_runtime_cancellation() {
   local signal_name=$1
   local exit_status=$2
-  local child_pid=${3:-}
+  local child_pid=
 
-  trap '' HUP INT TERM
   case "$signal_name:$exit_status" in
     HUP:129 | INT:130 | TERM:143)
       ;;
@@ -2911,11 +2917,108 @@ cancel_managed_child_and_exit() {
       exit 125
       ;;
   esac
-  if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]; then
-    kill -s "$signal_name" "$child_pid" 2>/dev/null || true
-    wait "$child_pid" 2>/dev/null || true
+  RUNTIME_PENDING_SIGNAL=$signal_name
+  RUNTIME_PENDING_STATUS=$exit_status
+  if [[ "${RUNTIME_CHILD_STATE:-idle}" == starting ]]; then
+    return 0
   fi
+  if [[ "${RUNTIME_CHILD_STATE:-idle}" == active ]]; then
+    case "${RUNTIME_CHILD_KIND:-}" in
+      download)
+        child_pid=${ACTIVE_DOWNLOAD_PID:-}
+        ;;
+      packager)
+        child_pid=${ACTIVE_PACKAGER_PID:-}
+        ;;
+      *)
+        exit 125
+        ;;
+    esac
+    trap '' HUP INT TERM
+    if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]; then
+      kill -s "$signal_name" "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+    fi
+    RUNTIME_CHILD_STATE=reaped
+    ACTIVE_DOWNLOAD_PID=
+    ACTIVE_PACKAGER_PID=
+  fi
+  trap '' HUP INT TERM
   exit "$exit_status"
+}
+
+activate_runtime_child() {
+  local child_kind=$1
+  local child_pid=$2
+  local pending_signal pending_status
+
+  [[ "${RUNTIME_CHILD_STATE:-}" == starting && "${RUNTIME_CHILD_KIND:-}" == "$child_kind" && \
+    "$child_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  RUNTIME_CHILD_STATE=active
+  if [[ -n "${RUNTIME_PENDING_SIGNAL:-}" ]]; then
+    pending_signal=$RUNTIME_PENDING_SIGNAL
+    pending_status=$RUNTIME_PENDING_STATUS
+    request_runtime_cancellation "$pending_signal" "$pending_status"
+  fi
+}
+
+mark_runtime_child_reaped() {
+  local child_kind=$1
+
+  [[ "${RUNTIME_CHILD_KIND:-}" == "$child_kind" ]] || return 1
+  RUNTIME_CHILD_STATE=reaped
+  case "$child_kind" in
+    download)
+      ACTIVE_DOWNLOAD_PID=
+      ;;
+    packager)
+      ACTIVE_PACKAGER_PID=
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+request_repair_cancellation() {
+  local signal_name=$1
+  local exit_status=$2
+
+  case "$signal_name:$exit_status" in
+    HUP:129 | INT:130 | TERM:143)
+      ;;
+    *)
+      exit 125
+      ;;
+  esac
+  repair_pending_signal=$signal_name
+  repair_pending_status=$exit_status
+  if [[ "${repair_child_state:-idle}" == starting ]]; then
+    return 0
+  fi
+  if [[ "${repair_child_state:-idle}" == active ]]; then
+    trap '' HUP INT TERM
+    if [[ "${active_repair_pid:-}" =~ ^[1-9][0-9]*$ ]]; then
+      kill -s "$signal_name" "$active_repair_pid" 2>/dev/null || true
+      wait "$active_repair_pid" 2>/dev/null || true
+    fi
+    repair_child_state=reaped
+    active_repair_pid=
+  fi
+  trap '' HUP INT TERM
+  exit "$exit_status"
+}
+
+activate_repair_child() {
+  local pending_signal pending_status
+
+  [[ "${repair_child_state:-}" == starting && "${active_repair_pid:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+  repair_child_state=active
+  if [[ -n "${repair_pending_signal:-}" ]]; then
+    pending_signal=$repair_pending_signal
+    pending_status=$repair_pending_status
+    request_repair_cancellation "$pending_signal" "$pending_status"
+  fi
 }
 
 download_wheels_impl() {
@@ -2931,6 +3034,7 @@ download_wheels_impl() {
   local attempt_log missing_record requirement canonical_name uv_command
   local socks_proxy_url= socks_site_dir= local_wheels_dir= repair_status
   local active_repair_pid=
+  local repair_child_state=idle repair_pending_signal= repair_pending_status=
   local repair_count=0
   local -a platform_names=()
   local -a pip_command=()
@@ -2948,9 +3052,9 @@ download_wheels_impl() {
   done < <(default_platforms "$target_arch")
   coordinator_workspace="$(mktemp -d -- /tmp/dify-plugin-coordinator.XXXXXXXX)" || return
   trap "cleanup_coordinator_workspace '$coordinator_workspace' || true" EXIT
-  trap 'cancel_managed_child_and_exit INT 130 "${active_repair_pid:-}"' INT
-  trap 'cancel_managed_child_and_exit TERM 143 "${active_repair_pid:-}"' TERM
-  trap 'cancel_managed_child_and_exit HUP 129 "${active_repair_pid:-}"' HUP
+  trap 'request_repair_cancellation INT 130' INT
+  trap 'request_repair_cancellation TERM 143' TERM
+  trap 'request_repair_cancellation HUP 129' HUP
   chmod 700 -- "$coordinator_workspace" || return
   validate_coordinator_workspace "$coordinator_workspace" || {
     printf 'failed to create a private coordinator workspace under /tmp\n' >&2
@@ -3036,15 +3140,18 @@ download_wheels_impl() {
     printf 'Pure Python sdist repair candidate: %s\n' "$requirement"
     printf 'Source build target: Python %s, ABI %s, architecture %s\n' \
       "$python_version" "$abi" "$target_arch"
+    repair_child_state=starting
     repair_one_pure_sdist_impl \
       pip_command "$uv_command" "$requirement" "$canonical_name" "$python_version" \
       "$repair_dir" "$socks_site_dir" "$repair_count" &
     active_repair_pid=$!
+    activate_repair_child || return
     if wait "$active_repair_pid"; then
       repair_status=0
     else
       repair_status=$?
     fi
+    repair_child_state=reaped
     active_repair_pid=
     if ((repair_status != 0)); then
       display_distinct_coordinator_logs "$initial_log" "$attempt_log" "$coordinator_workspace" || true
@@ -3084,8 +3191,9 @@ verify_requirements_offline() {
   local target_arch=$2
   local python_version=$3
   local uv_command=${DIFY_UV_COMMAND:-uv}
+  local verify_status
 
-  (
+  if (
     cd "$plugin_dir"
     "$uv_command" pip install \
       --dry-run \
@@ -3094,25 +3202,36 @@ verify_requirements_offline() {
       --python-platform "$(target_triple "$target_arch")" \
       --target .offline-verify \
       --requirement requirements.txt
-  )
+  ); then
+    verify_status=0
+  else
+    verify_status=$?
+  fi
   rm -rf -- "$plugin_dir/.offline-verify"
+  return "$verify_status"
 }
 
 verify_pyproject_offline() {
   local plugin_dir=$1
   local target_arch=$2
   local uv_command=${DIFY_UV_COMMAND:-uv}
+  local verify_status
 
   [[ -f "$plugin_dir/pyproject.toml" ]] || return 0
-  (
+  if (
     cd "$plugin_dir"
     "$uv_command" sync \
       --dry-run \
       --offline \
       --no-dev \
       --python-platform "$(target_triple "$target_arch")"
-  )
+  ); then
+    verify_status=0
+  else
+    verify_status=$?
+  fi
   rm -f -- "$plugin_dir/uv.lock"
+  return "$verify_status"
 }
 
 verify_output_archive() {
@@ -3122,17 +3241,17 @@ verify_output_archive() {
   local target_arch=$4
   local entries
 
-  unzip -tq "$output" >/dev/null
-  entries="$(unzip -Z1 "$output")"
+  unzip -tq "$output" >/dev/null || return 1
+  entries="$(unzip -Z1 "$output")" || return 1
 
-  grep -qx 'requirements.txt' <<<"$entries"
-  grep -qx 'uv.toml' <<<"$entries"
-  ! grep -Eq '(^|/)uv\.lock$' <<<"$entries"
-  [[ "$requires_wheel" != true ]] || grep -Eq '^wheels/.+\.whl$' <<<"$entries"
-  [[ "$requires_pyproject" != true ]] || grep -qx 'pyproject.toml' <<<"$entries"
+  grep -qx 'requirements.txt' <<<"$entries" || return 1
+  grep -qx 'uv.toml' <<<"$entries" || return 1
+  ! grep -Eq '(^|/)uv\.lock$' <<<"$entries" || return 1
+  [[ "$requires_wheel" != true ]] || grep -Eq '^wheels/.+\.whl$' <<<"$entries" || return 1
+  [[ "$requires_pyproject" != true ]] || grep -qx 'pyproject.toml' <<<"$entries" || return 1
 
   if [[ "$target_arch" == aarch64 ]]; then
-    ! grep -E '^wheels/.+x86_64.+\.whl$' <<<"$entries"
+    ! grep -E '^wheels/.+x86_64.+\.whl$' <<<"$entries" || return 1
   fi
 }
 
@@ -3151,21 +3270,177 @@ cleanup_active_staging() {
   esac
 }
 
+validate_output_parent_and_final() {
+  local output=$1
+
+  python3 -B - "$SCRIPT_DIR" "$output" <<'PY'
+import os
+import stat
+import sys
+
+
+parent, output = sys.argv[1:]
+try:
+    if (
+        not os.path.isabs(parent)
+        or os.path.normpath(parent) != parent
+        or os.path.dirname(output) != parent
+        or not os.path.basename(output).endswith("-offline.difypkg")
+    ):
+        raise ValueError
+    parent_record = os.lstat(parent)
+    if (
+        stat.S_ISLNK(parent_record.st_mode)
+        or not stat.S_ISDIR(parent_record.st_mode)
+        or parent_record.st_uid != os.geteuid()
+    ):
+        raise ValueError
+    if os.path.lexists(output):
+        output_record = os.lstat(output)
+        if (
+            stat.S_ISLNK(output_record.st_mode)
+            or not stat.S_ISREG(output_record.st_mode)
+            or output_record.st_uid != os.geteuid()
+        ):
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+prepare_atomic_output() {
+  local output=$1
+  local temp_dir
+
+  [[ -z "$ACTIVE_OUTPUT_TEMP_DIR" && -z "$ACTIVE_OUTPUT_TEMP_FILE" ]] || {
+    printf 'atomic output staging is already active\n' >&2
+    return 1
+  }
+  validate_output_parent_and_final "$output" || {
+    printf 'unsafe final output path: %s\n' "$output" >&2
+    return 1
+  }
+  temp_dir="$(mktemp -d -- "$SCRIPT_DIR/.dify-output.XXXXXXXX")" || return
+  if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
+import os
+import stat
+import sys
+
+
+parent, temp_dir = sys.argv[1:]
+try:
+    if (
+        os.path.dirname(temp_dir) != parent
+        or not os.path.basename(temp_dir).startswith(".dify-output.")
+    ):
+        raise ValueError
+    record = os.lstat(temp_dir)
+    if (
+        stat.S_ISLNK(record.st_mode)
+        or not stat.S_ISDIR(record.st_mode)
+        or record.st_uid != os.geteuid()
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  then
+    rmdir -- "$temp_dir" 2>/dev/null || true
+    return 1
+  fi
+  ACTIVE_OUTPUT_TEMP_DIR=$temp_dir
+  ACTIVE_OUTPUT_TEMP_FILE="$temp_dir/package.difypkg"
+}
+
+cleanup_active_output_temp() {
+  local temp_dir=${ACTIVE_OUTPUT_TEMP_DIR:-}
+
+  [[ -n "$temp_dir" ]] || return 0
+  if ! python3 -B - "$SCRIPT_DIR" "$temp_dir" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+
+parent, temp_dir = sys.argv[1:]
+try:
+    if (
+        os.path.dirname(temp_dir) != parent
+        or not os.path.basename(temp_dir).startswith(".dify-output.")
+    ):
+        raise ValueError
+    if os.path.lexists(temp_dir):
+        record = os.lstat(temp_dir)
+        if (
+            stat.S_ISLNK(record.st_mode)
+            or not stat.S_ISDIR(record.st_mode)
+            or record.st_uid != os.geteuid()
+        ):
+            raise ValueError
+        shutil.rmtree(temp_dir)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  then
+    printf 'refusing to clean unsafe atomic output staging: %s\n' "$temp_dir" >&2
+    return 1
+  fi
+  ACTIVE_OUTPUT_TEMP_DIR=
+  ACTIVE_OUTPUT_TEMP_FILE=
+}
+
+publish_output_archive() {
+  local temp_output=$1
+  local output=$2
+
+  python3 -B - "$SCRIPT_DIR" "$ACTIVE_OUTPUT_TEMP_DIR" "$temp_output" "$output" <<'PY'
+import os
+import stat
+import sys
+
+
+parent, temp_dir, temp_output, output = sys.argv[1:]
+try:
+    if (
+        os.path.dirname(temp_dir) != parent
+        or not os.path.basename(temp_dir).startswith(".dify-output.")
+        or temp_output != os.path.join(temp_dir, "package.difypkg")
+        or os.path.dirname(output) != parent
+        or not os.path.basename(output).endswith("-offline.difypkg")
+    ):
+        raise ValueError
+    for path, expected_type in ((parent, "directory"), (temp_dir, "directory"), (temp_output, "file")):
+        record = os.lstat(path)
+        if stat.S_ISLNK(record.st_mode) or record.st_uid != os.geteuid():
+            raise ValueError
+        if expected_type == "directory" and not stat.S_ISDIR(record.st_mode):
+            raise ValueError
+        if expected_type == "file" and not stat.S_ISREG(record.st_mode):
+            raise ValueError
+    if os.path.lexists(output):
+        output_record = os.lstat(output)
+        if (
+            stat.S_ISLNK(output_record.st_mode)
+            or not stat.S_ISREG(output_record.st_mode)
+            or output_record.st_uid != os.geteuid()
+        ):
+            raise ValueError
+    os.replace(temp_output, output)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+output_non_publication_barrier() {
+  :
+}
+
 cleanup_runtime() {
   local status=$?
 
+  cleanup_active_output_temp || status=$?
   cleanup_active_staging || status=$?
-  if [[ "$BUILD_SUCCEEDED" != true && -n "$ACTIVE_OUTPUT" ]]; then
-    case "$ACTIVE_OUTPUT" in
-      "$SCRIPT_DIR"/*-offline.difypkg)
-        rm -f -- "$ACTIVE_OUTPUT"
-        ;;
-      *)
-        printf 'refusing to clean unsafe output path: %s\n' "$ACTIVE_OUTPUT" >&2
-        status=1
-        ;;
-    esac
-  fi
   return "$status"
 }
 
@@ -3177,7 +3452,6 @@ register_output_for_package() {
   package_name="${package_filename%.*}"
   ACTIVE_OUTPUT="$SCRIPT_DIR/${package_name}-offline.difypkg"
   BUILD_SUCCEEDED=false
-  rm -f -- "$ACTIVE_OUTPUT"
 }
 
 initialize_runtime() {
@@ -3209,7 +3483,7 @@ initialize_runtime() {
 
 repackage() {
   local package_path=$1
-  local package_filename staging plugin_dir output python_version download_status
+  local package_filename staging plugin_dir output python_version download_status packager_status temp_output
   local requires_wheel=false
   local requires_pyproject=false
 
@@ -3233,6 +3507,10 @@ repackage() {
   fi
   [[ -f "$plugin_dir/pyproject.toml" ]] && requires_pyproject=true
 
+  RUNTIME_CHILD_KIND=download
+  RUNTIME_CHILD_STATE=starting
+  RUNTIME_PENDING_SIGNAL=
+  RUNTIME_PENDING_STATUS=
   DOWNLOAD_WHEELS_RUN_IN_PLACE=true download_wheels \
     "$staging/download-requirements.txt" \
     "$plugin_dir/wheels" \
@@ -3240,13 +3518,23 @@ repackage() {
     "$python_version" \
     "$staging/pip-bootstrap" &
   ACTIVE_DOWNLOAD_PID=$!
+  activate_runtime_child download "$ACTIVE_DOWNLOAD_PID" || return 1
   if wait "$ACTIVE_DOWNLOAD_PID"; then
     download_status=0
   else
     download_status=$?
   fi
-  ACTIVE_DOWNLOAD_PID=
-  ((download_status == 0)) || return "$download_status"
+  mark_runtime_child_reaped download || return 1
+  if ((download_status != 0)); then
+    case "$download_status" in
+      124 | 125 | 129 | 130 | 143)
+        return "$download_status"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  fi
   write_offline_metadata \
     "$plugin_dir" \
     "$staging/download-requirements.txt" \
@@ -3254,14 +3542,34 @@ repackage() {
     "$python_version"
 
   printf 'Verifying requirements.txt offline path ...\n'
-  verify_requirements_offline "$plugin_dir" "$TARGET_ARCH" "$python_version"
+  verify_requirements_offline "$plugin_dir" "$TARGET_ARCH" "$python_version" || return 1
   if [[ "$requires_pyproject" == true ]]; then
     printf 'Verifying pyproject.toml offline path ...\n'
-    verify_pyproject_offline "$plugin_dir" "$TARGET_ARCH"
+    verify_pyproject_offline "$plugin_dir" "$TARGET_ARCH" || return 1
   fi
 
-  "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$output"
-  verify_output_archive "$output" "$requires_wheel" "$requires_pyproject" "$TARGET_ARCH"
+  prepare_atomic_output "$output" || return 1
+  temp_output=$ACTIVE_OUTPUT_TEMP_FILE
+  output_non_publication_barrier before-packager
+  RUNTIME_CHILD_KIND=packager
+  RUNTIME_CHILD_STATE=starting
+  RUNTIME_PENDING_SIGNAL=
+  RUNTIME_PENDING_STATUS=
+  "$PACKAGER_BINARY" plugin package "$plugin_dir" -o "$temp_output" &
+  ACTIVE_PACKAGER_PID=$!
+  activate_runtime_child packager "$ACTIVE_PACKAGER_PID" || return 1
+  if wait "$ACTIVE_PACKAGER_PID"; then
+    packager_status=0
+  else
+    packager_status=$?
+  fi
+  mark_runtime_child_reaped packager || return 1
+  ((packager_status == 0)) || return 1
+  output_non_publication_barrier after-packager
+  verify_output_archive "$temp_output" "$requires_wheel" "$requires_pyproject" "$TARGET_ARCH" || return 1
+  output_non_publication_barrier before-publish
+  publish_output_archive "$temp_output" "$output" || return 1
+  cleanup_active_output_temp || return 1
 
   BUILD_SUCCEEDED=true
   cleanup_active_staging
@@ -3332,9 +3640,9 @@ github_source() {
 main() {
   initialize_runtime
   trap cleanup_runtime EXIT
-  trap 'cancel_managed_child_and_exit HUP 129 "${ACTIVE_DOWNLOAD_PID:-}"' HUP
-  trap 'cancel_managed_child_and_exit INT 130 "${ACTIVE_DOWNLOAD_PID:-}"' INT
-  trap 'cancel_managed_child_and_exit TERM 143 "${ACTIVE_DOWNLOAD_PID:-}"' TERM
+  trap 'request_runtime_cancellation HUP 129' HUP
+  trap 'request_runtime_cancellation INT 130' INT
+  trap 'request_runtime_cancellation TERM 143' TERM
 
   case "${1:-}" in
     local)
