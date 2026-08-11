@@ -1,0 +1,32 @@
+tests/test_repackaging.sh
+  s_c1a60985b94e3d::t_0dcdd903ff4e22 2771,3153,3172
+  s_c1a60985b94e3d::t_f2e231a972c9bb 3789,3873-3874,3894-4236,4238-4244,4246-4261,4274-4286
+  s_c1a60985b94e3d::t_56c78d37b54626 3204
+  s_c1a60985b94e3d::t_cbe673f6118f88 4237
+  s_c1a60985b94e3d::t_21559a3e660b63 4245,4262-4273
+  s_c1a60985b94e3d::t_4a87f37400027f 4456-4466
+  s_c1a60985b94e3d::t_629fad9ac558d4 4287
+plugin_repackaging.sh
+  s_c1a60985b94e3d::t_44021c6c5564e8 2950
+  s_c1a60985b94e3d::t_0dcdd903ff4e22 2326,2380-2383,2921,3039,3061-3062
+  s_c1a60985b94e3d::t_56c78d37b54626 3063-3069,3236
+  s_c1a60985b94e3d::t_cb8f8b20b820fb 15,2901-2920,2933,2951-2953,3041-3043,3048,3212,3241-3249,3335-3337
+README.md
+  s_c1a60985b94e3d::t_25cd0928016d05 19,136-160,183-185,192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "3a6e53f08bac1d6f5510911ff9d4aa451157867c",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
