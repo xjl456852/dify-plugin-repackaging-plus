@@ -904,13 +904,18 @@ run_bounded_command_log() {
 
   "$@" 2>&1 | task3_python -B /dev/fd/3 "$output_log" 3<<'PY'
 import os
+import stat
 import sys
 
 
 MAX_RAW_LOG_BYTES = 1024 * 1024
 TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
 path = sys.argv[1]
-descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+descriptor = os.open(
+    path,
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
 written = 0
 truncated = False
 
@@ -922,6 +927,8 @@ def write_all(contents):
 
 
 try:
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise OSError("diagnostic log is not a regular file")
     os.fchmod(descriptor, 0o600)
     while True:
         chunk = sys.stdin.buffer.read(64 * 1024)
@@ -942,6 +949,308 @@ PY
   pipeline_status=("${PIPESTATUS[@]}")
   ((${pipeline_status[1]:-1} == 0)) || return "${pipeline_status[1]:-1}"
   return "${pipeline_status[0]:-1}"
+}
+
+run_supervised_command_log() {
+  local output_log=$1
+  local timeout_seconds=$2
+  shift 2
+
+  task3_python -B /dev/fd/3 "$output_log" "$timeout_seconds" "$@" 3<<'PY'
+import ctypes
+import os
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+MAX_RAW_LOG_BYTES = 1024 * 1024
+TRUNCATION_MARKER = b"\n[raw diagnostic output truncated]\n"
+SUPERVISOR_ERROR_MARKER = b"\n[build process supervision failed]\n"
+PR_SET_CHILD_SUBREAPER = 36
+TERM_GRACE_SECONDS = 0.25
+KILL_AFTER_SECONDS = 2.0
+
+log_path = sys.argv[1]
+timeout_seconds = int(sys.argv[2])
+command = sys.argv[3:]
+if not command or timeout_seconds < 1:
+    raise SystemExit(125)
+
+log_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+log_descriptor = os.open(log_path, log_flags, 0o600)
+written = 0
+truncated = False
+pipe_eof = False
+process = None
+pipe_descriptor = None
+requested_signal = None
+
+
+def write_all(contents):
+    position = 0
+    while position < len(contents):
+        position += os.write(log_descriptor, contents[position:])
+
+
+def retain_output(contents):
+    global truncated, written
+    remaining = MAX_RAW_LOG_BYTES - written
+    if remaining > 0:
+        retained = contents[:remaining]
+        write_all(retained)
+        written += len(retained)
+    if len(contents) > max(remaining, 0):
+        truncated = True
+
+
+def drain_output(wait_seconds=0.0):
+    global pipe_eof
+    if pipe_descriptor is None or pipe_eof:
+        return
+    try:
+        readable, _, _ = select.select([pipe_descriptor], [], [], max(wait_seconds, 0.0))
+    except InterruptedError:
+        return
+    if not readable:
+        return
+    while True:
+        try:
+            contents = os.read(pipe_descriptor, 64 * 1024)
+        except BlockingIOError:
+            return
+        except InterruptedError:
+            continue
+        if not contents:
+            pipe_eof = True
+            return
+        retain_output(contents)
+
+
+def process_parents():
+    parents = {}
+    try:
+        entries = os.scandir("/proc")
+    except OSError as error:
+        raise RuntimeError("/proc is unavailable") from error
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            try:
+                process_id = int(entry.name)
+                with open(f"/proc/{entry.name}/status", "r", encoding="ascii", errors="strict") as status_file:
+                    parent_id = None
+                    for line in status_file:
+                        if line.startswith("PPid:\t"):
+                            parent_id = int(line.split()[1])
+                            break
+                if parent_id is not None:
+                    parents[process_id] = parent_id
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, UnicodeError, ValueError) as error:
+                # A vanished process is harmless; every other read failure is fail-closed.
+                raise RuntimeError("cannot inspect process descendants") from error
+    return parents
+
+
+def descendants():
+    parents = process_parents()
+    found = set()
+    frontier = {os.getpid()}
+    while frontier:
+        next_frontier = {
+            process_id
+            for process_id, parent_id in parents.items()
+            if parent_id in frontier and process_id not in found
+        }
+        found.update(next_frontier)
+        frontier = next_frontier
+    found.discard(os.getpid())
+    return found
+
+
+def signal_processes(process_ids, selected_signal):
+    for process_id in process_ids:
+        try:
+            os.kill(process_id, selected_signal)
+        except ProcessLookupError:
+            continue
+        except PermissionError as error:
+            raise RuntimeError("cannot signal build descendant") from error
+
+
+def signal_original_group(selected_signal, process_ids):
+    if process is None:
+        return
+    group_is_owned = process.poll() is None
+    if not group_is_owned:
+        for process_id in process_ids:
+            try:
+                if os.getpgid(process_id) == process.pid:
+                    group_is_owned = True
+                    break
+            except ProcessLookupError:
+                continue
+            except PermissionError as error:
+                raise RuntimeError("cannot inspect build process group") from error
+    if not group_is_owned:
+        return
+    try:
+        os.killpg(process.pid, selected_signal)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise RuntimeError("cannot signal build process group") from error
+
+
+def reap_children():
+    if process is not None:
+        process.poll()
+    while True:
+        try:
+            child_id, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        if child_id == 0:
+            return
+
+
+def request_shutdown(signal_number, _frame):
+    global requested_signal
+    requested_signal = signal_number
+
+
+def stop_and_reap_descendants(cleanup_deadline):
+    targets = descendants()
+    if process is not None and process.poll() is None:
+        targets.add(process.pid)
+    signal_original_group(signal.SIGTERM, targets)
+    signal_processes(targets, signal.SIGTERM)
+    term_deadline = min(cleanup_deadline, time.monotonic() + TERM_GRACE_SECONDS)
+    while time.monotonic() < term_deadline:
+        drain_output(0.02)
+        reap_children()
+        current = descendants()
+        if process is not None and process.poll() is None:
+            current.add(process.pid)
+        if not current:
+            break
+        time.sleep(0.01)
+
+    empty_scans = 0
+    while time.monotonic() < cleanup_deadline:
+        current = descendants()
+        if process is not None and process.poll() is None:
+            current.add(process.pid)
+        if current:
+            empty_scans = 0
+            signal_original_group(signal.SIGKILL, current)
+            signal_processes(current, signal.SIGKILL)
+        else:
+            reap_children()
+            current = descendants()
+            if process is not None and process.poll() is None:
+                current.add(process.pid)
+            if current:
+                empty_scans = 0
+            else:
+                empty_scans += 1
+                if empty_scans >= 3:
+                    break
+        drain_output(0.02)
+        time.sleep(0.01)
+    else:
+        return False
+
+    while not pipe_eof and time.monotonic() < cleanup_deadline:
+        drain_output(0.02)
+        reap_children()
+        current = descendants()
+        if current:
+            signal_processes(current, signal.SIGKILL)
+            empty_scans = 0
+        time.sleep(0.01)
+    reap_children()
+    return pipe_eof and not descendants() and (process is None or process.poll() is not None)
+
+
+result = 125
+try:
+    mode = os.fstat(log_descriptor).st_mode
+    if not stat.S_ISREG(mode):
+        raise RuntimeError("build log is not regular")
+    os.fchmod(log_descriptor, 0o600)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if not os.path.isdir("/proc/self"):
+        raise RuntimeError("Linux /proc is required")
+    for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(handled_signal, request_shutdown)
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+    pipe_descriptor = process.stdout.fileno()
+    os.set_blocking(pipe_descriptor, False)
+    command_deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    main_status = None
+    while True:
+        drain_output(0.05)
+        main_status = process.poll()
+        if main_status is not None:
+            break
+        if requested_signal is not None:
+            break
+        if time.monotonic() >= command_deadline:
+            timed_out = True
+            break
+
+    cleanup_deadline = time.monotonic() + KILL_AFTER_SECONDS
+    cleanup_ok = stop_and_reap_descendants(cleanup_deadline)
+    if not cleanup_ok:
+        retain_output(SUPERVISOR_ERROR_MARKER)
+        result = 125
+    elif requested_signal is not None:
+        result = 128 + requested_signal
+    elif timed_out:
+        result = 124
+    elif main_status is None:
+        result = 125
+    elif main_status < 0:
+        result = 128 + (-main_status)
+    else:
+        result = main_status
+except BaseException:
+    retain_output(SUPERVISOR_ERROR_MARKER)
+    if process is not None:
+        try:
+            stop_and_reap_descendants(time.monotonic() + KILL_AFTER_SECONDS)
+        except BaseException:
+            pass
+    result = 125
+finally:
+    if truncated:
+        write_all(TRUNCATION_MARKER)
+    if process is not None and process.stdout is not None:
+        process.stdout.close()
+    os.close(log_descriptor)
+raise SystemExit(result)
+PY
 }
 
 build_sanitized_environment_args() {
@@ -1006,7 +1315,9 @@ run_pip_with_socks_retry() {
   local pip_status retry_status
   local truststore_error="TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'"
 
-  : >"$pip_output_log"
+  if [[ "$bounded_capture" != true ]]; then
+    : >"$pip_output_log"
+  fi
   if run_selected_pip_attempt \
     "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
     false "$clean_env_args_name" "$bounded_capture"; then
@@ -1024,7 +1335,9 @@ run_pip_with_socks_retry() {
 
   printf '%s\n' \
     'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
-  : >"$pip_output_log"
+  if [[ "$bounded_capture" != true ]]; then
+    : >"$pip_output_log"
+  fi
   if run_selected_pip_attempt \
     "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
     true "$clean_env_args_name" "$bounded_capture"; then
@@ -1096,10 +1409,27 @@ try:
     if parsed.query or parsed.fragment:
         raise ValueError
     host = parsed.hostname
+    if (
+        re.fullmatch(r"[A-Za-z0-9._:-]+", host) is None
+        or any(character in host for character in "\"'\\")
+    ):
+        raise ValueError
+    port = parsed.port
+    if parsed.path and not parsed.path.startswith("/"):
+        raise ValueError
+    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
+        raise ValueError
+    decoded_path = unquote(parsed.path, errors="strict")
+    if (
+        any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
+        or any(character.isspace() or character in "\"'\\" for character in decoded_path)
+        or re.fullmatch(r"[/A-Za-z0-9._~!$&()*+,;=:@%+-]*", parsed.path) is None
+    ):
+        raise ValueError
     if ":" in host:
         host = f"[{host}]"
-    if parsed.port is not None:
-        host = f"{host}:{parsed.port}"
+    if port is not None:
+        host = f"{host}:{port}"
     if parsed.username is not None or parsed.password is not None:
         if parsed.username is None or parsed.password is None:
             raise ValueError
@@ -1108,7 +1438,7 @@ try:
             raise ValueError
         username = unquote(parsed.username, errors="strict")
         password = unquote(parsed.password, errors="strict")
-        safe_token = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:%@/-]+$")
+        safe_token = re.compile(r"[A-Za-z0-9._~!$&()*+,;=:%@/-]+$")
         if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
             raise ValueError
     print(urlunsplit((parsed.scheme.lower(), host, parsed.path, "", "")))
@@ -1131,22 +1461,155 @@ from urllib.parse import unquote, urlsplit
 
 raw_url = sys.stdin.read()
 auth_home = Path(sys.argv[1])
-parsed = urlsplit(raw_url)
-if parsed.username is None and parsed.password is None:
-    raise SystemExit(0)
-username = unquote(parsed.username, errors="strict")
-password = unquote(parsed.password, errors="strict")
-safe_token = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:%@/-]+$")
-if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
-    raise SystemExit(1)
-netrc_path = auth_home / ".netrc"
-descriptor = os.open(netrc_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 try:
-    contents = f"machine {parsed.hostname} login {username} password {password}\n".encode("utf-8")
-    os.write(descriptor, contents)
-    os.fchmod(descriptor, 0o600)
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw_url):
+        raise ValueError
+    parsed = urlsplit(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError
+    if parsed.query or parsed.fragment:
+        raise ValueError
+    host = parsed.hostname
+    if (
+        re.fullmatch(r"[A-Za-z0-9._:-]+", host) is None
+        or any(character in host for character in "\"'\\")
+    ):
+        raise ValueError
+    parsed.port
+    if parsed.path and not parsed.path.startswith("/"):
+        raise ValueError
+    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
+        raise ValueError
+    decoded_path = unquote(parsed.path, errors="strict")
+    if (
+        any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
+        or any(character.isspace() or character in "\"'\\" for character in decoded_path)
+        or re.fullmatch(r"[/A-Za-z0-9._~!$&()*+,;=:@%+-]*", parsed.path) is None
+    ):
+        raise ValueError
+    if parsed.username is None and parsed.password is None:
+        raise SystemExit(0)
+    if parsed.username is None or parsed.password is None:
+        raise ValueError
+    encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
+    if re.search(r"%(?![0-9A-Fa-f]{2})", encoded_userinfo):
+        raise ValueError
+    username = unquote(parsed.username, errors="strict")
+    password = unquote(parsed.password, errors="strict")
+    safe_token = re.compile(r"[A-Za-z0-9._~!$&()*+,;=:%@/-]+$")
+    if safe_token.fullmatch(username) is None or safe_token.fullmatch(password) is None:
+        raise ValueError
+    netrc_path = auth_home / ".netrc"
+    descriptor = os.open(
+        netrc_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        contents = f"machine {host} login {username} password {password}\n".encode("utf-8")
+        position = 0
+        while position < len(contents):
+            position += os.write(descriptor, contents[position:])
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+except (OSError, TypeError, UnicodeError, ValueError):
+    print("unsafe package index authentication configuration", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+remove_private_index_auth() {
+  local auth_home=$1
+
+  task3_python -B - "$auth_home" <<'PY'
+import errno
+import os
+import re
+import stat
+import sys
+
+
+auth_home = sys.argv[1]
+candidate_dir = os.path.dirname(auth_home)
+repair_dir = os.path.dirname(candidate_dir)
+if (
+    not os.path.isabs(auth_home)
+    or os.path.normpath(auth_home) != auth_home
+    or os.path.basename(auth_home) != "auth-home"
+    or re.fullmatch(r"candidate-[1-9][0-9]*", os.path.basename(candidate_dir)) is None
+    or os.path.basename(repair_dir) != "sdist-repair"
+):
+    raise SystemExit(1)
+try:
+    home_mode = os.lstat(auth_home).st_mode
+except FileNotFoundError:
+    raise SystemExit(0)
+if stat.S_ISLNK(home_mode) or not stat.S_ISDIR(home_mode):
+    raise SystemExit(1)
+netrc_path = os.path.join(auth_home, ".netrc")
+try:
+    netrc_mode = os.lstat(netrc_path).st_mode
+except FileNotFoundError:
+    pass
+else:
+    if stat.S_ISLNK(netrc_mode) or not stat.S_ISREG(netrc_mode):
+        raise SystemExit(1)
+    os.unlink(netrc_path)
+try:
+    os.rmdir(auth_home)
+except OSError as error:
+    if error.errno != errno.ENOTEMPTY:  # Leaves only a credential-free private HOME.
+        raise
+PY
+}
+
+safe_fchmod_regular_file() {
+  local path=$1
+  local requested_mode=$2
+
+  task3_python -B - "$path" "$requested_mode" <<'PY'
+import os
+import stat
+import sys
+
+
+path, raw_mode = sys.argv[1:]
+if raw_mode not in {"400", "600"}:
+    raise SystemExit(1)
+requested_mode = int(raw_mode, 8)
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError("not a regular file")
+    identity = (before.st_dev, before.st_ino)
+    os.fchmod(descriptor, requested_mode)
+    after = os.fstat(descriptor)
+    current = os.lstat(path)
+    if (
+        (after.st_dev, after.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+        or not stat.S_ISREG(current.st_mode)
+        or stat.S_IMODE(after.st_mode) != requested_mode
+        or stat.S_IMODE(current.st_mode) != requested_mode
+    ):
+        raise OSError("file identity changed during mode update")
 finally:
     os.close(descriptor)
+PY
+}
+
+validate_private_stage_file() {
+  task3_python -B - "$1" <<'PY'
+import os
+import stat
+import sys
+
+
+mode = os.lstat(sys.argv[1]).st_mode
+if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+    raise SystemExit(1)
 PY
 }
 
@@ -1178,10 +1641,6 @@ validate_sdist_repair_identifiers() {
   }
   [[ -n "$uv_command" ]] && command -v "$uv_command" >/dev/null 2>&1 || {
     printf 'uv command not found for pure Python sdist repair\n' >&2
-    return 1
-  }
-  command -v timeout >/dev/null 2>&1 || {
-    printf 'coreutils timeout is required for pure Python sdist repair\n' >&2
     return 1
   }
   build_timeout=${DIFY_SDIST_BUILD_TIMEOUT_SECONDS:-600}
@@ -1426,15 +1885,16 @@ snapshot_built_wheel() {
   local snapshot_path_result_name=$4
   local -n snapshot_dir_result=$snapshot_dir_result_name
   local -n snapshot_path_result=$snapshot_path_result_name
-  local wheel_basename original_path
+  local snapshot_record
 
-  wheel_basename="$(task3_python -B - "$wheel_dir" <<'PY'
+  snapshot_record="$(task3_python -B - "$wheel_dir" "$candidate_dir" <<'PY'
 import os
 import stat
 import sys
+import tempfile
 
 
-directory = sys.argv[1]
+directory, candidate_dir = sys.argv[1:]
 entries = []
 with os.scandir(directory) as iterator:
     for entry in iterator:
@@ -1453,23 +1913,57 @@ if (
 mode = entry.stat(follow_symlinks=False).st_mode
 if not stat.S_ISREG(mode):
     raise SystemExit(1)
-print(entry.name)
+source_path = os.path.join(directory, entry.name)
+snapshot_dir = tempfile.mkdtemp(prefix=".admission.", dir=candidate_dir)
+snapshot_path = os.path.join(snapshot_dir, entry.name)
+descriptor = None
+try:
+    if stat.S_IMODE(os.lstat(snapshot_dir).st_mode) != 0o700:
+        raise OSError("snapshot directory is not private")
+    descriptor = os.open(source_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError("wheel output is not regular")
+    identity = (before.st_dev, before.st_ino)
+    os.rename(source_path, snapshot_path)
+    moved = os.lstat(snapshot_path)
+    if (
+        (moved.st_dev, moved.st_ino) != identity
+        or not stat.S_ISREG(moved.st_mode)
+        or os.path.lexists(source_path)
+    ):
+        raise OSError("wheel output identity changed during snapshot")
+    os.fchmod(descriptor, 0o400)
+    hardened = os.fstat(descriptor)
+    current = os.lstat(snapshot_path)
+    if (
+        (hardened.st_dev, hardened.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+        or stat.S_IMODE(hardened.st_mode) != 0o400
+        or stat.S_IMODE(current.st_mode) != 0o400
+    ):
+        raise OSError("wheel snapshot mode or identity changed")
+    print(f"{snapshot_dir}\t{snapshot_path}")
+except BaseException:
+    try:
+        if os.path.lexists(snapshot_path):
+            os.unlink(snapshot_path)
+        os.rmdir(snapshot_dir)
+    except OSError:
+        pass
+    raise
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
 PY
 )" || return
-  [[ -n "$wheel_basename" && "$wheel_basename" != */* ]] || return 1
-  snapshot_dir_result="$(mktemp -d "$candidate_dir/.admission.XXXXXXXX")" || return
-  chmod 700 -- "$snapshot_dir_result" || return
-  original_path="$wheel_dir/$wheel_basename"
-  snapshot_path_result="$snapshot_dir_result/$wheel_basename"
-  if ! mv -- "$original_path" "$snapshot_path_result"; then
-    rmdir -- "$snapshot_dir_result" 2>/dev/null || true
-    return 1
-  fi
-  if [[ ! -f "$snapshot_path_result" || -L "$snapshot_path_result" ]] || \
-    ! chmod 400 -- "$snapshot_path_result" || ! chmod 500 -- "$snapshot_dir_result"; then
-    cleanup_admission_snapshot "$snapshot_dir_result" "$snapshot_path_result" || true
-    return 1
-  fi
+  [[ "$snapshot_record" == *$'\t'* && "$snapshot_record" != *$'\n'* && "$snapshot_record" != *$'\r'* ]] || return 1
+  IFS=$'\t' read -r snapshot_dir_result snapshot_path_result <<<"$snapshot_record"
+  [[ -n "$snapshot_dir_result" && -n "$snapshot_path_result" && \
+    "$(dirname -- "$snapshot_path_result")" == "$snapshot_dir_result" && \
+    "$(dirname -- "$snapshot_dir_result")" == "$candidate_dir" && \
+    "$(basename -- "$snapshot_dir_result")" == .admission.* && \
+    -f "$snapshot_path_result" && ! -L "$snapshot_path_result" ]] || return 1
 }
 
 cleanup_admission_snapshot() {
@@ -1479,9 +1973,7 @@ cleanup_admission_snapshot() {
   [[ -n "$snapshot_dir" && -n "$snapshot_path" && \
     "$(dirname -- "$snapshot_path")" == "$snapshot_dir" && \
     "$(basename -- "$snapshot_dir")" == .admission.* ]] || return 1
-  chmod 700 -- "$snapshot_dir" 2>/dev/null || true
   if [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]]; then
-    chmod 600 -- "$snapshot_path" 2>/dev/null || true
     rm -f -- "$snapshot_path"
   fi
   rmdir -- "$snapshot_dir" 2>/dev/null || true
@@ -1493,7 +1985,6 @@ remove_private_stage_log() {
 
   [[ -n "$log_path" && "$(dirname -- "$log_path")" == "$candidate_dir" ]] || return 1
   if [[ -f "$log_path" && ! -L "$log_path" ]]; then
-    chmod 600 -- "$log_path" 2>/dev/null || true
     rm -f -- "$log_path"
   fi
 }
@@ -1510,10 +2001,9 @@ admit_validated_snapshot() {
   target="$built_wheels_dir/$basename"
   [[ ! -e "$target" && ! -L "$target" ]] || return 1
   [[ "$(distribution_file_signature "$snapshot_path")" == "$expected_signature" ]] || return 1
-  chmod 400 -- "$snapshot_path" || return
+  safe_fchmod_regular_file "$snapshot_path" 400 || return
   snapshot_dir="$(dirname -- "$snapshot_path")"
   [[ "$(basename -- "$snapshot_dir")" == .admission.* ]] || return 1
-  chmod 700 -- "$snapshot_dir" || return
   if ! mv -n -- "$snapshot_path" "$target"; then
     return 1
   fi
@@ -1526,18 +2016,26 @@ admit_validated_snapshot() {
     [[ -f "$target" && ! -L "$target" ]] && rm -f -- "$target"
     return 1
   fi
-  chmod 400 -- "$target" || return
+  task3_python -B - "$target" <<'PY'
+import os
+import stat
+import sys
+
+
+mode = os.lstat(sys.argv[1]).st_mode
+if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o400:
+    raise SystemExit(1)
+PY
 }
 
 ensure_private_repair_directory() {
   local directory=$1
 
   if [[ -e "$directory" || -L "$directory" ]]; then
-    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%a' "$directory")" == 700 ]] || return 1
   else
     mkdir -m 700 -- "$directory" || return
   fi
-  chmod 700 -- "$directory" || return
   [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%a' "$directory")" == 700 ]]
 }
 
@@ -1558,6 +2056,20 @@ for path in sys.argv[1:]:
 PY
 }
 
+cleanup_sdist_repair_state() {
+  local original_status=$?
+
+  trap - EXIT HUP INT TERM
+  if [[ -n "${REPAIR_AUTH_HOME_TO_CLEAN:-}" ]]; then
+    remove_private_index_auth "$REPAIR_AUTH_HOME_TO_CLEAN" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${REPAIR_LOCK_TO_RELEASE:-}" && -n "${REPAIR_DIR_FOR_CLEANUP:-}" && \
+    "$REPAIR_LOCK_TO_RELEASE" == "$REPAIR_DIR_FOR_CLEANUP/.repair-lock" ]]; then
+    rmdir -- "$REPAIR_LOCK_TO_RELEASE" 2>/dev/null || true
+  fi
+  return "$original_status"
+}
+
 repair_one_pure_sdist_locked() {
   local pip_command_name=$1
   local uv_command=$2
@@ -1571,7 +2083,7 @@ repair_one_pure_sdist_locked() {
   local candidate_dir source_dir wheel_dir built_wheels_dir uv_cache_dir uv_python_dir auth_home
   local download_log= build_log= sdist_error= wheel_error=
   local sdist_output wheel_output sdist_path metadata_name metadata_version wheel_path wheel_name wheel_version
-  local snapshot_dir= before_signature after_signature build_timeout
+  local snapshot_dir= before_signature after_signature build_timeout build_status
   local -a clean_env_args=()
   local -a uv_build_command=()
 
@@ -1587,6 +2099,7 @@ repair_one_pure_sdist_locked() {
     return 1
   fi
   mkdir -m 700 -- "$source_dir" "$wheel_dir" "$auth_home" || return
+  REPAIR_AUTH_HOME_TO_CLEAN=$auth_home
   ensure_private_repair_directory "$built_wheels_dir" || return
   ensure_private_repair_directory "$uv_cache_dir" || return
   ensure_private_repair_directory "$uv_python_dir" || return
@@ -1597,7 +2110,7 @@ repair_one_pure_sdist_locked() {
   build_sanitized_environment_args clean_env_args "$auth_home"
 
   download_log="$(mktemp "$candidate_dir/.download-log.XXXXXXXX")" || return
-  if ! chmod 600 -- "$download_log"; then
+  if ! validate_private_stage_file "$download_log"; then
     remove_private_stage_log "$candidate_dir" "$download_log" || true
     return 1
   fi
@@ -1611,7 +2124,7 @@ repair_one_pure_sdist_locked() {
   remove_private_stage_log "$candidate_dir" "$download_log" || return
 
   sdist_error="$(mktemp "$candidate_dir/.validation-log.XXXXXXXX")" || return
-  if ! chmod 600 -- "$sdist_error"; then
+  if ! validate_private_stage_file "$sdist_error"; then
     remove_private_stage_log "$candidate_dir" "$sdist_error" || true
     return 1
   fi
@@ -1632,13 +2145,12 @@ repair_one_pure_sdist_locked() {
   fi
 
   build_log="$(mktemp "$candidate_dir/.build-log.XXXXXXXX")" || return
-  if ! chmod 600 -- "$build_log"; then
+  if ! validate_private_stage_file "$build_log"; then
     remove_private_stage_log "$candidate_dir" "$build_log" || true
     return 1
   fi
   build_timeout=${DIFY_SDIST_BUILD_TIMEOUT_SECONDS:-600}
   uv_build_command=(
-    timeout --signal=TERM --kill-after=5s "${build_timeout}s"
     env "${clean_env_args[@]}"
     "UV_CACHE_DIR=$uv_cache_dir"
     "UV_PYTHON_INSTALL_DIR=$uv_python_dir"
@@ -1651,7 +2163,19 @@ repair_one_pure_sdist_locked() {
     --index-url "$safe_index"
     "$sdist_path"
   )
-  if ! run_bounded_command_log "$build_log" "${uv_build_command[@]}"; then
+  if run_supervised_command_log "$build_log" "$build_timeout" "${uv_build_command[@]}"; then
+    build_status=0
+  else
+    build_status=$?
+  fi
+  if ! remove_private_index_auth "$auth_home"; then
+    printf '%s\n' 'private package index credentials could not be removed safely' >&2
+    remove_private_stage_log "$candidate_dir" "$build_log" || true
+    return 1
+  fi
+  REPAIR_AUTH_HOME_TO_CLEAN=
+  build_sanitized_environment_args clean_env_args "$candidate_dir"
+  if ((build_status != 0)); then
     redact_pip_log <"$build_log" >&2 || printf 'build output could not be displayed safely\n' >&2
     remove_private_stage_log "$candidate_dir" "$build_log" || true
     printf 'Pure Python sdist repair failed during build: %s\n' "$requirement" >&2
@@ -1672,7 +2196,7 @@ repair_one_pure_sdist_locked() {
     cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
     return 1
   }
-  if ! chmod 600 -- "$wheel_error"; then
+  if ! validate_private_stage_file "$wheel_error"; then
     remove_private_stage_log "$candidate_dir" "$wheel_error" || true
     cleanup_admission_snapshot "$snapshot_dir" "$wheel_path" || true
     return 1
@@ -1729,6 +2253,14 @@ repair_one_pure_sdist() (
   local ordinal=$8
   local safe_index repair_lock_dir
 
+  REPAIR_AUTH_HOME_TO_CLEAN=
+  REPAIR_LOCK_TO_RELEASE=
+  REPAIR_DIR_FOR_CLEANUP=
+  trap cleanup_sdist_repair_state EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
   validate_sdist_repair_dir "$repair_dir" || return
   validate_sdist_repair_identifiers \
     "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" "$ordinal" || return
@@ -1749,7 +2281,7 @@ repair_one_pure_sdist() (
     return 1
   fi
   REPAIR_LOCK_TO_RELEASE=$repair_lock_dir
-  trap 'rmdir -- "$REPAIR_LOCK_TO_RELEASE" 2>/dev/null || true' EXIT
+  REPAIR_DIR_FOR_CLEANUP=$repair_dir
   validate_sdist_repair_dir "$repair_dir" || return
   repair_one_pure_sdist_locked \
     "$pip_command_name" "$uv_command" "$requirement" "$canonical_name" "$python_version" \

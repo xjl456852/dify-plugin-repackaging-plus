@@ -924,20 +924,85 @@ case "${REPAIR_UV_MODE:-success}" in
     ;;
   mutate-snapshot)
     cp "$REPAIR_LARGE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
+    ;;
+  background-replace)
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
     (
-      candidate_dir="$(dirname -- "$out_dir")"
+      printf 'started\n' >"$REPAIR_BACKGROUND_STARTED"
       for _ in $(seq 1 10000); do
-        target="$(find "$candidate_dir" -maxdepth 2 -type f -path '*/.admission.*/*.whl' -print -quit 2>/dev/null)"
-        if [[ -n "$target" ]]; then
-          chmod u+w "$target" 2>/dev/null || true
-          printf 'snapshot mutation\n' >>"$target" 2>/dev/null || true
-          printf 'seen\n' >"$REPAIR_MUTATION_SEEN"
+        if [[ -f "$REPAIR_BACKGROUND_BUILT_WHEEL" ]]; then
+          chmod u+w "$REPAIR_BACKGROUND_BUILT_WHEEL" 2>/dev/null || true
+          cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$REPAIR_BACKGROUND_BUILT_WHEEL" 2>/dev/null || true
+          printf 'replaced\n' >"$REPAIR_BACKGROUND_REPLACED"
           exit
         fi
         sleep 0.001
       done
     ) </dev/null >/dev/null 2>&1 &
-    printf '%s\n' "$!" >"$REPAIR_MUTATION_PID_FILE"
+    for _ in $(seq 1 1000); do
+      [[ -f "$REPAIR_BACKGROUND_STARTED" ]] && break
+      sleep 0.001
+    done
+    ;;
+  double-fork-replace)
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    python3 - "$REPAIR_BACKGROUND_STARTED" "$REPAIR_BACKGROUND_REPLACED" \
+      "$REPAIR_BACKGROUND_BUILT_WHEEL" "$REPAIR_NATIVE_WHEEL_FIXTURE" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+
+
+started, replaced, built_wheel, malicious_wheel = map(Path, sys.argv[1:])
+if os.fork():
+    raise SystemExit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+null_fd = os.open(os.devnull, os.O_RDWR)
+for descriptor in (0, 1, 2):
+    os.dup2(null_fd, descriptor)
+if null_fd > 2:
+    os.close(null_fd)
+started.write_text("started\n", encoding="utf-8")
+for _ in range(10000):
+    if built_wheel.is_file():
+        try:
+            built_wheel.chmod(0o600)
+            shutil.copyfile(malicious_wheel, built_wheel)
+            replaced.write_text("replaced\n", encoding="utf-8")
+        except OSError:
+            pass
+        os._exit(0)
+    time.sleep(0.001)
+os._exit(0)
+PY
+    for _ in $(seq 1 1000); do
+      [[ -f "$REPAIR_BACKGROUND_STARTED" ]] && break
+      sleep 0.001
+    done
+    ;;
+  hold-pipe)
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    python3 - "$REPAIR_BACKGROUND_STARTED" <<'PY' &
+import os
+from pathlib import Path
+import sys
+import time
+
+
+if os.fork():
+    raise SystemExit(0)
+Path(sys.argv[1]).write_text("started\n", encoding="utf-8")
+time.sleep(5)
+os._exit(0)
+PY
+    for _ in $(seq 1 1000); do
+      [[ -f "$REPAIR_BACKGROUND_STARTED" ]] && break
+      sleep 0.001
+    done
     ;;
   native)
     cp "$REPAIR_NATIVE_WHEEL_FIXTURE" "$out_dir/docopt-0.6.2-py2.py3-none-any.whl"
@@ -974,6 +1039,8 @@ export REPAIR_LARGE_WHEEL_FIXTURE="$sdist_repair_fixture_dir/docopt-0.6.2-py2.py
 export REPAIR_REPLACER_PID_FILE="$FIXTURE_DIR/sdist-repair-replacer.pid"
 export REPAIR_MUTATION_PID_FILE="$FIXTURE_DIR/sdist-repair-mutation.pid"
 export REPAIR_REPLACER_SEEN="$FIXTURE_DIR/sdist-repair-replacer.seen"
+export REPAIR_BACKGROUND_STARTED="$FIXTURE_DIR/sdist-repair-background.started"
+export REPAIR_BACKGROUND_REPLACED="$FIXTURE_DIR/sdist-repair-background.replaced"
 : >"$REPAIR_PIP_ARGS_LOG"
 : >"$REPAIR_UV_ARGS_LOG"
 : >"$REPAIR_PIP_ENV_LOG"
@@ -1088,8 +1155,95 @@ for tool_args_log in "$REPAIR_PIP_ARGS_LOG" "$REPAIR_UV_ARGS_LOG"; do
 done
 assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-user-secret' 'private-index username is absent from observed parent process argv'
 assert_file_not_contains "$REPAIR_TOOL_PROC_LOG" 'argv-password-secret' 'private-index password is absent from observed parent process argv'
-assert_eq 700 "$(stat -c '%a' "$repair_dir/candidate-1/auth-home")" 'private authentication HOME uses mode 0700'
-assert_eq 600 "$(stat -c '%a' "$repair_dir/candidate-1/auth-home/.netrc")" 'private netrc uses mode 0600'
+assert_file_missing "$repair_dir/candidate-1/auth-home/.netrc" 'successful repair removes private netrc immediately after tool use'
+assert_file_missing "$repair_dir/candidate-1/auth-home" 'successful repair removes its empty private authentication HOME'
+
+for hostile_index_url in \
+  'https://good.example machine evil.example/simple' \
+  'https://good%20example.example/simple' \
+  'https://user%20name:password@target-index.example/simple' \
+  'https://user:pass%0Aword@target-index.example/simple' \
+  'https://user:pass%22word@target-index.example/simple' \
+  'https://user:pass%5Cword@target-index.example/simple' \
+  'https://target-index.example/simple%20path'; do
+  if printf '%s' "$hostile_index_url" | sanitize_index_url_for_tools >/dev/null 2>&1; then
+    fail 'ambiguous netrc/index token is rejected before credentials can be written'
+  else
+    pass 'ambiguous netrc/index token is rejected before credentials can be written'
+  fi
+done
+assert_eq \
+  'https://target-index.example/simple' \
+  "$(printf '%s' 'https://safe%2Duser:safe%2Dpassword@target-index.example/simple' | sanitize_index_url_for_tools)" \
+  'safe percent-encoded basic credentials are accepted without entering tool argv'
+assert_eq \
+  'https://[2001:db8::1]:8443/simple' \
+  "$(printf '%s' 'https://ipv6-user:ipv6-password@[2001:db8::1]:8443/simple' | sanitize_index_url_for_tools)" \
+  'IPv6 package index with an explicit port is sanitized unambiguously'
+netrc_parser_home="$FIXTURE_DIR/netrc parser auth-home"
+mkdir -m 700 -- "$netrc_parser_home"
+if printf '%s' 'https://safe%2Duser:safe%2Dpassword@target-index.example/simple' | \
+  write_private_index_auth "$netrc_parser_home" && \
+  [[ "$(python3 -B - "$netrc_parser_home/.netrc" <<'PY'
+import netrc
+import sys
+
+credentials = netrc.netrc(sys.argv[1]).authenticators('target-index.example')
+print(f'{credentials[0]}:{credentials[2]}')
+PY
+)" == 'safe-user:safe-password' ]]; then
+  pass 'strict private netrc writer preserves safe percent-decoded credentials'
+else
+  fail 'strict private netrc writer preserves safe percent-decoded credentials'
+fi
+rm -f -- "$netrc_parser_home/.netrc"
+if printf '%s' 'https://ipv6-user:ipv6-password@[2001:db8::1]:8443/simple' | \
+  write_private_index_auth "$netrc_parser_home" && \
+  python3 -B - "$netrc_parser_home/.netrc" <<'PY'
+import netrc
+import sys
+
+credentials = netrc.netrc(sys.argv[1]).authenticators('2001:db8::1')
+assert credentials is not None
+assert credentials[0] == 'ipv6-user'
+assert credentials[2] == 'ipv6-password'
+PY
+then
+  pass 'strict private netrc writer supports an IPv6 index host with explicit port'
+else
+  fail 'strict private netrc writer supports an IPv6 index host with explicit port'
+fi
+rm -f -- "$netrc_parser_home/.netrc"
+rmdir -- "$netrc_parser_home"
+
+signal_cleanup_repair="$FIXTURE_DIR/signal cleanup/sdist-repair"
+signal_cleanup_auth="$signal_cleanup_repair/candidate-1/auth-home"
+signal_cleanup_lock="$signal_cleanup_repair/.repair-lock"
+mkdir -p "$signal_cleanup_auth" "$signal_cleanup_lock"
+chmod 700 -- "$signal_cleanup_repair" "$signal_cleanup_repair/candidate-1" \
+  "$signal_cleanup_auth" "$signal_cleanup_lock"
+printf 'machine target-index.example login signal-user password signal-password\n' \
+  >"$signal_cleanup_auth/.netrc"
+chmod 600 -- "$signal_cleanup_auth/.netrc"
+if bash -c '
+  source "$1"
+  REPAIR_AUTH_HOME_TO_CLEAN=$2
+  REPAIR_LOCK_TO_RELEASE=$3
+  REPAIR_DIR_FOR_CLEANUP=$4
+  trap cleanup_sdist_repair_state EXIT
+  trap "exit 143" TERM
+  kill -TERM "$BASHPID"
+  sleep 1
+' _ "$ROOT_DIR/plugin_repackaging.sh" "$signal_cleanup_auth" "$signal_cleanup_lock" "$signal_cleanup_repair" \
+  >"$FIXTURE_DIR/sdist-repair-signal-cleanup.log" 2>&1; then
+  fail 'TERM cleanup path exits nonzero after removing private repair state'
+else
+  signal_cleanup_status=$?
+  assert_eq 143 "$signal_cleanup_status" 'TERM cleanup path preserves its signal-derived status'
+fi
+assert_file_missing "$signal_cleanup_auth/.netrc" 'TERM cleanup removes private index credentials'
+assert_file_missing "$signal_cleanup_auth" 'TERM cleanup removes empty private authentication HOME'
+assert_file_missing "$signal_cleanup_lock" 'TERM cleanup releases the exact repair-tree lock'
 
 query_repair_parent="$FIXTURE_DIR/query repair parent"
 mkdir -p "$query_repair_parent"
@@ -1239,6 +1393,7 @@ for secret_value in download-user download-password download-query download-frag
 done
 assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" 'download failure does not invoke uv'
 assert_file_missing "$repair_dir/built-wheels/partial-2.whl" 'download failure admits no partial wheel'
+assert_file_missing "$repair_dir/candidate-2/auth-home/.netrc" 'download failure removes private index credentials'
 
 for sdist_mode in corrupt multiple mismatch; do
   ordinal=3
@@ -1246,7 +1401,8 @@ for sdist_mode in corrupt multiple mismatch; do
   [[ "$sdist_mode" == mismatch ]] && ordinal=5
   uv_calls_before="$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")"
   validation_log="$FIXTURE_DIR/sdist-repair-$sdist_mode-sdist.log"
-  if REPAIR_PIP_MODE="$sdist_mode" \
+  if PIP_MIRROR_URL='https://validation-user:validation-password@target-index.example/simple' \
+    REPAIR_PIP_MODE="$sdist_mode" \
     without_proxy_environment repair_one_pure_sdist \
       repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
       >"$validation_log" 2>&1; then
@@ -1257,10 +1413,12 @@ for sdist_mode in corrupt multiple mismatch; do
   assert_file_contains "$validation_log" 'Pure Python sdist repair failed during validation: docopt' "$sdist_mode sdist reports the validation stage"
   assert_file_contains "$validation_log" 'validation failed:' "$sdist_mode sdist retains the validator explanation"
   assert_eq "$uv_calls_before" "$(grep -c '^CALL$' "$REPAIR_UV_ARGS_LOG")" "$sdist_mode sdist cannot invoke uv"
+  assert_file_missing "$repair_dir/candidate-$ordinal/auth-home/.netrc" "$sdist_mode sdist validation failure removes private index credentials"
 done
 
 build_failure_log="$FIXTURE_DIR/sdist-repair-build-failure.log"
-if REPAIR_UV_MODE=failure \
+if PIP_MIRROR_URL='https://build-user-secret:build-password-secret@target-index.example/simple' \
+  REPAIR_UV_MODE=failure \
   without_proxy_environment repair_one_pure_sdist \
     repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' 6 \
     >"$build_failure_log" 2>&1; then
@@ -1273,6 +1431,7 @@ assert_file_contains "$build_failure_log" 'socks5h://***@10.10.10.10:28802/path'
 for secret_value in build-user build-password build-query build-fragment $'\033'; do
   assert_file_not_contains "$build_failure_log" "$secret_value" "build repair diagnostic hides $secret_value"
 done
+assert_file_missing "$repair_dir/candidate-6/auth-home/.netrc" 'build failure removes private index credentials after supervised process cleanup'
 
 for wheel_mode in native nonpure multiple mismatch; do
   ordinal=7
@@ -1280,7 +1439,8 @@ for wheel_mode in native nonpure multiple mismatch; do
   [[ "$wheel_mode" == multiple ]] && ordinal=9
   [[ "$wheel_mode" == mismatch ]] && ordinal=10
   validation_log="$FIXTURE_DIR/sdist-repair-$wheel_mode-wheel.log"
-  if REPAIR_UV_MODE="$wheel_mode" \
+  if PIP_MIRROR_URL='https://wheel-user:wheel-password@target-index.example/simple' \
+    REPAIR_UV_MODE="$wheel_mode" \
     without_proxy_environment repair_one_pure_sdist \
       repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$repair_dir" '' "$ordinal" \
       >"$validation_log" 2>&1; then
@@ -1290,6 +1450,7 @@ for wheel_mode in native nonpure multiple mismatch; do
   fi
   assert_file_contains "$validation_log" 'Pure Python sdist repair failed during validation: docopt' "$wheel_mode wheel reports the validation stage"
   assert_file_contains "$validation_log" 'validation failed:' "$wheel_mode wheel retains the validator explanation"
+  assert_file_missing "$repair_dir/candidate-$ordinal/auth-home/.netrc" "$wheel_mode wheel validation failure removes private index credentials"
 done
 assert_eq 1 "$(find "$repair_dir/built-wheels" -maxdepth 1 -type f -name '*.whl' | wc -l)" 'rejected wheels never enter built-wheels'
 
@@ -1325,15 +1486,67 @@ for _ in $(seq 1 200); do
   [[ -f "$REPAIR_REPLACER_SEEN" ]] && break
   sleep 0.01
 done
-assert_file_contains "$REPAIR_REPLACER_SEEN" 'seen' 'adversarial backend actually replaced the abandoned original output path'
+assert_file_missing "$REPAIR_REPLACER_SEEN" 'supervisor terminates an ordinary backend child before snapshot validation starts'
 if python3 -B "$ROOT_DIR/tools/validate_python_distribution.py" wheel \
   "$replace_repair_dir/built-wheels" --name docopt --version 0.6.2 >/dev/null 2>&1; then
-  pass 'wheel admitted during original-path replacement independently revalidates'
+  pass 'wheel admitted after ordinary backend-child cleanup independently revalidates'
 else
-  fail 'wheel admitted during original-path replacement independently revalidates'
+  fail 'wheel admitted after ordinary backend-child cleanup independently revalidates'
 fi
 if [[ -f "$REPAIR_REPLACER_PID_FILE" ]]; then
-  kill "$(<"$REPAIR_REPLACER_PID_FILE")" 2>/dev/null || true
+  if kill -0 "$(<"$REPAIR_REPLACER_PID_FILE")" 2>/dev/null; then
+    fail 'ordinary backend child is gone before repair returns'
+    kill "$(<"$REPAIR_REPLACER_PID_FILE")" 2>/dev/null || true
+  else
+    pass 'ordinary backend child is gone before repair returns'
+  fi
+fi
+
+for background_mode in background-replace double-fork-replace; do
+  background_repair_parent="$FIXTURE_DIR/$background_mode repair parent"
+  mkdir -p "$background_repair_parent"
+  background_repair_dir="$background_repair_parent/sdist-repair"
+  export REPAIR_BACKGROUND_BUILT_WHEEL="$background_repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl"
+  rm -f -- "$REPAIR_BACKGROUND_STARTED" "$REPAIR_BACKGROUND_REPLACED"
+  if REPAIR_UV_MODE="$background_mode" \
+    without_proxy_environment repair_one_pure_sdist \
+      repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$background_repair_dir" '' 1 \
+      >"$FIXTURE_DIR/sdist-repair-$background_mode.log" 2>&1; then
+    pass "$background_mode backend descendants are cleaned before admission"
+  else
+    fail "$background_mode backend descendants are cleaned before admission"
+    sed 's/^/# supervised repair: /' "$FIXTURE_DIR/sdist-repair-$background_mode.log"
+  fi
+  assert_file_contains "$REPAIR_BACKGROUND_STARTED" 'started' "$background_mode adversarial child actually started"
+  sleep 1
+  assert_file_missing "$REPAIR_BACKGROUND_REPLACED" "$background_mode descendant cannot mutate built-wheels after repair returns"
+  if python3 -B "$ROOT_DIR/tools/validate_python_distribution.py" wheel \
+    "$background_repair_dir/built-wheels" --name docopt --version 0.6.2 >/dev/null 2>&1; then
+    pass "$background_mode admitted wheel remains valid after a deliberate post-admission delay"
+  else
+    fail "$background_mode admitted wheel remains valid after a deliberate post-admission delay"
+  fi
+done
+
+hold_pipe_parent="$FIXTURE_DIR/hold pipe repair parent"
+mkdir -p "$hold_pipe_parent"
+hold_pipe_dir="$hold_pipe_parent/sdist-repair"
+rm -f -- "$REPAIR_BACKGROUND_STARTED"
+hold_pipe_start=$SECONDS
+if REPAIR_UV_MODE=hold-pipe \
+  without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$hold_pipe_dir" '' 1 \
+    >"$FIXTURE_DIR/sdist-repair-hold-pipe.log" 2>&1; then
+  pass 'child retaining build stdout cannot block supervised repair'
+else
+  fail 'child retaining build stdout cannot block supervised repair'
+fi
+hold_pipe_elapsed=$((SECONDS - hold_pipe_start))
+assert_file_contains "$REPAIR_BACKGROUND_STARTED" 'started' 'stdout-retaining backend child actually started'
+if ((hold_pipe_elapsed <= 3)); then
+  pass 'supervisor cleanup deadline covers inherited build-output pipes'
+else
+  fail "supervisor cleanup deadline covers inherited build-output pipes (elapsed=${hold_pipe_elapsed}s)"
 fi
 
 mutation_repair_parent="$FIXTURE_DIR/mutation repair parent"
@@ -1341,6 +1554,19 @@ mkdir -p "$mutation_repair_parent"
 mutation_repair_dir="$mutation_repair_parent/sdist-repair"
 export REPAIR_MUTATION_SEEN="$FIXTURE_DIR/sdist-repair-mutation.seen"
 rm -f -- "$REPAIR_MUTATION_SEEN" "$REPAIR_MUTATION_PID_FILE"
+(
+  for _ in $(seq 1 10000); do
+    target="$(find "$mutation_repair_dir" -maxdepth 3 -type f -path '*/.admission.*/*.whl' -print -quit 2>/dev/null)"
+    if [[ -n "$target" ]]; then
+      chmod u+w "$target" 2>/dev/null || true
+      printf 'snapshot mutation\n' >>"$target" 2>/dev/null || true
+      printf 'seen\n' >"$REPAIR_MUTATION_SEEN"
+      exit
+    fi
+    sleep 0.001
+  done
+) </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >"$REPAIR_MUTATION_PID_FILE"
 if REPAIR_UV_MODE=mutate-snapshot \
   without_proxy_environment repair_one_pure_sdist \
     repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$mutation_repair_dir" '' 1 \
@@ -1394,6 +1620,7 @@ assert_eq 0 "$(find "$concurrent_repair_dir" -type l | wc -l)" 'concurrent repai
 stale_lock_parent="$FIXTURE_DIR/stale lock parent"
 stale_lock_dir="$stale_lock_parent/sdist-repair"
 mkdir -p "$stale_lock_dir/.repair-lock"
+chmod 700 -- "$stale_lock_dir" "$stale_lock_dir/.repair-lock"
 pip_calls_before="$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")"
 if without_proxy_environment repair_one_pure_sdist \
   repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$stale_lock_dir" '' 1 \
@@ -1413,6 +1640,29 @@ else
 fi
 assert_eq 600 "$(stat -c '%a' "$bounded_permission_log")" 'bounded raw command log uses mode 0600'
 rm -f -- "$bounded_permission_log"
+
+supervisor_status_log="$FIXTURE_DIR/supervisor-status.log"
+if run_supervised_command_log "$supervisor_status_log" 5 bash -c 'exit 37'; then
+  supervisor_exit_status=0
+else
+  supervisor_exit_status=$?
+fi
+assert_eq 37 "$supervisor_exit_status" 'build supervisor preserves the uv process exit status'
+assert_eq 600 "$(stat -c '%a' "$supervisor_status_log")" 'supervised raw build log uses mode 0600'
+rm -f -- "$supervisor_status_log"
+
+chmod_external_sentinel="$FIXTURE_DIR/chmod-external-sentinel"
+chmod_symlink="$FIXTURE_DIR/chmod-symlink"
+printf 'external sentinel\n' >"$chmod_external_sentinel"
+chmod 640 -- "$chmod_external_sentinel"
+ln -s "$chmod_external_sentinel" "$chmod_symlink"
+if safe_fchmod_regular_file "$chmod_symlink" 400 >/dev/null 2>&1; then
+  fail 'descriptor-bound mode hardening rejects a symlink swap target'
+else
+  pass 'descriptor-bound mode hardening rejects a symlink swap target'
+fi
+assert_eq 'external sentinel' "$(<"$chmod_external_sentinel")" 'symlink mode-hardening attempt leaves external content untouched'
+assert_eq 640 "$(stat -c '%a' "$chmod_external_sentinel")" 'symlink mode-hardening attempt leaves external mode untouched'
 
 invalid_timeout_parent="$FIXTURE_DIR/invalid timeout parent"
 mkdir -p "$invalid_timeout_parent"
@@ -1475,6 +1725,11 @@ else
 fi
 
 task3_function_source="$(sed -n '/^validate_sdist_repair_dir() {/,/^download_wheels_once() {/p' "$ROOT_DIR/plugin_repackaging.sh")"
+if grep -Eq '^[[:space:]]*chmod([[:space:]]|$)' <<<"$task3_function_source"; then
+  fail 'Task3 performs no path-based chmod after a pathname safety check'
+else
+  pass 'Task3 performs no path-based chmod after a pathname safety check'
+fi
 if grep -Fq '${#' <<<"$task3_function_source"; then
   fail 'Task3 empty-array checks remain safe under Bash 4.3 nounset'
 else
@@ -1496,6 +1751,7 @@ fi
 conflict_repair_parent="$FIXTURE_DIR/conflict repair parent"
 conflict_repair_dir="$conflict_repair_parent/sdist-repair"
 mkdir -p "$conflict_repair_dir/built-wheels"
+chmod 700 -- "$conflict_repair_dir" "$conflict_repair_dir/built-wheels"
 printf 'preexisting different wheel\n' >"$conflict_repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl"
 conflict_repair_log="$FIXTURE_DIR/sdist-repair-conflict.log"
 if without_proxy_environment repair_one_pure_sdist \
