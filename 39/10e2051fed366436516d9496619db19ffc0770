@@ -1,0 +1,20 @@
+docs/superpowers/specs/2026-08-11-pure-python-sdist-self-healing-design.md
+  s_c1a60985b94e3d::t_57b6759305d7f7 1-41,43-65,67-151
+  s_c1a60985b94e3d::t_36e498c27b3a70 42,66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "3910e2051fed366436516d9496619db19ffc0770",
+  "prompts": {},
+  "sessions": {
+    "s_c1a60985b94e3d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fbb87-339e-7e72-8f3b-b11b0c98309b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "xiejianglei <xiejianglei163@163.com>"
+    }
+  }
+}
