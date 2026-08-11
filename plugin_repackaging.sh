@@ -166,18 +166,31 @@ import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 
+MAX_DISPLAY_INPUT_BYTES = 1024 * 1024
+MAX_DISPLAY_OUTPUT_BYTES = MAX_DISPLAY_INPUT_BYTES + 64
+TRUNCATION_MARKER = "\n[pip diagnostic output truncated]\n"
+supported_scheme_pattern = re.compile(
+    r"(?:https?|socks(?:4a?|5h?))://",
+    re.IGNORECASE,
+)
 url_pattern = re.compile(
-    r"(?i)(?:https?|socks(?:4a?|5h?))://\S+"
+    supported_scheme_pattern.pattern + r"\S+",
+    re.IGNORECASE,
 )
 
 
 def redact_url(match):
+    if input_truncated and match.end() == len(text):
+        return "<redacted-url>"
     raw_url = match.group(0)
     trailing = ""
     while raw_url and raw_url[-1] in "'\"].,;)}>":
         trailing = raw_url[-1] + trailing
         raw_url = raw_url[:-1]
     try:
+        scheme_end = raw_url.find("://") + 3
+        if supported_scheme_pattern.search(raw_url, scheme_end):
+            return "<redacted-url>" + trailing
         if any(
             not character.isprintable()
             or unicodedata.category(character).startswith("C")
@@ -201,29 +214,41 @@ def redact_url(match):
     return safe_url + trailing
 
 
-raw_input = sys.stdin.buffer.read()
+raw_input = sys.stdin.buffer.read(MAX_DISPLAY_INPUT_BYTES + 1)
+input_truncated = len(raw_input) > MAX_DISPLAY_INPUT_BYTES
+raw_input = raw_input[:MAX_DISPLAY_INPUT_BYTES]
 text = raw_input.decode("utf-8", errors="surrogateescape")
 redacted = url_pattern.sub(redact_url, text)
 safe_output = []
+safe_output_bytes = 0
+display_truncated = input_truncated
 for character in redacted:
     if character in "\n\t":
-        safe_output.append(character)
-        continue
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if 0xDC80 <= codepoint <= 0xDCFF:
-        safe_output.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif character == "\r":
-        safe_output.append("\\r")
-    elif not character.isprintable() or category.startswith("C") or category in {"Zl", "Zp"}:
-        if codepoint < 0x80:
-            safe_output.append(f"\\x{codepoint:02x}")
-        elif codepoint <= 0xFFFF:
-            safe_output.append(f"\\u{codepoint:04x}")
-        else:
-            safe_output.append(f"\\U{codepoint:08x}")
+        safe_character = character
     else:
-        safe_output.append(character)
+        codepoint = ord(character)
+        category = unicodedata.category(character)
+        if 0xDC80 <= codepoint <= 0xDCFF:
+            safe_character = f"\\x{codepoint - 0xDC00:02x}"
+        elif character == "\r":
+            safe_character = "\\r"
+        elif not character.isprintable() or category.startswith("C") or category in {"Zl", "Zp"}:
+            if codepoint < 0x80:
+                safe_character = f"\\x{codepoint:02x}"
+            elif codepoint <= 0xFFFF:
+                safe_character = f"\\u{codepoint:04x}"
+            else:
+                safe_character = f"\\U{codepoint:08x}"
+        else:
+            safe_character = character
+    encoded_size = len(safe_character.encode("utf-8"))
+    if safe_output_bytes + encoded_size > MAX_DISPLAY_OUTPUT_BYTES:
+        display_truncated = True
+        break
+    safe_output.append(safe_character)
+    safe_output_bytes += encoded_size
+if display_truncated:
+    safe_output.append(TRUNCATION_MARKER)
 sys.stdout.buffer.write("".join(safe_output).encode("utf-8"))
 PY
 }

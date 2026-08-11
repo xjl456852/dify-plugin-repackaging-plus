@@ -373,6 +373,18 @@ for secret_value in \
   assert_file_not_contains "$apostrophe_url_log" "$secret_value" "maximal URL token redaction hides $secret_value"
 done
 
+adjacent_url_log="$FIXTURE_DIR/adjacent-url.log"
+printf '%s\n' \
+  'Adjacent "https://first-user:first-secret@one.example/simple,https://second-user:second-secret@two.example/private?second-query=x#second-fragment"' \
+  "Mixed (http://third-user:third-secret@three.example/start;socks5h://fourth-user:fourth-secret@10.10.10.10:28802/private?fourth-query=x#fourth-fragment)" \
+  | redact_pip_log >"$adjacent_url_log" 2>/dev/null || true
+assert_eq 2 "$(grep -o '<redacted-url>' "$adjacent_url_log" | wc -l)" 'adjacent supported URL schemes redact each ambiguous maximal token completely'
+for secret_value in \
+  first-user first-secret second-user second-secret second-query second-fragment \
+  third-user third-secret fourth-user fourth-secret fourth-query fourth-fragment; do
+  assert_file_not_contains "$adjacent_url_log" "$secret_value" "adjacent URL redaction hides $secret_value"
+done
+
 unsafe_terminal_input="$FIXTURE_DIR/unsafe-terminal-input.bin"
 unsafe_terminal_output="$FIXTURE_DIR/unsafe-terminal-output.txt"
 printf '%s' $'URL https://terminal-user:terminal-password@mirror.example/simple?terminal-query-secret=yes#terminal-fragment-secret\n' >"$unsafe_terminal_input"
@@ -406,6 +418,46 @@ done
 for secret_value in terminal-user terminal-password terminal-query-secret terminal-fragment-secret; do
   assert_file_not_contains "$unsafe_terminal_output" "$secret_value" "terminal-safe display still redacts $secret_value"
 done
+
+display_input_limit=$((1024 * 1024))
+truncated_url_input="$FIXTURE_DIR/truncated-url-input.bin"
+truncated_url_output="$FIXTURE_DIR/truncated-url-output.txt"
+cut_url_prefix='https://cut-user:cut-password'
+head -c "$((display_input_limit - ${#cut_url_prefix}))" /dev/zero | tr '\0' A >"$truncated_url_input"
+printf '%s' "$cut_url_prefix" >>"$truncated_url_input"
+printf '%s' '@mirror.example/simple?cut-query-secret=yes#cut-fragment-secret UNPROCESSED-URL-TAIL-SECRET' >>"$truncated_url_input"
+printf '\033]52;c;tail-control-payload\007\n' >>"$truncated_url_input"
+redact_pip_log <"$truncated_url_input" >"$truncated_url_output" 2>/dev/null || true
+assert_file_contains "$truncated_url_output" '[pip diagnostic output truncated]' 'bounded redactor marks URL-boundary truncation'
+for secret_value in cut-user cut-password cut-query-secret cut-fragment-secret UNPROCESSED-URL-TAIL-SECRET tail-control-payload; do
+  assert_file_not_contains "$truncated_url_output" "$secret_value" "URL-boundary truncation never emits $secret_value"
+done
+if (( $(stat -c %s "$truncated_url_output") <= display_input_limit + 128 )); then
+  pass 'URL-boundary redacted output stays within its documented bound'
+else
+  fail 'URL-boundary redacted output stays within its documented bound'
+fi
+
+truncated_utf8_input="$FIXTURE_DIR/truncated-utf8-input.bin"
+truncated_utf8_output="$FIXTURE_DIR/truncated-utf8-output.txt"
+head -c "$((display_input_limit - 1))" /dev/zero | tr '\0' B >"$truncated_utf8_input"
+printf '\342' >>"$truncated_utf8_input"
+printf '\202\254 UNPROCESSED-UTF8-TAIL-SECRET\033]52;c;utf8-tail-control\007\n' >>"$truncated_utf8_input"
+redact_pip_log <"$truncated_utf8_input" >"$truncated_utf8_output" 2>/dev/null || true
+assert_file_contains "$truncated_utf8_output" '\xe2' 'partial UTF-8 byte at display boundary is rendered visibly'
+assert_file_contains "$truncated_utf8_output" '[pip diagnostic output truncated]' 'bounded redactor marks UTF-8-boundary truncation'
+assert_file_not_contains "$truncated_utf8_output" 'UNPROCESSED-UTF8-TAIL-SECRET' 'UTF-8-boundary truncation never emits unprocessed tail text'
+assert_file_not_contains "$truncated_utf8_output" 'utf8-tail-control' 'UTF-8-boundary truncation never emits tail control payload'
+if python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).read_text(encoding="utf-8")' "$truncated_utf8_output"; then
+  pass 'UTF-8-boundary redacted output remains valid UTF-8'
+else
+  fail 'UTF-8-boundary redacted output remains valid UTF-8'
+fi
+if (( $(stat -c %s "$truncated_utf8_output") <= display_input_limit + 128 )); then
+  pass 'UTF-8-boundary redacted output stays within its documented bound'
+else
+  fail 'UTF-8-boundary redacted output stays within its documented bound'
+fi
 
 metadata_dir="$FIXTURE_DIR/metadata"
 mkdir -p "$metadata_dir"
