@@ -276,6 +276,36 @@ else
   pass 'control-only unknown diagnostics fail closed'
 fi
 
+unicode_diagnostics=($'\u0085' $'\u2028' $'\u2029')
+unicode_diagnostic_names=('U+0085 NEL' 'U+2028 line separator' 'U+2029 paragraph separator')
+for unicode_index in "${!unicode_diagnostics[@]}"; do
+  write_missing_wheel_log "$missing_log" docopt
+  printf '%s\n' "${unicode_diagnostics[$unicode_index]}" >>"$missing_log"
+  if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+    fail "${unicode_diagnostic_names[$unicode_index]} anywhere in raw pip output is rejected"
+  else
+    pass "${unicode_diagnostic_names[$unicode_index]} anywhere in raw pip output is rejected"
+  fi
+done
+
+for unsafe_dependency_context in \
+  $'docopt (from records\t)' \
+  $'docopt (from records\v)' \
+  $'docopt (from records\u0085)'; do
+  write_missing_wheel_log "$missing_log" "$unsafe_dependency_context" docopt
+  if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
+    fail 'Unicode/control characters are rejected before dependency context is stripped'
+  else
+    pass 'Unicode/control characters are rejected before dependency context is stripped'
+  fi
+done
+
+printf '%s\r\n%s\r\n' \
+  $'\tERROR: Could not find a version that satisfies the requirement docopt (from versions: none)' \
+  $'\tERROR: No matching distribution found for docopt' \
+  >"$missing_log"
+assert_eq docopt "$(extract_missing_requirement "$missing_log" 2>/dev/null)" 'ordinary TAB indentation and CRLF remain accepted'
+
 write_missing_wheel_log "$missing_log" docopt click
 if extract_missing_requirement "$missing_log" >/dev/null 2>&1; then
   fail 'mismatched missing requirements are rejected'

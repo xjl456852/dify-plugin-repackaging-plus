@@ -205,6 +205,7 @@ extract_missing_requirement() {
 from pathlib import Path
 import re
 import sys
+import unicodedata
 
 
 MAX_PIP_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -212,9 +213,16 @@ path = Path(sys.argv[1])
 try:
     if not path.is_file() or path.stat().st_size > MAX_PIP_OUTPUT_BYTES:
         raise ValueError("invalid pip output file")
-    log = path.read_text(encoding="utf-8", errors="replace")
-except (OSError, ValueError):
+    log = path.read_text(encoding="utf-8")
+except (OSError, UnicodeError, ValueError):
     raise SystemExit(1)
+
+for character in log:
+    if character in "\n\r\t":
+        continue
+    category = unicodedata.category(character)
+    if not character.isprintable() or category.startswith("C") or category in {"Zl", "Zp"}:
+        raise SystemExit(1)
 
 missing_version_matches = list(re.finditer(
     r"^[ \t]*(?:ERROR:[ \t]*)?Could not find a version that satisfies the requirement "
@@ -253,19 +261,14 @@ benign_progress_patterns = tuple(re.compile(pattern) for pattern in (
     r"(?:[ \t]+\d+(?:\.\d+)?[ \t]+(?:kB|MB|GB)/s)?"
     r"(?:[ \t]+(?:eta[ \t]+)?(?:\d+:\d+(?::\d+)?|-:--:--))?",
 ))
-if any(
-    ord(character) < 32 and character not in "\n\t\r"
-    for character in diagnostics
-) or "\x7f" in diagnostics:
-    raise SystemExit(1)
-for diagnostic_line in diagnostics.splitlines():
+for diagnostic_line in diagnostics.split("\n"):
     if not diagnostic_line.strip(" \t\r"):
         continue
     diagnostic_line = diagnostic_line.strip(" \t\r")
     if not any(pattern.fullmatch(diagnostic_line) for pattern in benign_progress_patterns):
         raise SystemExit(1)
 
-dependency_context = re.compile(r"\s+\(from [^()\r\n]+\)\s*$", re.IGNORECASE)
+dependency_context = re.compile(r"\s+\(from [^()\t\r\n]+\)\s*$", re.IGNORECASE)
 requirement_pattern = re.compile(
     r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
     r"(?:\s*(?P<spec>"
