@@ -1886,7 +1886,30 @@ case "${REPAIR_PIP_MODE:-success}" in
       printf '%s\n' "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" >&2
       exit 42
     fi
-    [[ "${PIP_USE_DEPRECATED:-}" == legacy-certs ]] || exit 43
+    [[ -z "${PIP_USE_DEPRECATED:-}" ]] || exit 43
+    [[ "${PYTHONPATH:-}" == *socks-context-compat* ]] || exit 44
+    REPAIR_COMPAT_SSL_SENTINEL='destination-tls-context' \
+      "$REPAIR_REAL_PYTHON" -B -c '
+from pip._vendor.urllib3.contrib.socks import SOCKSProxyManager
+from pip._vendor.urllib3.poolmanager import ProxyManager
+import os
+import runpy
+
+sentinel = os.environ["REPAIR_COMPAT_SSL_SENTINEL"]
+first_init = SOCKSProxyManager.__init__
+compat_script = os.path.join(os.environ["PYTHONPATH"].split(os.pathsep)[0], "sitecustomize.py")
+runpy.run_path(compat_script)
+assert SOCKSProxyManager.__init__ is first_init
+socks_manager = SOCKSProxyManager(
+    "socks5h://proxy.example:1080",
+    ssl_context=sentinel,
+    proxy_ssl_context="not-applicable-to-socks",
+)
+assert socks_manager.kwargs["ssl_context"] == sentinel
+assert "proxy_ssl_context" not in socks_manager.kwargs
+https_manager = ProxyManager(proxy_ssl_context="https-proxy-tls-context")
+assert https_manager.kwargs["proxy_ssl_context"] == "https-proxy-tls-context"
+' || exit 45
     ;;
   slow)
     sleep 0.3
@@ -1976,6 +1999,14 @@ done
 [[ -n "$out_dir" ]]
 mkdir -p "$out_dir"
 case "${REPAIR_UV_MODE:-success}" in
+  uv-managed-ignore)
+    printf '*\n' >"$out_dir/.gitignore"
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    ;;
+  uv-managed-ignore-wrong)
+    printf 'keep-this\n' >"$out_dir/.gitignore"
+    cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
+    ;;
   slow)
     sleep 1
     cp "$REPAIR_WHEEL_FIXTURE" "$out_dir/"
@@ -2200,6 +2231,41 @@ if [[ -f "$repair_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl" ]]; then
 else
   fail 'validated universal wheel reaches built-wheels'
 fi
+
+uv_ignore_repair_parent="$FIXTURE_DIR/uv managed ignore repair parent"
+mkdir -p "$uv_ignore_repair_parent"
+uv_ignore_repair_dir="$uv_ignore_repair_parent/sdist-repair"
+cp -- "$REPAIR_PIP_ARGS_LOG" "$FIXTURE_DIR/pip-args-before-uv-ignore"
+cp -- "$REPAIR_UV_ARGS_LOG" "$FIXTURE_DIR/uv-args-before-uv-ignore"
+if PIP_MIRROR_URL='https://target-index.example/simple' \
+  REPAIR_UV_MODE=uv-managed-ignore without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 \
+    "$uv_ignore_repair_dir" '' 1 >"$FIXTURE_DIR/uv-managed-ignore.log" 2>&1; then
+  pass 'uv managed out-dir gitignore does not hide the only built wheel'
+else
+  fail 'uv managed out-dir gitignore does not hide the only built wheel'
+fi
+assert_file_contains "$FIXTURE_DIR/uv-managed-ignore.log" \
+  'Pure Python wheel admitted: docopt-0.6.2-py2.py3-none-any.whl' \
+  'uv managed out-dir gitignore still admits only the validated wheel'
+assert_file_missing "$uv_ignore_repair_dir/built-wheels/.gitignore" \
+  'uv managed out-dir gitignore is never admitted'
+
+uv_wrong_ignore_parent="$FIXTURE_DIR/uv wrong ignore repair parent"
+mkdir -p "$uv_wrong_ignore_parent"
+uv_wrong_ignore_dir="$uv_wrong_ignore_parent/sdist-repair"
+if PIP_MIRROR_URL='https://target-index.example/simple' \
+  REPAIR_UV_MODE=uv-managed-ignore-wrong without_proxy_environment repair_one_pure_sdist \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 \
+    "$uv_wrong_ignore_dir" '' 1 >"$FIXTURE_DIR/uv-wrong-ignore.log" 2>&1; then
+  fail 'unexpected out-dir gitignore content remains a validation failure'
+else
+  pass 'unexpected out-dir gitignore content remains a validation failure'
+fi
+assert_file_missing "$uv_wrong_ignore_dir/built-wheels/docopt-0.6.2-py2.py3-none-any.whl" \
+  'unexpected out-dir gitignore content admits no wheel'
+cp -- "$FIXTURE_DIR/pip-args-before-uv-ignore" "$REPAIR_PIP_ARGS_LOG"
+cp -- "$FIXTURE_DIR/uv-args-before-uv-ignore" "$REPAIR_UV_ARGS_LOG"
 expected_repair_pip_args="$FIXTURE_DIR/expected-repair-pip.args"
 printf '%s\n' \
   'CALL' \
@@ -2991,14 +3057,36 @@ assert_file_contains "$conflict_repair_log" 'Pure Python sdist repair failed dur
 socks_repair_parent="$FIXTURE_DIR/socks repair parent"
 mkdir -p "$socks_repair_parent"
 socks_repair_dir="$socks_repair_parent/sdist-repair"
-mkdir -p "$FIXTURE_DIR/fake-socks-site"
+repair_compat_fixture="$FIXTURE_DIR/fake-socks-site"
+mkdir -p \
+  "$repair_compat_fixture/pip/_vendor/urllib3/contrib" \
+  "$repair_compat_fixture/pip/_vendor/urllib3"
+touch \
+  "$repair_compat_fixture/pip/__init__.py" \
+  "$repair_compat_fixture/pip/_vendor/__init__.py" \
+  "$repair_compat_fixture/pip/_vendor/urllib3/__init__.py" \
+  "$repair_compat_fixture/pip/_vendor/urllib3/contrib/__init__.py"
+cat >"$repair_compat_fixture/pip/_vendor/urllib3/contrib/socks.py" <<'PY'
+class SOCKSProxyManager:
+    def __init__(self, proxy_url, **kwargs):
+        self.proxy_url = proxy_url
+        self.kwargs = kwargs
+PY
+cat >"$repair_compat_fixture/pip/_vendor/urllib3/poolmanager.py" <<'PY'
+class ProxyManager:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+PY
+printf '# fake PySocks module for compatibility-shim tests\n' >"$repair_compat_fixture/socks.py"
+export REPAIR_REAL_PYTHON="$(command -v python3)"
+export REPAIR_COMPAT_FIXTURE_DIR="$repair_compat_fixture"
 export REPAIR_PIP_ATTEMPT_FILE="$FIXTURE_DIR/sdist-repair-socks-attempt"
 : >"$REPAIR_PIP_ARGS_LOG"
 rm -f -- "$REPAIR_PIP_ATTEMPT_FILE"
 socks_repair_log="$FIXTURE_DIR/sdist-repair-socks.log"
 if https_proxy='socks5h://10.10.10.10:28802' HTTPS_PROXY= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= \
   REPAIR_PIP_MODE=truststore repair_one_pure_sdist \
-    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$socks_repair_dir" "$FIXTURE_DIR/fake-socks-site" 1 \
+    repair_pip_command "$fake_bin/uv-sdist-repair" docopt docopt 3.12 "$socks_repair_dir" "$repair_compat_fixture" 1 \
     >"$socks_repair_log" 2>&1; then
   pass 'sdist download preserves the exact SOCKS truststore compatibility retry'
 else
@@ -3006,7 +3094,8 @@ else
   sed 's/^/# socks sdist repair: /' "$socks_repair_log"
 fi
 assert_eq 2 "$(grep -c '^CALL$' "$REPAIR_PIP_ARGS_LOG")" 'sdist SOCKS truststore workaround retries exactly once'
-assert_file_contains "$socks_repair_log" 'retrying once with PIP_USE_DEPRECATED=legacy-certs' 'sdist SOCKS retry is explained'
+assert_file_contains "$socks_repair_log" 'retrying once with a temporary SOCKS context compatibility shim' 'sdist SOCKS retry is explained'
+assert_file_not_contains "$socks_repair_log" 'legacy-certs' 'sdist SOCKS compatibility keeps truststore TLS enabled'
 assert_eq 0 "$(find "$socks_repair_dir" -type f -name '*download*log*' | wc -l)" 'successful SOCKS retry removes all raw attempt diagnostics'
 set -e
 
@@ -3936,7 +4025,7 @@ case "${1:-}" in
     printf '# temporary test module\n' >"$target/socks.py"
     ;;
   download)
-    if [[ "${FAKE_PIP_SOCKS_TLS_BUG:-0}" == 1 && "${PIP_USE_DEPRECATED:-}" != legacy-certs ]]; then
+    if [[ "${FAKE_PIP_SOCKS_TLS_BUG:-0}" == 1 && "${DIFY_PIP_SOCKS_CONTEXT_COMPAT:-}" != 1 ]]; then
       printf '%s\n' \
         "TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'" >&2
       exit 86
@@ -4100,7 +4189,8 @@ else
   fail 'pip SOCKS proxy SSL context bug is retried automatically'
 fi
 assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'SOCKS proxy SSL context workaround retries exactly once'
-assert_file_contains "$tls_bug_case_dir/output.log" 'legacy-certs' 'SOCKS proxy SSL context retry is explained'
+assert_file_contains "$tls_bug_case_dir/output.log" 'temporary SOCKS context compatibility shim' 'SOCKS proxy SSL context retry is explained'
+assert_file_not_contains "$tls_bug_case_dir/output.log" 'legacy-certs' 'SOCKS proxy SSL context retry keeps truststore enabled'
 
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
@@ -4176,8 +4266,14 @@ else
   fail 'installed PySocks also retries the proxy SSL context bug'
 fi
 assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'installed PySocks compatibility retry runs exactly once'
-assert_file_contains "$installed_tls_bug_case_dir/output.log" 'legacy-certs' 'installed PySocks compatibility retry is explained'
-assert_file_missing "$installed_tls_bug_case_dir/pip-bootstrap" 'installed PySocks retry creates no bootstrap directory'
+assert_file_contains "$installed_tls_bug_case_dir/output.log" 'temporary SOCKS context compatibility shim' 'installed PySocks compatibility retry is explained'
+assert_file_not_contains "$installed_tls_bug_case_dir/output.log" 'legacy-certs' 'installed PySocks compatibility retry keeps truststore enabled'
+if [[ -f "$installed_tls_bug_case_dir/pip-bootstrap/socks-context-compat/sitecustomize.py" ]]; then
+  pass 'installed PySocks compatibility shim stays inside caller-provided bootstrap staging'
+else
+  fail 'installed PySocks compatibility shim stays inside caller-provided bootstrap staging'
+fi
+assert_eq 0 "$(find "$installed_tls_bug_case_dir/wheels" -name 'sitecustomize.py' | wc -l)" 'SOCKS compatibility shim is never admitted as a wheel artifact'
 
 : >"$SOCKS_PIP_LOG"
 : >"$SOCKS_CURL_LOG"
@@ -4898,7 +4994,7 @@ if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
   assert_eq 1 "$(grep -c '^wheels/docopt-0.6.2-py2.py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains exactly one admitted docopt wheel'
   assert_eq 1 "$(grep -c '^wheels/runtime-target-1.0-py3-none-any.whl$' <<<"$full_archive_entries")" 'full archive contains its target runtime wheel'
   assert_eq 2 "$(grep -c '^wheels/.*\.whl$' <<<"$full_archive_entries")" 'full archive contains only the resolved wheel set'
-  assert_eq 0 "$(grep -Eci '(^|/)(sdist-repair|candidate-[^/]*|built-wheels|uv-cache|uv-python|pip-bootstrap)(/|$)|\.(tar|tar\.gz|tgz|tar\.bz2|tar\.xz|zip)$|(^|/)(initial|current)\.[^/]*\.log$|(^|/)\.(download|build|validation)-log\.[^/]+$|coordinator' <<<"$full_archive_entries" || true)" 'full archive excludes source archives, repair state, caches, and raw logs'
+  assert_eq 0 "$(grep -Eci '(^|/)(sdist-repair|candidate-[^/]*|built-wheels|uv-cache|uv-python|pip-bootstrap|socks-context-compat)(/|$)|(^|/)\.gitignore$|\.(tar|tar\.gz|tgz|tar\.bz2|tar\.xz|zip)$|(^|/)(initial|current)\.[^/]*\.log$|(^|/)\.(download|build|validation)-log\.[^/]+$|coordinator' <<<"$full_archive_entries" || true)" 'full archive excludes source archives, repair state, caches, compatibility shims, uv metadata, and raw logs'
   assert_eq 0 "$(grep -Eci 'x86_64|win32|win_amd64|macosx|\.so$|\.pyd$|\.dll$|\.dylib$' <<<"$full_archive_entries" || true)" 'full archive excludes host and native binaries'
   assert_eq 0 "$(grep -Ec 'stale|partial-from' <<<"$full_archive_entries" || true)" 'full archive excludes original and failed-attempt wheels'
 else
@@ -5769,6 +5865,8 @@ if [[ -f "$GENERATED_TEST_OUTPUT" ]]; then
   socks_archive_entries="$(unzip -Z1 "$GENERATED_TEST_OUTPUT")"
   assert_eq 1 "$(grep -c '^wheels/example-1.0-py3-none-any.whl$' <<<"$socks_archive_entries")" 'SOCKS-repaired archive contains runtime wheelhouse'
   assert_eq 0 "$(grep -ci 'pip-bootstrap' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes bootstrap directory'
+  assert_eq 0 "$(grep -ci 'socks-context-compat' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes compatibility shim directory'
+  assert_eq 0 "$(grep -Ec '(^|/)\.gitignore$' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes uv managed gitignore'
   assert_eq 0 "$(grep -ci 'PySocks' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes PySocks wheel'
   assert_eq 0 "$(grep -c '/socks.py$' <<<"$socks_archive_entries")" 'SOCKS-repaired archive excludes temporary socks module'
 else

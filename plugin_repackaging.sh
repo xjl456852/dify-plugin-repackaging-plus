@@ -1494,14 +1494,89 @@ build_sanitized_environment_args() {
   result+=("HOME=$controlled_home")
 }
 
+prepare_pip_socks_context_compat() {
+  local compat_parent=$1
+  local result_name=$2
+  local -n result=$result_name
+  local compat_path="$compat_parent/socks-context-compat"
+
+  result=
+  if [[ ! -e "$compat_parent" ]]; then
+    validate_pip_bootstrap_dir "$compat_parent" || return
+    mkdir -p -- "$compat_parent" || return
+  fi
+  validate_optional_socks_site_dir "$compat_parent" || return
+  task3_python -B - "$compat_parent" "$compat_path" <<'PY'
+import os
+import stat
+import sys
+
+
+parent, compat_dir = sys.argv[1:]
+payload = b'''import os
+
+
+if os.environ.get("DIFY_PIP_SOCKS_CONTEXT_COMPAT") == "1":
+    from pip._vendor.urllib3.contrib import socks as _dify_socks
+
+    if not getattr(_dify_socks.SOCKSProxyManager, "_dify_proxy_context_compat", False):
+        _dify_original_init = _dify_socks.SOCKSProxyManager.__init__
+
+        def _dify_compatible_init(self, *args, **kwargs):
+            kwargs.pop("proxy_ssl_context", None)
+            _dify_original_init(self, *args, **kwargs)
+
+        _dify_socks.SOCKSProxyManager.__init__ = _dify_compatible_init
+        _dify_socks.SOCKSProxyManager._dify_proxy_context_compat = True
+'''
+
+if os.path.dirname(compat_dir) != parent or os.path.basename(compat_dir) != "socks-context-compat":
+    raise SystemExit(1)
+try:
+    os.mkdir(compat_dir, 0o700)
+except FileExistsError:
+    pass
+directory = os.lstat(compat_dir)
+if stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid():
+    raise SystemExit(1)
+path = os.path.join(compat_dir, "sitecustomize.py")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags, 0o600)
+except FileExistsError:
+    descriptor = None
+if descriptor is not None:
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+record = os.lstat(path)
+if (
+    stat.S_ISLNK(record.st_mode)
+    or not stat.S_ISREG(record.st_mode)
+    or record.st_uid != os.geteuid()
+    or record.st_nlink != 1
+    or open(path, "rb").read() != payload
+):
+    raise SystemExit(1)
+PY
+  if (($? != 0)); then
+    printf 'failed to prepare temporary pip SOCKS context compatibility support\n' >&2
+    return 1
+  fi
+  result=$compat_path
+}
+
 run_selected_pip_attempt() {
   local pip_command_name=$1
   local download_args_name=$2
   local socks_site_dir=$3
   local pip_output_log=$4
-  local use_legacy_certs=$5
+  local use_socks_context_compat=$5
   local clean_env_args_name=$6
   local bounded_capture=$7
+  local compat_parent=${8:-}
   local pip_timeout=${DIFY_PIP_TIMEOUT_SECONDS:-600}
   local -n selected_pip_command=$pip_command_name
   local -n selected_download_args=$download_args_name
@@ -1511,14 +1586,19 @@ run_selected_pip_attempt() {
     local -n selected_clean_env_args=$clean_env_args_name
     command+=("${selected_clean_env_args[@]}")
   fi
-  if [[ "$use_legacy_certs" == true ]]; then
-    command+=(PIP_USE_DEPRECATED=legacy-certs)
+  local python_path=$socks_site_dir
+  if [[ "$use_socks_context_compat" == true ]]; then
+    local compat_dir=
+    [[ -n "$compat_parent" ]] || return 1
+    prepare_pip_socks_context_compat "$compat_parent" compat_dir || return
+    python_path="$compat_dir${python_path:+:$python_path}"
+    command+=(DIFY_PIP_SOCKS_CONTEXT_COMPAT=1)
   fi
-  if [[ -n "$socks_site_dir" ]]; then
+  if [[ -n "$python_path" ]]; then
     if [[ -n "$clean_env_args_name" ]]; then
-      command+=("PYTHONPATH=$socks_site_dir")
+      command+=("PYTHONPATH=$python_path")
     else
-      command+=("PYTHONPATH=$socks_site_dir${PYTHONPATH:+:$PYTHONPATH}")
+      command+=("PYTHONPATH=$python_path${PYTHONPATH:+:$PYTHONPATH}")
     fi
   fi
   command+=("${selected_pip_command[@]}" "${selected_download_args[@]}")
@@ -1538,6 +1618,7 @@ run_pip_with_socks_retry() {
   local clean_env_args_name=${6:-}
   local bounded_capture=${7:-false}
   local display_output=${8:-true}
+  local compat_parent=${9:-}
   local pip_status retry_status
   local truststore_error="TypeError: PoolKey.__new__() got an unexpected keyword argument 'key_proxy_ssl_context'"
 
@@ -1546,7 +1627,7 @@ run_pip_with_socks_retry() {
   fi
   if run_selected_pip_attempt \
     "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
-    false "$clean_env_args_name" "$bounded_capture"; then
+    false "$clean_env_args_name" "$bounded_capture" "$compat_parent"; then
     pip_status=0
   else
     pip_status=$?
@@ -1562,13 +1643,13 @@ run_pip_with_socks_retry() {
   fi
 
   printf '%s\n' \
-    'pip SOCKS support is incompatible with its truststore proxy context; retrying once with PIP_USE_DEPRECATED=legacy-certs.' >&2
+    'pip SOCKS support is incompatible with its proxy TLS context; retrying once with a temporary SOCKS context compatibility shim.' >&2
   if [[ "$bounded_capture" != true ]]; then
     : >"$pip_output_log"
   fi
   if run_selected_pip_attempt \
     "$pip_command_name" "$download_args_name" "$socks_site_dir" "$pip_output_log" \
-    true "$clean_env_args_name" "$bounded_capture"; then
+    true "$clean_env_args_name" "$bounded_capture" "$compat_parent"; then
     retry_status=0
   else
     retry_status=$?
@@ -1952,7 +2033,9 @@ PY
     "$error_log" \
     "$([[ -n "$proxy_url" ]] && printf true || printf false)" \
     clean_env_args \
-    true
+    true \
+    true \
+    "$candidate_home"
 }
 
 parse_distribution_validator_record() {
@@ -2039,14 +2122,42 @@ for managed_directory in (candidate_dir, directory):
     ):
         raise SystemExit(1)
 entries = []
+wheel_entries = []
 with os.scandir(directory) as iterator:
     for entry in iterator:
         entries.append(entry)
         if len(entries) > 1024:
             raise SystemExit(1)
-if len(entries) != 1:
+        if entry.name.lower().endswith(".whl"):
+            wheel_entries.append(entry)
+            continue
+        if entry.name != ".gitignore" or entry.is_symlink():
+            raise SystemExit(1)
+        ignored_record = entry.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(ignored_record.st_mode)
+            or ignored_record.st_uid != os.geteuid()
+            or ignored_record.st_nlink != 1
+            or ignored_record.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise SystemExit(1)
+        ignored_path = os.path.join(directory, entry.name)
+        descriptor = os.open(ignored_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            ignored_before = os.fstat(descriptor)
+            contents = os.read(descriptor, 3)
+            ignored_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            contents not in {b"*", b"*\n"}
+            or (ignored_before.st_dev, ignored_before.st_ino, ignored_before.st_size, ignored_before.st_mtime_ns)
+            != (ignored_after.st_dev, ignored_after.st_ino, ignored_after.st_size, ignored_after.st_mtime_ns)
+        ):
+            raise SystemExit(1)
+if len(wheel_entries) != 1:
     raise SystemExit(1)
-entry = entries[0]
+entry = wheel_entries[0]
 if (
     any(ord(character) < 32 or ord(character) == 127 for character in entry.name)
     or not entry.name.lower().endswith(".whl")
@@ -2569,7 +2680,8 @@ download_wheels_once() {
     "$([[ -n "$socks_proxy_url" ]] && printf true || printf false)" \
     '' \
     "$bounded_capture" \
-    "$display_output"
+    "$display_output" \
+    "$bootstrap_dir"
 }
 
 validate_coordinator_workspace() {
