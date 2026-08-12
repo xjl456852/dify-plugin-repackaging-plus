@@ -1100,6 +1100,108 @@ assert_eq 'snapshot replacement sentinel' "$(<"$snapshot_source")" 'diagnostic s
 rm -f -- "$snapshot_source" "$diagnostic_victim" "$diagnostic_initial"
 cleanup_coordinator_workspace "$diagnostic_workspace" >/dev/null 2>&1 || true
 
+compat_python="$FIXTURE_DIR/socks-compat-race.py"
+awk '
+  /^prepare_pip_socks_context_compat\(\) \{/ { in_function = 1 }
+  in_function && /task3_python -B .*<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /^# SOCKS_COMPAT_SITE_PREOPEN$/) {
+      print "open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$compat_python"
+compat_race_parent="$FIXTURE_DIR/compat-race-parent"
+compat_race_dir="$compat_race_parent/socks-context-compat"
+compat_race_path="$compat_race_dir/sitecustomize.py"
+compat_race_victim="$FIXTURE_DIR/compat-race-victim.py"
+compat_race_ready="$FIXTURE_DIR/compat-race.ready"
+compat_race_go="$FIXTURE_DIR/compat-race.go"
+compat_race_status="$FIXTURE_DIR/compat-race.status"
+mkdir -m 700 -- "$compat_race_parent"
+(
+  if DIFY_TEST_RACE_READY="$compat_race_ready" DIFY_TEST_RACE_GO="$compat_race_go" \
+    python3 -B "$compat_python" "$compat_race_parent" "$compat_race_dir"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf '%s\n' "$status" >"$compat_race_status"
+) &
+compat_race_pid=$!
+for _ in $(seq 1 500); do
+  [[ -e "$compat_race_ready" ]] && break
+  sleep 0.01
+done
+if [[ -e "$compat_race_ready" && -f "$compat_race_path" ]]; then
+  cp -- "$compat_race_path" "$compat_race_victim"
+  rm -f -- "$compat_race_path"
+  ln -- "$compat_race_victim" "$compat_race_path"
+  : >"$compat_race_go"
+fi
+wait "$compat_race_pid"
+if [[ "$(<"$compat_race_status")" != 0 ]]; then
+  pass 'SOCKS compatibility preparation rejects a deterministic same-content hardlink swap'
+else
+  fail 'SOCKS compatibility preparation rejects a deterministic same-content hardlink swap'
+fi
+assert_eq 2 "$(stat -c '%h' "$compat_race_victim")" 'SOCKS compatibility race fixture replaced the path with a hardlink'
+
+wheel_snapshot_python="$FIXTURE_DIR/wheel-snapshot-race.py"
+awk '
+  /^snapshot_built_wheel\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 ~ /^        ignored_record = entry\.stat\(follow_symlinks=False\)$/) {
+      print "        open(os.environ[\"DIFY_TEST_RACE_READY\"], \"w\").close()"
+      print "        while not os.path.exists(os.environ[\"DIFY_TEST_RACE_GO\"]): pass"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$wheel_snapshot_python"
+wheel_snapshot_candidate="$FIXTURE_DIR/wheel-snapshot-candidate"
+wheel_snapshot_dir="$wheel_snapshot_candidate/wheel"
+wheel_snapshot_ignore="$wheel_snapshot_dir/.gitignore"
+wheel_snapshot_victim="$FIXTURE_DIR/wheel-snapshot-victim"
+wheel_snapshot_ready="$FIXTURE_DIR/wheel-snapshot.ready"
+wheel_snapshot_go="$FIXTURE_DIR/wheel-snapshot.go"
+wheel_snapshot_status="$FIXTURE_DIR/wheel-snapshot.status"
+mkdir -m 700 -- "$wheel_snapshot_candidate" "$wheel_snapshot_dir"
+printf 'fake wheel bytes\n' >"$wheel_snapshot_dir/example-1.0-py3-none-any.whl"
+printf '*\n' >"$wheel_snapshot_ignore"
+(
+  if DIFY_TEST_RACE_READY="$wheel_snapshot_ready" DIFY_TEST_RACE_GO="$wheel_snapshot_go" \
+    python3 -B "$wheel_snapshot_python" "$wheel_snapshot_dir" "$wheel_snapshot_candidate" \
+    >"$FIXTURE_DIR/wheel-snapshot.stdout"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf '%s\n' "$status" >"$wheel_snapshot_status"
+) &
+wheel_snapshot_pid=$!
+for _ in $(seq 1 500); do
+  [[ -e "$wheel_snapshot_ready" ]] && break
+  sleep 0.01
+done
+if [[ -e "$wheel_snapshot_ready" ]]; then
+  cp -- "$wheel_snapshot_ignore" "$wheel_snapshot_victim"
+  rm -f -- "$wheel_snapshot_ignore"
+  ln -- "$wheel_snapshot_victim" "$wheel_snapshot_ignore"
+  : >"$wheel_snapshot_go"
+fi
+wait "$wheel_snapshot_pid"
+if [[ "$(<"$wheel_snapshot_status")" != 0 ]]; then
+  pass 'wheel snapshot rejects a deterministic same-content uv gitignore hardlink swap'
+else
+  fail 'wheel snapshot rejects a deterministic same-content uv gitignore hardlink swap'
+fi
+assert_eq 2 "$(stat -c '%h' "$wheel_snapshot_victim")" 'uv gitignore race fixture replaced the path with a hardlink'
+assert_eq 0 "$(find "$wheel_snapshot_candidate" -maxdepth 1 -type d -name '.admission.*' | wc -l)" 'uv gitignore hardlink swap creates no admission snapshot'
+
 write_missing_wheel_log() {
   local file=$1
   local first_requirement=$2
@@ -4268,10 +4370,10 @@ fi
 assert_eq 2 "$(grep -c '^download ' "$SOCKS_PIP_LOG")" 'installed PySocks compatibility retry runs exactly once'
 assert_file_contains "$installed_tls_bug_case_dir/output.log" 'temporary SOCKS context compatibility shim' 'installed PySocks compatibility retry is explained'
 assert_file_not_contains "$installed_tls_bug_case_dir/output.log" 'legacy-certs' 'installed PySocks compatibility retry keeps truststore enabled'
-if [[ -f "$installed_tls_bug_case_dir/pip-bootstrap/socks-context-compat/sitecustomize.py" ]]; then
-  pass 'installed PySocks compatibility shim stays inside caller-provided bootstrap staging'
+if [[ ! -e "$installed_tls_bug_case_dir/pip-bootstrap/socks-context-compat" ]]; then
+  pass 'installed PySocks compatibility shim never uses caller-provided DrvFS bootstrap staging'
 else
-  fail 'installed PySocks compatibility shim stays inside caller-provided bootstrap staging'
+  fail 'installed PySocks compatibility shim never uses caller-provided DrvFS bootstrap staging'
 fi
 assert_eq 0 "$(find "$installed_tls_bug_case_dir/wheels" -name 'sitecustomize.py' | wc -l)" 'SOCKS compatibility shim is never admitted as a wheel artifact'
 

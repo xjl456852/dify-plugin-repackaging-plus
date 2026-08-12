@@ -1540,9 +1540,21 @@ directory = os.lstat(compat_dir)
 if stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid():
     raise SystemExit(1)
 path = os.path.join(compat_dir, "sitecustomize.py")
+directory_descriptor = os.open(
+    compat_dir,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+opened_directory = os.fstat(directory_descriptor)
+if (
+    not stat.S_ISDIR(opened_directory.st_mode)
+    or opened_directory.st_uid != os.geteuid()
+    or (opened_directory.st_dev, opened_directory.st_ino) != (directory.st_dev, directory.st_ino)
+):
+    os.close(directory_descriptor)
+    raise SystemExit(1)
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 try:
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = os.open("sitecustomize.py", flags, 0o600, dir_fd=directory_descriptor)
 except FileExistsError:
     descriptor = None
 if descriptor is not None:
@@ -1551,15 +1563,40 @@ if descriptor is not None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-record = os.lstat(path)
-if (
-    stat.S_ISLNK(record.st_mode)
-    or not stat.S_ISREG(record.st_mode)
-    or record.st_uid != os.geteuid()
-    or record.st_nlink != 1
-    or open(path, "rb").read() != payload
-):
-    raise SystemExit(1)
+record = os.stat("sitecustomize.py", dir_fd=directory_descriptor, follow_symlinks=False)
+# SOCKS_COMPAT_SITE_PREOPEN
+descriptor = os.open(
+    "sitecustomize.py",
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    dir_fd=directory_descriptor,
+)
+try:
+    before = os.fstat(descriptor)
+    contents = os.read(descriptor, len(payload) + 1)
+    after = os.fstat(descriptor)
+    current = os.stat("sitecustomize.py", dir_fd=directory_descriptor, follow_symlinks=False)
+    current_directory = os.lstat(compat_dir)
+    signature = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or signature(before) != signature(record)
+        or signature(after) != signature(before)
+        or signature(current) != signature(before)
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or (current_directory.st_dev, current_directory.st_ino)
+        != (opened_directory.st_dev, opened_directory.st_ino)
+        or contents != payload
+    ):
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+    os.close(directory_descriptor)
 PY
   if (($? != 0)); then
     printf 'failed to prepare temporary pip SOCKS context compatibility support\n' >&2
@@ -2147,12 +2184,23 @@ with os.scandir(directory) as iterator:
             ignored_before = os.fstat(descriptor)
             contents = os.read(descriptor, 3)
             ignored_after = os.fstat(descriptor)
+            ignored_current = os.stat(ignored_path, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        ignored_signature = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
         if (
-            contents not in {b"*", b"*\n"}
-            or (ignored_before.st_dev, ignored_before.st_ino, ignored_before.st_size, ignored_before.st_mtime_ns)
-            != (ignored_after.st_dev, ignored_after.st_ino, ignored_after.st_size, ignored_after.st_mtime_ns)
+            not stat.S_ISREG(ignored_before.st_mode)
+            or ignored_before.st_uid != os.geteuid()
+            or ignored_before.st_nlink != 1
+            or ignored_before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or ignored_signature(ignored_before) != ignored_signature(ignored_record)
+            or ignored_signature(ignored_after) != ignored_signature(ignored_before)
+            or ignored_signature(ignored_current) != ignored_signature(ignored_before)
+            or not stat.S_ISREG(ignored_current.st_mode)
+            or ignored_current.st_uid != os.geteuid()
+            or ignored_current.st_nlink != 1
+            or ignored_current.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or contents not in {b"*", b"*\n"}
         ):
             raise SystemExit(1)
 if len(wheel_entries) != 1:
@@ -2628,6 +2676,7 @@ download_wheels_once() {
   local local_wheels_dir=${7:-}
   local bounded_capture=${8:-false}
   local display_output=${9:-true}
+  local compat_parent=${DIFY_INTERNAL_COORDINATOR_WORKSPACE:-$bootstrap_dir}
   local abi platform socks_proxy_url= socks_site_dir=
   local -a pip_command=()
   local -a platform_args=()
@@ -2681,7 +2730,7 @@ download_wheels_once() {
     '' \
     "$bounded_capture" \
     "$display_output" \
-    "$bootstrap_dir"
+    "$compat_parent"
 }
 
 validate_coordinator_workspace() {
