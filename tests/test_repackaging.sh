@@ -532,6 +532,7 @@ awk '
   in_python {
     print
     if ($0 == "import sys") {
+      print "import errno"
       print "_dify_original_rename = os.rename"
       print "def _dify_injected_rename(*args, **kwargs):"
       print "    counter = os.environ[\"DIFY_TEST_RENAME_COUNTER\"]"
@@ -549,6 +550,7 @@ awk '
 ' "$ROOT_DIR/plugin_repackaging.sh" >"$tracked_drvfs_retry_python"
 tracked_drvfs_retry_parent="$(mktemp -d -- /tmp/dify-tracked-drvfs-retry-parent.XXXXXXXX)"
 tracked_drvfs_retry_counter="$FIXTURE_DIR/tracked-drvfs-rename-retry.count"
+tracked_drvfs_retry_stderr="$FIXTURE_DIR/tracked-drvfs-rename-retry.stderr"
 tracked_drvfs_retry_status=0
 if (
   SCRIPT_DIR=$tracked_drvfs_retry_parent
@@ -567,7 +569,8 @@ if (
   else
     exit $?
   fi
-); then
+  ) 2>"$tracked_drvfs_retry_stderr"
+then
   tracked_drvfs_retry_status=0
 else
   tracked_drvfs_retry_status=$?
@@ -578,6 +581,10 @@ assert_eq 1 "$(wc -l <"$tracked_drvfs_retry_counter")" \
   'tracked temp creation retries the injected DrvFS rename denial only once'
 assert_eq 0 "$(find "$tracked_drvfs_retry_parent" -mindepth 1 -maxdepth 1 | wc -l)" \
   'DrvFS rename retry leaves no preparation or tracked directory residue'
+assert_file_not_contains "$tracked_drvfs_retry_stderr" 'Traceback' \
+  'DrvFS rename retry fixture emits no traceback'
+assert_file_not_contains "$tracked_drvfs_retry_stderr" 'NameError' \
+  'DrvFS rename retry fixture imports its injected errno dependency'
 rm -rf -- "$tracked_drvfs_retry_parent"
 
 owned_cleanup_final_python="$FIXTURE_DIR/owned-temp-cleanup-final-race.py"
