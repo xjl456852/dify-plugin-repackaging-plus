@@ -2746,6 +2746,7 @@ create_tracked_temp_dir() {
     TRACKED_TEMP_CREATION_STATE=creating
     tracked_temp_creation_barrier before-create-primitive "$tracking_variable" "$candidate"
     if creation_record="$(task3_python -B - "$candidate" "$parent" "$prefix" <<'PY'
+import errno
 import os
 import secrets
 import stat
@@ -2761,6 +2762,9 @@ claimed = False
 published = False
 collision = False
 cleanup_allowed = False
+cleanup_succeeded = False
+transient_rename_denial = False
+renaming_candidate = False
 marker_name = None
 preparation_name = f"{prefix}preparation-{secrets.token_hex(16)}"
 try:
@@ -2821,6 +2825,7 @@ try:
         collision = True
         raise OSError
     try:
+        renaming_candidate = True
         os.rename(
             preparation_name,
             basename,
@@ -2831,6 +2836,7 @@ try:
         if error.errno in (17, 39):
             collision = True
         raise
+    renaming_candidate = False
     published = True
     cleanup_allowed = False
     os.close(directory_descriptor)
@@ -2882,7 +2888,11 @@ try:
     )
 except SystemExit:
     raise
-except (OSError, ValueError):
+except (OSError, ValueError) as error:
+    transient_rename_denial = (
+        renaming_candidate
+        and getattr(error, "errno", None) == errno.EACCES
+    )
     if marker_descriptor is not None:
         os.close(marker_descriptor)
         marker_descriptor = None
@@ -2902,8 +2912,11 @@ except (OSError, ValueError):
                 opened.st_ino,
             ):
                 os.rmdir(cleanup_name, dir_fd=parent_descriptor)
+                cleanup_succeeded = True
         except OSError:
             pass
+    if transient_rename_denial and cleanup_succeeded:
+        raise SystemExit(18)
     raise SystemExit(17 if collision else 1)
 finally:
     if marker_descriptor is not None:
@@ -2940,7 +2953,13 @@ PY
     tracked_owned=false
     TRACKED_TEMP_CREATION_STATE=idle
     honor_tracked_temp_pending_signal
-    ((creation_status == 17)) || return 1
+    case "$creation_status" in
+      17 | 18)
+        ;;
+      *)
+        return 1
+        ;;
+    esac
   done
   printf 'unable to allocate a unique tracked temporary directory\n' >&2
   return 1

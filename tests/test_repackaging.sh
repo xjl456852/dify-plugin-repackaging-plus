@@ -524,6 +524,62 @@ assert_file_not_contains "$tracked_preparation_stderr" 'Traceback' 'tracked temp
 rm -rf -- "$tracked_preparation_path" "$tracked_preparation_actual_path" \
   "$tracked_preparation_held" "$tracked_preparation_parent"
 
+tracked_drvfs_retry_python="$FIXTURE_DIR/tracked-drvfs-rename-retry.py"
+awk '
+  /^create_tracked_temp_dir\(\) \{/ { in_function = 1 }
+  in_function && /<<'\''PY'\''$/ { in_python = 1; next }
+  in_python && /^PY$/ { exit }
+  in_python {
+    print
+    if ($0 == "import sys") {
+      print "_dify_original_rename = os.rename"
+      print "def _dify_injected_rename(*args, **kwargs):"
+      print "    counter = os.environ[\"DIFY_TEST_RENAME_COUNTER\"]"
+      print "    try:"
+      print "        descriptor = os.open(counter, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)"
+      print "    except FileExistsError:"
+      print "        return _dify_original_rename(*args, **kwargs)"
+      print "    else:"
+      print "        os.write(descriptor, b\"attempt\\n\")"
+      print "        os.close(descriptor)"
+      print "        raise OSError(errno.EACCES, \"injected DrvFS rename contention\")"
+      print "os.rename = _dify_injected_rename"
+    }
+  }
+' "$ROOT_DIR/plugin_repackaging.sh" >"$tracked_drvfs_retry_python"
+tracked_drvfs_retry_parent="$(mktemp -d -- /tmp/dify-tracked-drvfs-retry-parent.XXXXXXXX)"
+tracked_drvfs_retry_counter="$FIXTURE_DIR/tracked-drvfs-rename-retry.count"
+tracked_drvfs_retry_status=0
+if (
+  SCRIPT_DIR=$tracked_drvfs_retry_parent
+  task3_python() {
+    if (($# == 5)) && [[ "$1" == -B && "$2" == - ]]; then
+      env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+        DIFY_TEST_RENAME_COUNTER="$tracked_drvfs_retry_counter" \
+        python3 -B "$tracked_drvfs_retry_python" "${@:3}"
+    else
+      env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV python3 "$@"
+    fi
+  }
+  if create_tracked_temp_dir \
+    "$tracked_drvfs_retry_parent" .dify-output. ACTIVE_OUTPUT_TEMP_DIR; then
+    cleanup_active_output_temp
+  else
+    exit $?
+  fi
+); then
+  tracked_drvfs_retry_status=0
+else
+  tracked_drvfs_retry_status=$?
+fi
+assert_eq 0 "$tracked_drvfs_retry_status" \
+  'tracked temp creation self-heals one transient DrvFS rename denial'
+assert_eq 1 "$(wc -l <"$tracked_drvfs_retry_counter")" \
+  'tracked temp creation retries the injected DrvFS rename denial only once'
+assert_eq 0 "$(find "$tracked_drvfs_retry_parent" -mindepth 1 -maxdepth 1 | wc -l)" \
+  'DrvFS rename retry leaves no preparation or tracked directory residue'
+rm -rf -- "$tracked_drvfs_retry_parent"
+
 owned_cleanup_final_python="$FIXTURE_DIR/owned-temp-cleanup-final-race.py"
 awk '
   /^remove_owned_temp_tree\(\) \{/ { in_function = 1 }
